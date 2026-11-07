@@ -1,0 +1,6 @@
+.agent-local/
+.tools/
+.toolchain/
+.venv/
+_opam/
+.DS_Store
