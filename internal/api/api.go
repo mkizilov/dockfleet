@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dockfleet/dockfleet/internal/placement"
 	"github.com/dockfleet/dockfleet/internal/scheduler"
 	"github.com/dockfleet/dockfleet/internal/store"
 )
@@ -30,6 +31,9 @@ type Config struct {
 	Logger  *slog.Logger
 	// InstanceID names this manager in the audit events it records.
 	InstanceID string
+	// Overcommit is how far nodes may be promised beyond their capacity when a
+	// workload is placed; the zero value is none.
+	Overcommit scheduler.Overcommit
 	// Now defaults to time.Now; tests override it.
 	Now func() time.Time
 }
@@ -40,6 +44,7 @@ type server struct {
 	nodeTTL    time.Duration
 	logger     *slog.Logger
 	instanceID string
+	overcommit scheduler.Overcommit
 	now        func() time.Time
 }
 
@@ -52,6 +57,7 @@ func New(cfg Config) http.Handler {
 		nodeTTL:    cfg.NodeTTL,
 		logger:     cfg.Logger,
 		instanceID: cfg.InstanceID,
+		overcommit: cfg.Overcommit,
 		now:        cfg.Now,
 	}
 	if s.now == nil {
@@ -159,17 +165,35 @@ func (s *server) readyz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
-type nodeView struct {
-	store.Node
-	Status string `json:"status"`
+type resources struct {
+	CPUMillis   int64 `json:"cpu_millis"`
+	MemoryBytes int64 `json:"memory_bytes"`
 }
 
-func (s *server) view(n store.Node) nodeView {
-	status := "not_ready"
-	if scheduler.Ready(n, s.now(), s.nodeTTL) {
-		status = "ready"
+type allocation struct {
+	resources
+	Workloads int `json:"workloads"`
+}
+
+// nodeView is a node with what the scheduler sees of it: whether it can take
+// new replicas and why not, how much of it may be promised, and how much has
+// been promised to workloads that are meant to run.
+type nodeView struct {
+	store.Node
+	Status       string     `json:"status"`
+	StatusReason string     `json:"status_reason,omitempty"`
+	Allocatable  resources  `json:"allocatable"`
+	Allocated    allocation `json:"allocated"`
+}
+
+func (s *server) view(n store.Node, used scheduler.Used) nodeView {
+	v := nodeView{Node: n, Status: "ready", StatusReason: scheduler.Unavailability(n, s.now(), s.nodeTTL)}
+	if v.StatusReason != "" {
+		v.Status = "not_ready"
 	}
-	return nodeView{Node: n, Status: status}
+	v.Allocatable.CPUMillis, v.Allocatable.MemoryBytes = s.overcommit.Allocatable(n.CPUMillis, n.MemoryBytes)
+	v.Allocated = allocation{resources: resources{CPUMillis: used.CPUMillis, MemoryBytes: used.MemoryBytes}, Workloads: used.Workloads}
+	return v
 }
 
 func (s *server) listNodes(w http.ResponseWriter, r *http.Request) {
@@ -178,23 +202,56 @@ func (s *server) listNodes(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, err)
 		return
 	}
+	workloads, err := s.store.ListWorkloads(r.Context())
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	used := scheduler.UsedByNode(workloads)
 	views := make([]nodeView, 0, len(nodes))
 	for _, n := range nodes {
-		views = append(views, s.view(n))
+		views = append(views, s.view(n, used[n.ID]))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"nodes": views})
 }
 
 func (s *server) getNode(w http.ResponseWriter, r *http.Request) {
 	n, err := s.store.GetNode(r.Context(), r.PathValue("id"))
-	switch {
-	case errors.Is(err, store.ErrNotFound):
+	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "node not found")
-	case err != nil:
-		s.internalError(w, r, err)
-	default:
-		writeJSON(w, http.StatusOK, s.view(n))
+		return
 	}
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	workloads, err := s.store.ListWorkloadsForNode(r.Context(), n.ID)
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.view(n, scheduler.UsedByNode(workloads)[n.ID]))
+}
+
+// unschedulableError is a placement the scheduler could not make.
+type unschedulableError struct {
+	u *scheduler.Unschedulable
+}
+
+func (e *unschedulableError) Error() string { return e.u.Message }
+
+// writeUnschedulable answers 409 with the reason, and for each node why it was ruled out.
+func writeUnschedulable(w http.ResponseWriter, u *scheduler.Unschedulable) {
+	type nodeReason struct {
+		NodeID  string `json:"node_id"`
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	nodes := make([]nodeReason, 0, len(u.Nodes))
+	for _, n := range u.Nodes {
+		nodes = append(nodes, nodeReason(n))
+	}
+	writeJSON(w, http.StatusConflict, map[string]any{"error": u.Message, "code": u.Code, "nodes": nodes})
 }
 
 type createWorkloadRequest struct {
@@ -242,34 +299,34 @@ func (s *server) createWorkload(w http.ResponseWriter, r *http.Request) {
 		if err := tx.LockPlacement(ctx); err != nil {
 			return err
 		}
-		nodes, err := tx.ListNodes(ctx)
-		if err != nil {
-			return err
-		}
-		workloads, err := tx.ListWorkloads(ctx)
-		if err != nil {
-			return err
-		}
-		target, err := scheduler.Place(
-			scheduler.Request{CPUMillis: req.CPUMillis, MemoryBytes: req.MemoryBytes, NodeSelector: req.NodeSelector},
-			scheduler.Candidates(nodes, workloads, s.now(), s.nodeTTL),
-		)
-		if err != nil {
-			return err
-		}
 		now := s.now().UTC()
+		cluster, err := placement.ReadCluster(ctx, tx, now, s.nodeTTL)
+		if err != nil {
+			return err
+		}
+		// The same scheduler that places service replicas decides here.
+		decision := scheduler.Schedule(scheduler.Input{
+			Nodes: cluster.Nodes, Assignments: cluster.Assignments, Overcommit: s.overcommit,
+			Replicas: []scheduler.Replica{{
+				Service: req.Name, CPUMillis: req.CPUMillis, MemoryBytes: req.MemoryBytes, NodeSelector: req.NodeSelector,
+			}},
+		})[0]
+		if !decision.Placed() {
+			return &unschedulableError{decision.Unschedulable}
+		}
 		if created, err = tx.CreateWorkload(ctx, store.Workload{
 			ID: id, Name: req.Name, Image: req.Image, CPUMillis: req.CPUMillis, MemoryBytes: req.MemoryBytes,
-			NodeID: target.ID, DesiredState: store.DesiredRunning, CreatedAt: now,
+			NodeID: decision.NodeID, DesiredState: store.DesiredRunning, CreatedAt: now,
 		}); err != nil {
 			return err
 		}
-		_, err = tx.AppendEvent(ctx, s.event("workload.created", "workload", id, "", map[string]string{"name": req.Name, "node_id": target.ID, "image": req.Image}))
+		_, err = tx.AppendEvent(ctx, s.event("workload.created", "workload", id, "", map[string]string{"name": req.Name, "node_id": decision.NodeID, "image": req.Image}))
 		return err
 	})
+	var unschedulable *unschedulableError
 	switch {
-	case errors.Is(err, scheduler.ErrNoCapacity):
-		writeError(w, http.StatusConflict, err.Error())
+	case errors.As(err, &unschedulable):
+		writeUnschedulable(w, unschedulable.u)
 	case errors.Is(err, store.ErrConflict):
 		writeError(w, http.StatusConflict, "a workload with this name already exists")
 	case err != nil:

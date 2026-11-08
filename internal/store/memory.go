@@ -27,6 +27,15 @@ type memState struct {
 	events       []Event
 	nextEventID  int64
 	leases       map[string]Lease
+
+	unschedulable map[slotKey]Unschedulable
+}
+
+// slotKey identifies one replica slot of a service revision.
+type slotKey struct {
+	serviceID string
+	revision  int
+	index     int
 }
 
 var _ Store = (*Memory)(nil)
@@ -41,6 +50,8 @@ func newMemState() memState {
 		revisions:    map[string][]Revision{},
 		nextEventID:  1,
 		leases:       map[string]Lease{},
+
+		unschedulable: map[slotKey]Unschedulable{},
 	}
 }
 
@@ -155,7 +166,15 @@ func (s memState) clone() memState {
 	for k, v := range s.leases {
 		c.leases[k] = v
 	}
+	for k, v := range s.unschedulable {
+		c.unschedulable[k] = cloneUnschedulable(v)
+	}
 	return c
+}
+
+func cloneUnschedulable(u Unschedulable) Unschedulable {
+	u.Nodes = append([]NodeReason{}, u.Nodes...)
+	return u
 }
 
 // memTx is a transaction: a private copy of the state that replaces the
@@ -279,6 +298,7 @@ func (m *Memory) RevokeEnrollment(_ context.Context, nodeID string, at time.Time
 
 // view returns the workload with its observation attached.
 func (m *Memory) view(w Workload) Workload {
+	w.Ports = append([]ServicePort(nil), w.Ports...)
 	if o, ok := m.s.observations[w.ID]; ok {
 		c := cloneObservation(o)
 		w.Observed = &c
@@ -308,7 +328,7 @@ func (m *Memory) CreateWorkload(_ context.Context, w Workload) (Workload, error)
 		}
 	}
 	m.s.workloads[w.ID] = w
-	return w, nil
+	return m.view(w), nil
 }
 
 func (m *Memory) GetWorkload(_ context.Context, id string) (Workload, error) {
@@ -572,6 +592,76 @@ func (m *Memory) ListRevisions(_ context.Context, serviceID string) ([]Revision,
 	for _, r := range m.s.revisions[serviceID] {
 		out = append(out, cloneRevision(r))
 	}
+	return out, nil
+}
+
+// ---- scheduling ----
+
+func (u Unschedulable) key() slotKey {
+	return slotKey{u.ServiceID, u.Revision, u.ReplicaIndex}
+}
+
+// validate checks the fields a record needs, whatever the store.
+func (u Unschedulable) validate() error {
+	if u.ServiceID == "" || u.Revision < 1 || u.ReplicaIndex < 1 || u.Code == "" {
+		return fmt.Errorf("%w: an unschedulable record needs a service, a revision and replica index of at least 1, and a code", ErrInvalid)
+	}
+	return nil
+}
+
+func sortUnschedulable(list []Unschedulable) {
+	sort.Slice(list, func(i, j int) bool {
+		a, b := list[i], list[j]
+		if a.ServiceID != b.ServiceID {
+			return a.ServiceID < b.ServiceID
+		}
+		if a.Revision != b.Revision {
+			return a.Revision < b.Revision
+		}
+		return a.ReplicaIndex < b.ReplicaIndex
+	})
+}
+
+func (m *Memory) ReplaceUnschedulable(_ context.Context, items []Unschedulable, at time.Time) ([]Unschedulable, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	next := make(map[slotKey]Unschedulable, len(items))
+	var changed []Unschedulable
+	for _, item := range items {
+		if err := item.validate(); err != nil {
+			return nil, err
+		}
+		key := item.key()
+		if _, dup := next[key]; dup {
+			return nil, fmt.Errorf("%w: replica %d of revision %d of service %s is listed twice", ErrInvalid, key.index, key.revision, key.serviceID)
+		}
+		if item.Revision > len(m.s.revisions[item.ServiceID]) {
+			return nil, fmt.Errorf("%w: revision %d of service %s", ErrNotFound, item.Revision, item.ServiceID)
+		}
+		item = cloneUnschedulable(item)
+		if old, ok := m.s.unschedulable[key]; ok && old.SameReason(item) {
+			next[key] = old
+			continue
+		}
+		item.Since = at.UTC()
+		next[key] = item
+		changed = append(changed, cloneUnschedulable(item))
+	}
+	m.s.unschedulable = next
+	sortUnschedulable(changed)
+	return changed, nil
+}
+
+func (m *Memory) ListUnschedulable(_ context.Context, serviceID string) ([]Unschedulable, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := []Unschedulable{}
+	for key, u := range m.s.unschedulable {
+		if serviceID == "" || key.serviceID == serviceID {
+			out = append(out, cloneUnschedulable(u))
+		}
+	}
+	sortUnschedulable(out)
 	return out, nil
 }
 

@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path"
 	"runtime"
@@ -44,6 +45,14 @@ type Manager struct {
 	NodeTTL           time.Duration
 	RequestTimeout    time.Duration
 	ShutdownTimeout   time.Duration
+
+	// SchedulerInterval is the time between scheduling passes; zero (only
+	// possible outside this loader) turns the scheduler off.
+	SchedulerInterval time.Duration
+	// CPUOvercommit and MemoryOvercommit are how many times a node's capacity may
+	// be promised to workloads. 1 means never more than the node has.
+	CPUOvercommit    float64
+	MemoryOvercommit float64
 }
 
 // TLSEnabled reports whether the manager serves TLS. TLS always means mutual
@@ -111,6 +120,9 @@ func LoadManager(get Getenv) (Manager, error) {
 	c.NodeTTL = duration(get, "DOCKFLEET_NODE_TTL", 30*time.Second, &errs)
 	c.RequestTimeout = duration(get, "DOCKFLEET_REQUEST_TIMEOUT", 10*time.Second, &errs)
 	c.ShutdownTimeout = duration(get, "DOCKFLEET_SHUTDOWN_TIMEOUT", 15*time.Second, &errs)
+	c.SchedulerInterval = duration(get, "DOCKFLEET_SCHEDULER_INTERVAL", 5*time.Second, &errs)
+	c.CPUOvercommit = overcommit(get, "DOCKFLEET_SCHEDULER_CPU_OVERCOMMIT", &errs)
+	c.MemoryOvercommit = overcommit(get, "DOCKFLEET_SCHEDULER_MEMORY_OVERCOMMIT", &errs)
 
 	switch c.Store {
 	case "postgres":
@@ -244,6 +256,26 @@ func duration(get Getenv, key string, def time.Duration, errs *[]error) time.Dur
 		return def
 	}
 	return d
+}
+
+// MaxOvercommit is the largest overcommit factor the scheduler accepts.
+const MaxOvercommit = 8.0
+
+// overcommit reads an overcommit factor: a number from 1 (never promise a node
+// more than it has, the default) to MaxOvercommit. Raising it is a deliberate
+// choice, so a value below 1, a non-number and anything absurd are errors, not
+// quietly corrected.
+func overcommit(get Getenv, key string, errs *[]error) float64 {
+	raw := strings.TrimSpace(get(key))
+	if raw == "" {
+		return 1
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 1 || v > MaxOvercommit {
+		*errs = append(*errs, fmt.Errorf("%s must be a number from 1 (no overcommit) to %g, got %q", key, MaxOvercommit, raw))
+		return 1
+	}
+	return v
 }
 
 func positiveInt(get Getenv, key string, def int64, errs *[]error) int64 {

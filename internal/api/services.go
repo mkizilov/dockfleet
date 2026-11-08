@@ -26,15 +26,19 @@ type serviceView struct {
 	// Version changes with every modification and is the ETag.
 	Version int64 `json:"version"`
 
+	// Status is what the scheduler has decided about the service's replicas.
+	// It is read-only: scheduling is not something a definition can ask for.
+	Status serviceStatus `json:"status"`
+
 	CreatedAt time.Time  `json:"created_at"`
 	UpdatedAt time.Time  `json:"updated_at"`
 	DeletedAt *time.Time `json:"deleted_at,omitempty"`
 }
 
-func newServiceView(svc store.Service, spec store.ServiceSpec) serviceView {
+func newServiceView(svc store.Service, spec store.ServiceSpec, status serviceStatus) serviceView {
 	return serviceView{
 		ID: svc.ID, Name: svc.Name, Replicas: svc.Replicas, Revision: svc.CurrentRevision, Version: svc.Version,
-		Spec: spec, CreatedAt: svc.CreatedAt, UpdatedAt: svc.UpdatedAt, DeletedAt: svc.DeletedAt,
+		Spec: spec, Status: status, CreatedAt: svc.CreatedAt, UpdatedAt: svc.UpdatedAt, DeletedAt: svc.DeletedAt,
 	}
 }
 
@@ -123,8 +127,13 @@ func (s *server) createService(w http.ResponseWriter, r *http.Request) {
 		s.failService(w, r, err, false)
 		return
 	}
+	status, err := s.statusOf(r.Context(), svc)
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
 	w.Header().Set("Location", "/v1/services/"+svc.Name)
-	writeService(w, http.StatusCreated, newServiceView(svc, in.spec))
+	writeService(w, http.StatusCreated, newServiceView(svc, in.spec, status))
 }
 
 func (s *server) listServices(w http.ResponseWriter, r *http.Request) {
@@ -141,9 +150,18 @@ func (s *server) listServices(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, err)
 		return
 	}
+	services := make([]store.Service, 0, len(defs))
+	for _, d := range defs {
+		services = append(services, d.Service)
+	}
+	statuses, err := s.statusesOf(r.Context(), services)
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
 	views := make([]serviceView, 0, len(defs))
 	for _, d := range defs {
-		views = append(views, newServiceView(d.Service, d.Revision.Spec))
+		views = append(views, newServiceView(d.Service, d.Revision.Spec, statuses[d.Service.ID]))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"services": views})
 }
@@ -165,7 +183,12 @@ func (s *server) getService(w http.ResponseWriter, r *http.Request) {
 		s.failService(w, r, err, false)
 		return
 	}
-	writeService(w, http.StatusOK, newServiceView(svc, rev.Spec))
+	status, err := s.statusOf(r.Context(), svc)
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	writeService(w, http.StatusOK, newServiceView(svc, rev.Spec, status))
 }
 
 // updateService replaces the definition: the replica count and the spec are
@@ -235,7 +258,12 @@ func (s *server) updateService(w http.ResponseWriter, r *http.Request) {
 		s.failService(w, r, err, want != 0)
 		return
 	}
-	writeService(w, http.StatusOK, newServiceView(out, in.spec))
+	status, err := s.statusOf(r.Context(), out)
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	writeService(w, http.StatusOK, newServiceView(out, in.spec, status))
 }
 
 // deleteService marks the service deleted and its desired replicas zero. Its
@@ -245,17 +273,17 @@ func (s *server) deleteService(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var out serviceView
+	var deleted store.Service
+	var spec store.ServiceSpec
 	err := s.store.InTx(r.Context(), func(tx store.Tx) error {
 		svc, cur, err := s.liveService(r, tx)
 		if err != nil {
 			return err
 		}
-		deleted, err := tx.DeleteService(r.Context(), svc.ID, want, s.now().UTC())
-		if err != nil {
+		if deleted, err = tx.DeleteService(r.Context(), svc.ID, want, s.now().UTC()); err != nil {
 			return err
 		}
-		out = newServiceView(deleted, cur.Spec)
+		spec = cur.Spec
 		_, err = tx.AppendEvent(r.Context(), s.event("service.deleted", "service", svc.ID, "", map[string]string{"name": svc.Name}))
 		return err
 	})
@@ -263,7 +291,13 @@ func (s *server) deleteService(w http.ResponseWriter, r *http.Request) {
 		s.failService(w, r, err, want != 0)
 		return
 	}
-	writeService(w, http.StatusOK, out)
+	// The workloads the service already has are kept, and still shown.
+	status, err := s.statusOf(r.Context(), deleted)
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	writeService(w, http.StatusOK, newServiceView(deleted, spec, status))
 }
 
 // listServiceRevisions returns the deployment history, oldest first.

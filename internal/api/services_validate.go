@@ -133,7 +133,7 @@ var (
 		"security_opt", "sysctls", "cgroup_parent", "group_add", "host_ip", "extra_hosts",
 	)
 
-	readOnlyFields = fieldSet("id", "version", "revision", "created_at", "updated_at", "deleted_at")
+	readOnlyFields = fieldSet("id", "version", "revision", "status", "created_at", "updated_at", "deleted_at")
 )
 
 func fieldReason(key string) string {

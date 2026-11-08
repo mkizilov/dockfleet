@@ -11,7 +11,9 @@ This document describes what exists today and where the planned orchestration wo
                               v
    +----------------------------------------------------+
    | manager                                            |
-   |   internal/api  --->  internal/scheduler           |
+   |   internal/api ---+                                |
+   |                   v                                |
+   |   internal/placement --> internal/scheduler (pure) |
    |        |                                           |
    |        v                                           |
    |   internal/store  <--  internal/registry           |
@@ -38,9 +40,10 @@ Agents dial the manager; the manager never connects to agents. This keeps nodes 
 - **`cmd/manager`**: loads configuration, opens the store (running migrations for PostgreSQL), binds both listeners, delegates to `internal/manager`. Exits non-zero on startup failure.
 - **`cmd/agent`**: loads configuration, builds the Docker and gRPC clients, runs `internal/agent`.
 - **`internal/manager`**: runs the HTTP and gRPC servers side by side and owns shutdown (below).
-- **`internal/api`**: Go 1.22 `ServeMux` handlers. Request bodies are capped at 1 MiB and decoded strictly (unknown fields rejected). Bearer tokens are compared in constant time. Workload creation lists nodes and workloads, asks the scheduler for a node, saves the workload and records its audit event in one transaction under a cluster-wide placement lock, so no manager sharing the database can overcommit a node. Administrative changes record events in the same transaction (`GET /v1/events`). Service definitions (`/v1/services`) are validated against an explicit allow-list of fields (unsafe Docker options get a specific refusal), normalized so equivalent definitions are not changes, and stored as revisions with optimistic `If-Match` locking; the handlers never touch nodes, workloads or the scheduler. See [api.md](api.md).
-- **`internal/scheduler`**: pure functions. `Candidates` drops nodes without a recent heartbeat and totals reserved CPU and memory per node; `Place` filters by label selector and free capacity and picks the node with the most free CPU (ties: free memory, then node ID).
-- **`internal/store`**: small repository interfaces (nodes, enrollments, workloads and their observations, services and revisions, events, leases) combined in `Store`, with `InTx` for transactions. PostgreSQL (`pgx` pool, embedded checksummed migrations guarded by an advisory lock) and in-memory implementations pass one shared conformance suite. Desired and observed state are separate tables with separate writers. See [state.md](state.md).
+- **`internal/api`**: Go 1.22 `ServeMux` handlers. Request bodies are capped at 1 MiB and decoded strictly (unknown fields rejected). Bearer tokens are compared in constant time. Workload creation reads the cluster, asks the scheduler for a node, saves the workload and records its audit event in one transaction under a cluster-wide placement lock, so no manager sharing the database can overcommit a node; a refusal is a `409` that carries the scheduler's reason for the request and for every node. Administrative changes record events in the same transaction (`GET /v1/events`). Service definitions (`/v1/services`) are validated against an explicit allow-list of fields (unsafe Docker options get a specific refusal), normalized so equivalent definitions are not changes, and stored as revisions with optimistic `If-Match` locking; the handlers never write workloads or schedule, and only read them to show a service's `status` (where its replicas were assigned, and why any has no node). Nodes show their allocatable and allocated resources. See [api.md](api.md).
+- **`internal/scheduler`**: the decision, as pure functions of a snapshot (nodes, existing assignments, replicas to place, overcommit). No I/O, no clock, no Docker (a test pins its imports). Deterministic placement that never oversubscribes unless configured, with a reason for every replica it cannot place and for every node it rules out. See [scheduler.md](scheduler.md).
+- **`internal/placement`**: carries decisions out against the store. Each pass runs in one transaction under the placement lock: it reads nodes, enrollments, workloads and service definitions, asks the scheduler where every waiting replica goes, saves the assignments as workloads, replaces the stored explanations for replicas without a node, and records audit events. The manager runs it every `DOCKFLEET_SCHEDULER_INTERVAL`. Running the containers stays with the agents.
+- **`internal/store`**: small repository interfaces (nodes, enrollments, workloads and their observations, services and revisions, scheduling explanations, events, leases) combined in `Store`, with `InTx` for transactions. PostgreSQL (`pgx` pool, embedded checksummed migrations guarded by an advisory lock) and in-memory implementations pass one shared conformance suite. Desired and observed state are separate tables with separate writers. See [state.md](state.md).
 - **`internal/protocol`**: `NodeService` (`RegisterNode`, `Heartbeat`, `DeregisterNode`) from `proto/dockfleet/v1/fleet.proto`; protocol version rules; `ProtocolError` details surfaced as `protocol.Error`; a unary interceptor enforcing the agent token and another applying a per-call deadline; a client that attaches the token, refuses plaintext to non-loopback addresses and reconnects with backoff. Optional TLS 1.3. Details in [protocol.md](protocol.md).
 - **`internal/registry`**: the manager-side node registry. `Register` persists the node and starts a session (replacing an older one); `Heartbeat` validates the session, refreshes liveness, applies status reports (writing only changes, ignoring workloads not assigned to the reporting node) and returns the node's complete assignment set; `Deregister` ends the session and backdates the heartbeat. `Register` and every `Heartbeat` also require an active enrollment in the store, so revocation ends a session at its next heartbeat. Sessions are in memory; everything else is in the store.
 - **`internal/netutil`**: `IsLoopbackAddr` and `RequireLoopback`, shared by config validation, the manager and the client.
@@ -53,7 +56,7 @@ Agents dial the manager; the manager never connects to agents. This keeps nodes 
 
 ### Not implemented
 
-Driving the Docker adapter from assignments (the agent does not start workload containers yet and reports them as `pending`), reconciliation of desired versus actual state, workload deletion or rescheduling when a node dies, node removal, per-node identity, running leader election (the lease primitive exists), a controller that turns service definitions into workloads (the services REST API stores them as desired state only), metrics. Agent sessions live in one process's memory, so an agent talks to one manager at a time.
+Driving the Docker adapter from assignments (the agent does not start workload containers yet and reports them as `pending`), reconciliation of desired versus actual state, removing replicas (scaling down, retiring an old revision's workloads) and moving workloads off a dead node, node removal, per-node identity, running leader election (the lease primitive exists; scheduling passes serialize on the placement lock instead), metrics. The scheduler places replicas that have no workload; it never removes or moves one. Agent sessions live in one process's memory, so an agent talks to one manager at a time.
 
 ## Data model
 
@@ -64,15 +67,16 @@ Driving the Docker adapter from assignments (the agent does not start workload c
 | `enrollments` | `node_id` | desired | Administrator's permission for a node ID to join; `revoked_at` set on revocation |
 | `services` | `id` | desired | Name (unique among live services), desired `replicas`, `current_revision`, optimistic-lock `version`, `deleted_at` |
 | `service_revisions` | `(service_id, revision)` | desired | Immutable spec snapshots (deployment history) |
-| `workloads` | `id` | desired | Placement (`node_id`), unique `name`, resources, `desired_state`, optional service/revision/replica slot |
+| `workloads` | `id` | desired | Placement (`node_id`), unique `name`, resources, published `ports`, `desired_state`, optional service/revision/replica slot (unique) |
+| `unschedulable_replicas` | `(service_id, revision, replica_index)` | scheduler output | Why a replica has no node yet: code, message and one reason per node; removed when it is placed or no longer wanted |
 | `events` | `id` | audit | Append-only administrative events |
 | `leases` | `name` | coordination | Named leases with fencing tokens for multi-manager duties |
 
-Migrations (001-007) live in `internal/store/migrations`, are recorded with their checksums in `schema_migrations` and are never edited after release. A workload has no observation until its agent reports (`Workload.Phase()` is then `scheduled`); reports set the phase (`pending`, `running`, `succeeded`, `failed`, `stopped`) in `workload_observations` and never touch `workloads`. Details, multi-manager design and the restart guarantee are in [state.md](state.md).
+Migrations (001-008) live in `internal/store/migrations`, are recorded with their checksums in `schema_migrations` and are never edited after release. A workload has no observation until its agent reports (`Workload.Phase()` is then `scheduled`); reports set the phase (`pending`, `running`, `succeeded`, `failed`, `stopped`) in `workload_observations` and never touch `workloads`. Details, multi-manager design and the restart guarantee are in [state.md](state.md).
 
 ## Node liveness
 
-A node is `ready` when `now - last_heartbeat <= DOCKFLEET_NODE_TTL`. The manager tells each agent its heartbeat interval at registration. Readiness is computed on read; nothing is written when a node goes quiet. A clean agent shutdown deregisters, which backdates the heartbeat so the node leaves scheduling immediately.
+A node is `ready` when `now - last_heartbeat <= DOCKFLEET_NODE_TTL`. The manager tells each agent its heartbeat interval at registration. Readiness is computed on read; nothing is written when a node goes quiet. A clean agent shutdown deregisters, which backdates the heartbeat so the node leaves scheduling immediately. The scheduler also skips a node whose enrollment was revoked, even while it still heartbeats, and says so.
 
 ## Lifecycle and cancellation
 
@@ -106,6 +110,7 @@ Known gaps: the admin API uses one shared bearer token, there is no CRL/OCSP (re
 - **Generated code is not committed.** `buf generate` output goes to `internal/protocol/dockfleet/` and is git-ignored; CI and `make proto` regenerate it from pinned tool versions. This avoids drift at the cost of a required step after cloning.
 - **In-memory store** exists for fast tests and database-free development; it is not a production option and logs a warning.
 - **Placement is recorded, not executed**, so the admin API and scheduler can be built and tested before the runtime exists.
+- **Deciding is separate from saving, and saving from running.** `internal/scheduler` answers "where?" from a snapshot and nothing else; `internal/placement` saves the answer as desired state; the agent and `internal/docker` are the only code that touches containers. Each can be tested without the others.
 
 ## Extension points for the next stages
 

@@ -14,25 +14,29 @@ var testTime = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 // newStore returns an empty store; it is called once per subtest.
 func runStoreConformance(t *testing.T, newStore func(t *testing.T) Store) {
 	t.Helper()
-	suites := map[string]func(*testing.T, Store){
-		"nodes":                 testNodes,
-		"enrollments":           testEnrollments,
-		"workloads":             testWorkloads,
-		"observations":          testObservations,
-		"services":              testServices,
-		"service revisions":     testRevisions,
-		"service definitions":   testDefinitions,
-		"service workloads":     testServiceWorkloads,
-		"service deletion":      testServiceDeletion,
-		"events":                testEvents,
-		"leases":                testLeases,
-		"transactions":          testTransactions,
-		"transaction rollbacks": testTransactionRollbacks,
+	suites := []struct {
+		name string
+		run  func(*testing.T, Store)
+	}{
+		{"nodes", testNodes},
+		{"enrollments", testEnrollments},
+		{"workloads", testWorkloads},
+		{"observations", testObservations},
+		{"services", testServices},
+		{"service revisions", testRevisions},
+		{"service definitions", testDefinitions},
+		{"workload ports", testWorkloadPorts},
+		{"unschedulable replicas", testUnschedulable},
+		{"service workloads", testServiceWorkloads},
+		{"service deletion", testServiceDeletion},
+		{"events", testEvents},
+		{"leases", testLeases},
+		{"transactions", testTransactions},
+		{"transaction rollbacks", testTransactionRollbacks},
 	}
-	for name, suite := range suites {
-		t.Run(name, func(t *testing.T) {
-			s := newStore(t)
-			suite(t, s)
+	for _, suite := range suites {
+		t.Run(suite.name, func(t *testing.T) {
+			suite.run(t, newStore(t))
 		})
 	}
 }

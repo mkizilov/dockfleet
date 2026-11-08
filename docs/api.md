@@ -2,7 +2,7 @@
 
 The manager's HTTP API (`internal/api`) is how administrators describe what should run. This document covers **service definitions**. Nodes, workloads, enrollments and events are listed in the [README](../README.md#administrative-api).
 
-A service definition is **desired state**: it says what an administrator wants, and it is stored (PostgreSQL, or memory for development) as such. Defining, changing or deleting a service does **not** place, schedule, start or stop anything. Nothing turns definitions into containers yet; the definitions, their revision history and their replica counts are what a later controller will act on. See [state.md](state.md).
+A service definition is **desired state**: it says what an administrator wants, and it is stored (PostgreSQL, or memory for development) as such. Defining, changing or deleting a service through this API does **not** place, schedule, start or stop anything: the handlers only record intent (and read the scheduler's results back, see [Scheduling status](#scheduling-status)). The scheduler ([scheduler.md](scheduler.md)) runs separately in the manager, assigns waiting replicas to nodes and records why any has no node. Nothing turns assignments into containers yet. See [state.md](state.md).
 
 ## Access
 
@@ -72,13 +72,13 @@ Other statuses: `404` unknown service, `409` name already in use (or a concurren
 | `spec.ports` | no | Up to 32. `container_port` 1-65535 (required); `protocol` `tcp` (default) or `udp`; `host_port` 0 or omitted to let the node choose, otherwise 1024-65535 (lower ports are privileged). Ports and host ports must not repeat. Where a port is published is the agent's decision (loopback by default); a fixed `host_port` allows one replica per node. |
 | `spec.health_check` | no | `command`: program and arguments run inside the container, exit status 0 is healthy; at most 32 arguments. Exec form only: a leading `CMD`, `CMD-SHELL` or `NONE` is refused, so there is no shell string. `interval_seconds` (default 30, max 3600), `timeout_seconds` (5, max 300), `start_period_seconds` (0, max 3600), `retries` (3, max 10); zero or omitted means the default. |
 | `spec.restart_policy` | no | `condition` is `no`, `on-failure` or `always`. `max_retries` (1-100, default 5) applies to `on-failure` only. Omitted means `on-failure` with 5 retries. |
-| `spec.node_selector` | no | Up to 16 labels a node must carry. Used when placement exists. |
+| `spec.node_selector` | no | Up to 16 labels a node must carry. The scheduler only places a replica on a node whose labels include all of them. |
 
 Defaults are written into the stored definition, and the definition is put in a canonical form (ports sorted, empty values dropped). So `GET` shows what is stored, the same definition written differently is not a change, and **what `GET` returns is a valid `PUT` body** apart from the read-only fields below.
 
 ### Rejected options
 
-Only the fields above exist. Anything else is refused rather than ignored, so a typo or an unimplemented option can never be silently dropped. Docker options that would weaken the isolation between a container and its host get a specific message: `privileged`, `cap_add`, `devices`, `device_cgroup_rules`, `volumes`, `volumes_from`, `mounts`, `binds` (so no Docker socket or host path can be mounted), `network_mode`, `pid`/`pid_mode`, `ipc`/`ipc_mode`, `uts`/`uts_mode`, `userns_mode`, `security_opt`, `sysctls`, `cgroup_parent`, `group_add`, `host_ip`, `extra_hosts`. `id`, `version`, `revision`, `created_at`, `updated_at` and `deleted_at` are read-only.
+Only the fields above exist. Anything else is refused rather than ignored, so a typo or an unimplemented option can never be silently dropped. Docker options that would weaken the isolation between a container and its host get a specific message: `privileged`, `cap_add`, `devices`, `device_cgroup_rules`, `volumes`, `volumes_from`, `mounts`, `binds` (so no Docker socket or host path can be mounted), `network_mode`, `pid`/`pid_mode`, `ipc`/`ipc_mode`, `uts`/`uts_mode`, `userns_mode`, `security_opt`, `sysctls`, `cgroup_parent`, `group_add`, `host_ip`, `extra_hosts`. `id`, `version`, `revision`, `status`, `created_at`, `updated_at` and `deleted_at` are read-only.
 
 The limits are kept at least as strict as the agent's container policy ([docker.md](docker.md)): the agent re-checks every container it creates and refuses privileged mode, Docker socket mounts and the rest again, so a definition the API accepts is never one an agent would reject for its content.
 
@@ -92,12 +92,13 @@ The limits are kept at least as strict as the agent's container policy ([docker.
   "revision": 2,
   "version": 5,
   "spec": { "...": "as above" },
+  "status": { "...": "see Scheduling status" },
   "created_at": "2026-01-01T12:00:00Z",
   "updated_at": "2026-01-02T08:30:00Z"
 }
 ```
 
-`revision` is the deployment revision currently wanted and `spec` its content. `version` increases with every change and is also the `ETag` (`"5"`). A deleted service has `deleted_at` and `replicas` 0.
+`revision` is the deployment revision currently wanted and `spec` its content. `version` increases with every change and is also the `ETag` (`"5"`). A deleted service has `deleted_at` and `replicas` 0. `status` is the scheduler's, not part of the definition: it is read-only, and a `PUT` body that includes it is refused like any other read-only field (leave it out when writing a `GET` back).
 
 ## Updating and deleting
 
@@ -123,14 +124,55 @@ curl -s -H "Authorization: Bearer $TOKEN" $API/v1/services/web/revisions
 curl -s -X DELETE -H "Authorization: Bearer $TOKEN" $API/v1/services/web
 ```
 
+## Scheduling status
+
+Every service view (`GET /v1/services`, `GET /v1/services/{name}` and the responses of `POST`, `PUT` and `DELETE`) carries what the scheduler has decided:
+
+```json
+"status": {
+  "desired_replicas": 3,
+  "scheduled_replicas": 2,
+  "unschedulable_replicas": 1,
+  "replicas": [
+    {"revision": 2, "index": 1, "workload_id": "9c1e...", "workload_name": "web-r2-1-3f9a2c",
+     "node_id": "worker-1", "desired_state": "running", "phase": "scheduled"},
+    {"revision": 2, "index": 2, "workload_id": "b07d...", "workload_name": "web-r2-2-81c0de",
+     "node_id": "worker-2", "desired_state": "running", "phase": "running"}
+  ],
+  "unschedulable": [
+    {"service_id": "5f0c...", "revision": 2, "replica_index": 3,
+     "code": "insufficient_resources",
+     "message": "0/2 nodes can run web#3: 2 node(s) lack CPU (needs 500m)",
+     "nodes": [
+       {"node_id": "worker-1", "code": "insufficient_resources", "message": "insufficient resources (CPU: needs 500m, 100m free)"},
+       {"node_id": "worker-2", "code": "insufficient_resources", "message": "insufficient resources (CPU: needs 500m, 0m free)"}
+     ],
+     "since": "2026-01-02T08:31:05Z"}
+  ]
+}
+```
+
+- `scheduled_replicas` counts the wanted replicas of the current revision (index up to `replicas`) that have a workload meant to run; `unschedulable_replicas` those that have none because no node qualifies.
+- `replicas` lists the service's workloads, by revision and index, including those of older revisions: they still hold their node's resources until something removes them. `phase` is what the node's agent last reported, or `scheduled` before it has reported anything. The decision (`node_id`, `desired_state`) and the observation (`phase`) are separate facts.
+- `unschedulable` explains each waiting replica: a `code` (`no_nodes`, `no_available_nodes`, `selector_unsatisfied`, `host_port_conflict`, `insufficient_resources`, `exceeds_capacity`), a `message`, one reason per node, and `since`, when this explanation first applied (it does not move while nothing changes). The codes are described in [scheduler.md](scheduler.md#why-a-replica-cannot-be-placed). Scheduling runs every `DOCKFLEET_SCHEDULER_INTERVAL`, so a new or changed service shows an empty status for up to that long.
+
+The assignments themselves are ordinary workloads: `GET /v1/workloads` lists them with `node_id`, `desired_state`, `service_id`, `service_revision`, `replica_index` and `ports`, and each carries the agent's `observed` report beside the decision. The scheduler's audit events, with the actor `scheduler`, are in `GET /v1/events`: `replica.scheduled` (resource: the workload; details: service, revision, replica, node) and `replica.unschedulable` (resource: the service), the latter only when an explanation is new or changed.
+
+### Nodes and standalone workloads
+
+The same scheduler serves the other state endpoints:
+
+- `GET /v1/nodes` and `GET /v1/nodes/{id}` show, beside `status` (`ready` or `not_ready`), a `status_reason` when it is not ready (for example `no heartbeat within the last 30s`), the `allocatable` CPU and memory (`cpu_millis`, `memory_bytes`: capacity times the overcommit factor) and what is `allocated` to workloads that are meant to run (`cpu_millis`, `memory_bytes`, `workloads`).
+- `POST /v1/workloads` places the workload with the same rules. When nothing fits the answer is `409` with the reason for the request and for every node: `{"error": "0/1 nodes can run ...", "code": "insufficient_resources", "nodes": [{"node_id": "...", "code": "...", "message": "..."}]}`. A node whose enrollment was revoked gets nothing. (A duplicate name is also `409`, with only `error`.)
+
 ## Audit events
 
 Each successful change is recorded in `GET /v1/events` in the same transaction as the change: `service.created`, `service.deployed` (from and to revision, image), `service.scaled` (from and to replicas) and `service.deleted`, with the actor `admin`. Events never contain environment values. Requests that fail validation or change nothing record nothing.
 
 ## Not yet
 
-No pagination of the service list, no partial (`PATCH`) updates, no secret values, no image allow-list, no per-user authentication (one shared admin token), and, by design for now, no placement or scheduling.
+No pagination of the service list, no partial (`PATCH`) updates, no secret values, no image allow-list, no per-user authentication (one shared admin token), and nothing that removes or moves replicas once placed (scaling down or deploying a new revision leaves the earlier workloads in place; see [scheduler.md](scheduler.md#placement-passes)).
 
 ## Tests
 
-`internal/api/services_*_test.go` is one suite run against the in-memory store always and against PostgreSQL under the `integration` build tag (`make test-integration`; every test gets a throwaway database). It covers authentication (missing, malformed and wrong credentials on every route), CRUD, equivalent definitions, optimistic locking, deletion and name reuse, revisions, events, a validation table of over a hundred bad inputs, every unsafe option at every nesting level, request limits, and that no workload is ever created. PostgreSQL-only tests restart the store on the same database and run two managers against one.
+`internal/api/services_*_test.go` is one suite run against the in-memory store always and against PostgreSQL under the `integration` build tag (`make test-integration`; every test gets a throwaway database). It covers authentication (missing, malformed and wrong credentials on every route), CRUD, equivalent definitions, optimistic locking, deletion and name reuse, revisions, events, a validation table of over a hundred bad inputs, every unsafe option at every nesting level, request limits, that the handlers never create a workload, and the status after a scheduling pass (assigned, unschedulable with a reason for every node, across revisions, scaling and deletion), the node view and the standalone workload refusals. PostgreSQL-only tests restart the store on the same database and run two managers against one.

@@ -23,6 +23,7 @@ import (
 
 	"github.com/dockfleet/dockfleet/internal/agent"
 	"github.com/dockfleet/dockfleet/internal/protocol"
+	"github.com/dockfleet/dockfleet/internal/placement"
 	dockfleetv1 "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/v1"
 	"github.com/dockfleet/dockfleet/internal/registry"
 	"github.com/dockfleet/dockfleet/internal/scheduler"
@@ -354,6 +355,51 @@ func TestAssignedWorkloadsAreReportedBack(t *testing.T) {
 	other, err := m.store.GetWorkload(ctx, "w-theirs")
 	if err != nil || other.Phase() != store.WorkloadScheduled || other.Observed != nil {
 		t.Fatalf("another node's workload must not be touched: %+v, %v", other, err)
+	}
+}
+
+// The scheduler only decides and records. The node it names learns of the
+// assignment through the protocol, like any other workload, and an agent here
+// has no Docker at all (fakeDocker).
+func TestScheduledReplicasReachTheirAgents(t *testing.T) {
+	m := newManager(t, nil)
+	m.start()
+	m.startAgent("sim-1", nil)
+	m.startAgent("sim-2", nil)
+	waitFor(t, "registration", func() bool { return m.sessionID("sim-1") != "" && m.sessionID("sim-2") != "" })
+
+	ctx := context.Background()
+	// Each simulated node has 2000m, so two replicas of 1500m go on separate
+	// nodes and the third has nowhere to go.
+	svc, err := m.store.CreateService(ctx, store.NewService{
+		ID: "svc-web", Name: "web", Replicas: 3, At: time.Now(),
+		Spec: store.ServiceSpec{Image: "nginx:1", CPUMillis: 1500, MemoryBytes: 1 << 20},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := placement.New(placement.Config{Store: m.store, NodeTTL: time.Minute}).RunOnce(ctx)
+	if err != nil || report.Placed != 2 || report.Unschedulable != 1 {
+		t.Fatalf("scheduling pass = %+v, %v", report, err)
+	}
+
+	workloads, err := m.store.ListWorkloadsForService(ctx, svc.ID)
+	if err != nil || len(workloads) != 2 || workloads[0].NodeID == workloads[1].NodeID {
+		t.Fatalf("workloads = %+v, %v; want one replica on each node", workloads, err)
+	}
+	waitFor(t, "both agents to report their replica", func() bool {
+		for _, w := range workloads {
+			got, err := m.store.GetWorkload(ctx, w.ID)
+			if err != nil || got.Observed == nil || got.Observed.NodeID != w.NodeID || got.Phase() != store.WorkloadPending {
+				return false
+			}
+		}
+		return true
+	})
+
+	waiting, err := m.store.ListUnschedulable(ctx, svc.ID)
+	if err != nil || len(waiting) != 1 || waiting[0].ReplicaIndex != 3 || waiting[0].Code != scheduler.CodeInsufficientResources {
+		t.Fatalf("unschedulable = %+v, %v", waiting, err)
 	}
 }
 

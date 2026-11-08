@@ -6,7 +6,7 @@
 
 Only the agent. The manager never connects to Docker and never needs a Docker socket:
 
-- `internal/manager`, `internal/api`, `internal/registry`, `internal/store`, `internal/scheduler`, `internal/protocol` and `cmd/manager` do not import `internal/docker` or any `github.com/docker/...` package. `TestManagerSideNeverImportsDocker` parses their imports (transitively) and fails the build if that changes.
+- `internal/manager`, `internal/api`, `internal/registry`, `internal/store`, `internal/scheduler`, `internal/placement`, `internal/protocol` and `cmd/manager` do not import `internal/docker` or any `github.com/docker/...` package. `TestManagerSideNeverImportsDocker` parses their imports (transitively) and fails the build if that changes.
 - The manager's configuration has no Docker settings, and `deploy/` files must not mention `docker.sock` (also tested).
 - Agents reach the manager only over gRPC (mutual TLS). The adapter accepts a `unix://` socket or a loopback `tcp://` address; any other TCP host is refused because the Engine API is unauthenticated and equivalent to root on the host (`DOCKFLEET_DOCKER_HOST`, default `unix:///var/run/docker.sock`).
 - The agent process needs access to the socket, which is root-equivalent on that machine. Run it as a dedicated user with access to the socket and nothing else, and treat the worker host accordingly.

@@ -42,7 +42,7 @@ func migratedStore(t *testing.T) (*Postgres, string) {
 	return p, dbURL
 }
 
-const allTables = `nodes, enrollments, workloads, workload_observations, services, service_revisions, events, leases`
+const allTables = `nodes, enrollments, workloads, workload_observations, services, service_revisions, unschedulable_replicas, events, leases`
 
 func TestPostgresConformance(t *testing.T) {
 	p, _ := migratedStore(t)

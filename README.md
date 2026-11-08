@@ -1,8 +1,8 @@
 # DockFleet
 
-DockFleet is a distributed container orchestration system written in Go. A central **manager** keeps cluster state in PostgreSQL (desired and observed state kept apart) and places workloads; **agents** on worker nodes register with the manager, heartbeat, receive their assigned workloads and report status.
+DockFleet is a distributed container orchestration system written in Go. A central **manager** keeps cluster state in PostgreSQL (desired and observed state kept apart) and schedules workloads onto nodes by their free CPU and memory; **agents** on worker nodes register with the manager, heartbeat, receive their assigned workloads and report status.
 
-> **Status: early.** The manager-agent gRPC protocol (versioned registration, heartbeats, assignments, status reports) works end to end over mutual TLS with explicit node enrollment, and both processes shut down gracefully. The manager records placement decisions, but **no containers are created, started or stopped yet**: agents acknowledge assignments as `pending`. See [Limitations](#limitations).
+> **Status: early.** The manager-agent gRPC protocol (versioned registration, heartbeats, assignments, status reports) works end to end over mutual TLS with explicit node enrollment, and both processes shut down gracefully. The manager's scheduler assigns service replicas to nodes and records why any cannot be placed, but **no containers are created, started or stopped yet**: agents acknowledge assignments as `pending`. See [Limitations](#limitations).
 
 ## Layout
 
@@ -12,7 +12,8 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 | `cmd/agent`          | Worker-node entry point                                                 |
 | `cmd/pki`            | `dockfleet-pki`: development CA and certificate issuing                 |
 | `internal/api`       | Administrative HTTP API (services, nodes, workloads, enrollments, events, health) |
-| `internal/scheduler` | Workload placement (pure functions, no I/O)                             |
+| `internal/scheduler` | Placement decisions and their explanations (pure functions, no I/O) ([docs/scheduler.md](docs/scheduler.md)) |
+| `internal/placement` | Carries decisions out: reads the cluster, runs the scheduler, saves assignments and explanations |
 | `internal/agent`     | Node logic: register, heartbeat, retry, re-register                     |
 | `internal/store`     | Persistence: repository interfaces, transactions, versioned migrations; PostgreSQL and in-memory implementations ([docs/state.md](docs/state.md)) |
 | `internal/protocol`  | gRPC service, client, versioning, errors, bearer-token auth, TLS helpers |
@@ -27,7 +28,7 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 | `proto/`             | Protobuf definitions (`buf` module)                                     |
 | `deploy/`            | Docker Compose file for development dependencies                        |
 | `config/dev.env`     | Development-only configuration                                          |
-| `docs/`              | [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), [Mutual TLS and enrollment](docs/mtls.md), [Docker adapter](docs/docker.md), [Control-plane state](docs/state.md), [Services API](docs/api.md) |
+| `docs/`              | [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), [Mutual TLS and enrollment](docs/mtls.md), [Docker adapter](docs/docker.md), [Control-plane state](docs/state.md), [Services API](docs/api.md), [Scheduler](docs/scheduler.md) |
 
 ## Prerequisites
 
@@ -64,11 +65,12 @@ curl -s -X POST -H 'Authorization: Bearer dev-api-token-0123456789' \
   -d '{"name":"web","image":"nginx:1.27","cpu_millis":500,"memory_bytes":134217728}' \
   http://127.0.0.1:21280/v1/workloads
 
-# Describe a service (desired state only: nothing is placed or started yet)
+# Describe a service (desired state; nothing is started). Within a few seconds the scheduler
+# assigns its replicas to nodes, and `status` shows where each went or why one could not
 curl -s -X POST -H 'Authorization: Bearer dev-api-token-0123456789' \
   -d '{"name":"site","replicas":3,"spec":{"image":"nginx:1.27","cpu_millis":500,"memory_bytes":134217728,"ports":[{"container_port":80}]}}' \
   http://127.0.0.1:21280/v1/services
-curl -s -H 'Authorization: Bearer dev-api-token-0123456789' http://127.0.0.1:21280/v1/services
+curl -s -H 'Authorization: Bearer dev-api-token-0123456789' http://127.0.0.1:21280/v1/services/site
 ```
 
 Stop either process with Ctrl-C or `SIGTERM`; both drain and exit with status 0. `make compose-down` stops the database.
@@ -90,14 +92,14 @@ Administrators distributing real credentials should read [docs/mtls.md](docs/mtl
 | ------------------------- | ---- | ------------------------------------------------------------------- |
 | `GET /healthz`            | no   | Liveness                                                            |
 | `GET /readyz`             | no   | Readiness (store reachable)                                         |
-| `GET /v1/nodes`           | yes  | Registered nodes with `ready` / `not_ready` status                  |
+| `GET /v1/nodes`           | yes  | Registered nodes with `ready` / `not_ready` status (and why), allocatable and allocated resources |
 | `GET /v1/nodes/{id}`      | yes  | One node                                                            |
 | `POST /v1/workloads`      | yes  | Choose a node for a workload (desired state `running`); nothing is observed until its agent reports |
-| `GET /v1/workloads`       | yes  | All workloads, each with its desired state and its `observed` report |
+| `GET /v1/workloads`       | yes  | All workloads (including the scheduler's assignments of service replicas), each with its node, desired state and its `observed` report |
 | `GET /v1/workloads/{id}`  | yes  | One workload                                                        |
 | `POST /v1/services`       | yes  | Create a service definition: image, replicas, CPU and memory limits, environment, ports, health check, restart policy ([details](docs/api.md)) |
 | `GET /v1/services`        | yes  | List service definitions (`include_deleted=true` adds deleted ones)  |
-| `GET /v1/services/{name}` | yes  | One service definition, with its `ETag`                              |
+| `GET /v1/services/{name}` | yes  | One service definition, with its `ETag` and its scheduling `status`: where each replica was assigned, and why any has no node |
 | `PUT /v1/services/{name}` | yes  | Replace a definition: a changed spec is a new revision, a changed replica count a scaling; `If-Match` guards against lost updates |
 | `DELETE /v1/services/{name}` | yes | Delete a service (history is kept)                                |
 | `GET /v1/services/{name}/revisions` | yes | Deployment history                                         |
@@ -107,7 +109,7 @@ Administrators distributing real credentials should read [docs/mtls.md](docs/mtl
 | `GET /v1/enrollments/{id}` | yes | One enrollment                                                      |
 | `DELETE /v1/enrollments/{id}` | yes | Revoke an enrollment; the node's session ends at its next heartbeat |
 
-Errors are `{"error": "..."}`. A workload request that fits on no ready node returns `409`. A workload shows what was asked for (`desired_state`, `node_id`, ...) and, separately, what its agent reported (`observed`, `null` until the first report: `state` is one of `pending`, `running`, `succeeded`, `failed`, `stopped`, plus message, container ID, exit code, OOM kill, restart count and times). The two are never mixed: a report never changes what is wanted. See [docs/state.md](docs/state.md).
+Errors are `{"error": "..."}`. A workload request that fits on no ready node returns `409` with the scheduler's reason for the request and for each node (`code`, `nodes`; [docs/api.md](docs/api.md#nodes-and-standalone-workloads)). A workload shows what was asked for (`desired_state`, `node_id`, ...) and, separately, what its agent reported (`observed`, `null` until the first report: `state` is one of `pending`, `running`, `succeeded`, `failed`, `stopped`, plus message, container ID, exit code, OOM kill, restart count and times). The two are never mixed: a report never changes what is wanted. See [docs/state.md](docs/state.md).
 
 ## Manager-agent protocol
 
@@ -139,6 +141,8 @@ All settings are environment variables. The manager and agent refuse to start on
 | `DOCKFLEET_TLS_CERT_FILE`, `DOCKFLEET_TLS_KEY_FILE`, `DOCKFLEET_TLS_CLIENT_CA_FILE` | manager | unset | Set all three to enable TLS 1.3: HTTPS admin API and mutual TLS for agents (`DOCKFLEET_AGENT_TOKEN` is then ignored) |
 | `DOCKFLEET_HEARTBEAT_INTERVAL`   | manager | `10s`                        | Sent to agents on registration                             |
 | `DOCKFLEET_NODE_TTL`             | manager | `30s`                        | Node is `not_ready` after this long without a heartbeat; at least 2x the interval |
+| `DOCKFLEET_SCHEDULER_INTERVAL`   | manager | `5s`                         | Time between scheduling passes that assign waiting replicas to nodes |
+| `DOCKFLEET_SCHEDULER_CPU_OVERCOMMIT`, `DOCKFLEET_SCHEDULER_MEMORY_OVERCOMMIT` | manager | `1` | How many times a node's CPU or memory may be promised to workloads, from `1` (never more than the node has) to `8`. Raising it is a deliberate choice; see [docs/scheduler.md](docs/scheduler.md) |
 | `DOCKFLEET_REQUEST_TIMEOUT`      | manager | `10s`                        | Deadline for each gRPC call                                |
 | `DOCKFLEET_SHUTDOWN_TIMEOUT`     | manager | `15s`                        | Drain budget before connections are forced closed          |
 | `DOCKFLEET_MANAGER_ADDR`         | agent   | `127.0.0.1:21281`            | Non-loopback requires `DOCKFLEET_TLS_CA_FILE`              |
@@ -159,11 +163,11 @@ All settings are environment variables. The manager and agent refuse to start on
 ```sh
 make test               # unit tests, -race, no external services
 make cover              # per-package coverage
-make test-integration   # PostgreSQL store tests; needs `make compose-up`
+make test-integration   # PostgreSQL store, API and scheduling tests; needs `make compose-up`
 make test-docker        # Docker Engine tests; needs DOCKFLEET_TEST_DOCKER_HOST
 ```
 
-Unit tests need no Docker, database or network. `internal/integration` runs real agent loops against a real manager over gRPC on an in-memory transport (registration, heartbeats, assignments and status reports, manager restart and reconnection, long outages, graceful deregistration, superseded sessions, incompatible protocol versions, bad credentials) and over real TLS handshakes: trusted nodes, untrusted client and server certificates, wrong server names, wrong node identity, expired and not-yet-valid certificates, certificates expiring on an open connection, missing client certificates, unenrolled and revoked nodes, certificate renewal, and the absence of any plaintext fallback. Other network-style tests use `bufconn`, fake HTTP round-trippers, or loopback ports 21290-21295 (`internal/manager`). PostgreSQL tests are behind the `integration` build tag and read `DOCKFLEET_TEST_DATABASE_URL`: they create and drop a throwaway database per test on that server, so no data is shared or touched (migrations, upgrade from the previous schema, restart persistence, two managers on one database, constraints and index use; see [docs/state.md](docs/state.md)).
+Unit tests need no Docker, database or network. `internal/scheduler` has table-driven tests for resource exhaustion, offline nodes, deterministic placement (shuffled inputs give identical decisions), multiple replicas and conflicting constraints, all without a store or a clock; `internal/placement` runs the scheduling passes against the in-memory store (and PostgreSQL under the `integration` tag, including two managers scheduling at once). `internal/integration` runs real agent loops against a real manager over gRPC on an in-memory transport (registration, heartbeats, assignments and status reports, a scheduled replica reaching its agent, manager restart and reconnection, long outages, graceful deregistration, superseded sessions, incompatible protocol versions, bad credentials) and over real TLS handshakes: trusted nodes, untrusted client and server certificates, wrong server names, wrong node identity, expired and not-yet-valid certificates, certificates expiring on an open connection, missing client certificates, unenrolled and revoked nodes, certificate renewal, and the absence of any plaintext fallback. Other network-style tests use `bufconn`, fake HTTP round-trippers, or loopback ports 21290-21295 (`internal/manager`). PostgreSQL tests are behind the `integration` build tag and read `DOCKFLEET_TEST_DATABASE_URL`: they create and drop a throwaway database per test on that server, so no data is shared or touched (migrations, upgrade from the previous schema, restart persistence, two managers on one database, constraints and index use; see [docs/state.md](docs/state.md)).
 
 Generated protobuf code is not committed, so run `make generate` after a fresh clone and `make proto` after editing `proto/`.
 
@@ -171,8 +175,8 @@ Generated protobuf code is not committed, so run `make generate` after a fresh c
 
 - The Docker adapter (create, start, stop, remove, inspect, logs, stats) is implemented and tested, but the agent does not use it to run assigned workloads yet, so agents still report them `pending` and nothing reconciles failures. Workload assignments carry no ports, mounts or environment yet.
 - Sessions are held in manager memory: an agent talks to one manager at a time and registers again if that manager forgets it. Two agents configured with the same node ID will keep superseding each other.
-- The database is ready for several managers (placement lock, optimistic versions, leases, migration lock), but no leader election runs yet. Service definitions have a REST API ([docs/api.md](docs/api.md)) and are stored as desired state, but nothing turns them into workloads: no placement, scheduling or reconciliation of services yet.
-- Scheduling is a spread strategy that places one workload per request.
+- The database is ready for several managers (placement lock, optimistic versions, leases, migration lock), but no leader election runs yet; scheduling passes on several managers queue on the placement lock instead. Service definitions have a REST API ([docs/api.md](docs/api.md)); the scheduler assigns their replicas to nodes ([docs/scheduler.md](docs/scheduler.md)), but nothing removes, moves or restarts workloads: scaling down or deploying a new revision leaves the earlier workloads in place, and a workload on a dead node stays there.
+- Scheduling reserves each workload's declared CPU and memory limits (it does not measure usage), has no priorities, preemption or affinities, and checks only fixed host-port conflicts.
 - Node capacity is declared by the agent, not measured.
 - Registered nodes are never deleted; dead nodes stay listed as `not_ready`.
 - The admin API is authenticated by one shared bearer token (over HTTPS when TLS is configured). Certificate revocation is by enrollment only (no CRL/OCSP), and the development CA is not a production PKI.

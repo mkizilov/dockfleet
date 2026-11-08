@@ -15,13 +15,14 @@ import (
 // ---- workloads (desired) joined with observations (observed) ----
 
 const workloadSelect = `SELECT w.id, w.name, w.image, w.cpu_millis, w.memory_bytes, w.node_id, w.desired_state,
-	w.service_id, w.service_revision, w.replica_index, w.created_at, w.updated_at,
+	w.service_id, w.service_revision, w.replica_index, w.ports, w.created_at, w.updated_at,
 	o.workload_id, o.node_id, o.state, o.message, o.container_id, o.exit_code, o.oom_killed, o.restart_count,
 	o.started_at, o.finished_at, o.observed_at
 	FROM workloads w LEFT JOIN workload_observations o ON o.workload_id = w.id`
 
 func scanWorkload(row pgx.Row) (Workload, error) {
 	var w Workload
+	var ports []byte
 	var (
 		serviceID, obsWorkload, obsNode, obsState, obsMessage, obsContainer *string
 		revision, replica, obsExit, obsRestarts                             *int
@@ -29,7 +30,7 @@ func scanWorkload(row pgx.Row) (Workload, error) {
 		obsStarted, obsFinished, obsAt                                      *time.Time
 	)
 	err := row.Scan(&w.ID, &w.Name, &w.Image, &w.CPUMillis, &w.MemoryBytes, &w.NodeID, &w.DesiredState,
-		&serviceID, &revision, &replica, &w.CreatedAt, &w.UpdatedAt,
+		&serviceID, &revision, &replica, &ports, &w.CreatedAt, &w.UpdatedAt,
 		&obsWorkload, &obsNode, &obsState, &obsMessage, &obsContainer, &obsExit, &obsOOM, &obsRestarts,
 		&obsStarted, &obsFinished, &obsAt)
 	if err != nil {
@@ -37,6 +38,12 @@ func scanWorkload(row pgx.Row) (Workload, error) {
 	}
 	if serviceID != nil {
 		w.ServiceID, w.ServiceRevision, w.ReplicaIndex = *serviceID, *revision, *replica
+	}
+	if err := json.Unmarshal(ports, &w.Ports); err != nil {
+		return Workload{}, fmt.Errorf("decode ports of workload %s: %w", w.ID, err)
+	}
+	if len(w.Ports) == 0 {
+		w.Ports = nil
 	}
 	w.CreatedAt, w.UpdatedAt = w.CreatedAt.UTC(), w.UpdatedAt.UTC()
 	if obsWorkload != nil {
@@ -79,12 +86,20 @@ func (q *queries) CreateWorkload(ctx context.Context, w Workload) (Workload, err
 	if err != nil {
 		return Workload{}, err
 	}
+	ports := w.Ports
+	if ports == nil {
+		ports = []ServicePort{}
+	}
+	portsJSON, err := marshalJSON(ports)
+	if err != nil {
+		return Workload{}, err
+	}
 	_, err = q.db.Exec(ctx,
 		`INSERT INTO workloads (id, name, image, cpu_millis, memory_bytes, node_id, desired_state,
-		                        service_id, service_revision, replica_index, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+		                        service_id, service_revision, replica_index, ports, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
 		w.ID, w.Name, w.Image, w.CPUMillis, w.MemoryBytes, w.NodeID, w.DesiredState,
-		nilIfZero(w.ServiceID), nilIfZero(w.ServiceRevision), nilIfZero(w.ReplicaIndex), w.CreatedAt, w.UpdatedAt)
+		nilIfZero(w.ServiceID), nilIfZero(w.ServiceRevision), nilIfZero(w.ReplicaIndex), portsJSON, w.CreatedAt, w.UpdatedAt)
 	if err != nil {
 		return Workload{}, mapError(err)
 	}
@@ -407,6 +422,112 @@ func (q *queries) ListRevisions(ctx context.Context, serviceID string) ([]Revisi
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// ---- scheduling ----
+
+const unschedulableColumns = `service_id, revision, replica_index, code, message, nodes, since`
+
+func scanUnschedulable(row pgx.Row) (Unschedulable, error) {
+	var u Unschedulable
+	var nodes []byte
+	if err := row.Scan(&u.ServiceID, &u.Revision, &u.ReplicaIndex, &u.Code, &u.Message, &nodes, &u.Since); err != nil {
+		return Unschedulable{}, mapError(err)
+	}
+	if err := json.Unmarshal(nodes, &u.Nodes); err != nil {
+		return Unschedulable{}, fmt.Errorf("decode node reasons of replica %d of service %s: %w", u.ReplicaIndex, u.ServiceID, err)
+	}
+	if u.Nodes == nil {
+		u.Nodes = []NodeReason{}
+	}
+	u.Since = u.Since.UTC()
+	return u, nil
+}
+
+func (q *queries) ListUnschedulable(ctx context.Context, serviceID string) ([]Unschedulable, error) {
+	query := `SELECT ` + unschedulableColumns + ` FROM unschedulable_replicas`
+	var args []any
+	if serviceID != "" {
+		query += ` WHERE service_id = $1`
+		args = append(args, serviceID)
+	}
+	rows, err := q.db.Query(ctx, query+` ORDER BY service_id, revision, replica_index`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Unschedulable{}
+	for rows.Next() {
+		u, err := scanUnschedulable(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// ReplaceUnschedulable reads, compares and writes in one transaction. Callers
+// that may run concurrently (several managers) hold Tx.LockPlacement, so two
+// of them never interleave here.
+func (q *queries) ReplaceUnschedulable(ctx context.Context, items []Unschedulable, at time.Time) ([]Unschedulable, error) {
+	keep := make(map[slotKey]bool, len(items))
+	for _, item := range items {
+		if err := item.validate(); err != nil {
+			return nil, err
+		}
+		if keep[item.key()] {
+			return nil, fmt.Errorf("%w: replica %d of revision %d of service %s is listed twice", ErrInvalid, item.ReplicaIndex, item.Revision, item.ServiceID)
+		}
+		keep[item.key()] = true
+	}
+	var changed []Unschedulable
+	err := q.atomic(ctx, func(q *queries) error {
+		existing, err := q.ListUnschedulable(ctx, "")
+		if err != nil {
+			return err
+		}
+		old := make(map[slotKey]Unschedulable, len(existing))
+		for _, u := range existing {
+			old[u.key()] = u
+			if !keep[u.key()] {
+				if _, err := q.db.Exec(ctx, `DELETE FROM unschedulable_replicas WHERE service_id = $1 AND revision = $2 AND replica_index = $3`,
+					u.ServiceID, u.Revision, u.ReplicaIndex); err != nil {
+					return err
+				}
+			}
+		}
+		for _, item := range items {
+			if prev, ok := old[item.key()]; ok && prev.SameReason(item) {
+				continue
+			}
+			nodes := item.Nodes
+			if nodes == nil {
+				nodes = []NodeReason{}
+			}
+			nodesJSON, err := marshalJSON(nodes)
+			if err != nil {
+				return err
+			}
+			item.Since = at.UTC()
+			_, err = q.db.Exec(ctx,
+				`INSERT INTO unschedulable_replicas (`+unschedulableColumns+`)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7)
+				 ON CONFLICT (service_id, revision, replica_index) DO UPDATE SET
+				   code = EXCLUDED.code, message = EXCLUDED.message, nodes = EXCLUDED.nodes, since = EXCLUDED.since`,
+				item.ServiceID, item.Revision, item.ReplicaIndex, item.Code, item.Message, nodesJSON, item.Since)
+			if err != nil {
+				return mapError(err)
+			}
+			changed = append(changed, cloneUnschedulable(item))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sortUnschedulable(changed)
+	return changed, nil
 }
 
 // ---- events ----

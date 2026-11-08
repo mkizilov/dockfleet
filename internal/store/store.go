@@ -136,11 +136,14 @@ type Workload struct {
 	DesiredState string `json:"desired_state"`
 	// ServiceID, ServiceRevision and ReplicaIndex (1-based) are set together
 	// for a replica of a service and are all zero for a standalone workload.
-	ServiceID       string    `json:"service_id,omitempty"`
-	ServiceRevision int       `json:"service_revision,omitempty"`
-	ReplicaIndex    int       `json:"replica_index,omitempty"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	ServiceID       string `json:"service_id,omitempty"`
+	ServiceRevision int    `json:"service_revision,omitempty"`
+	ReplicaIndex    int    `json:"replica_index,omitempty"`
+	// Ports are the ports the workload publishes. The scheduler keeps two
+	// workloads from claiming the same fixed host port on one node.
+	Ports     []ServicePort `json:"ports,omitempty"`
+	CreatedAt time.Time     `json:"created_at"`
+	UpdatedAt time.Time     `json:"updated_at"`
 
 	// Observed is the agent's latest report, or nil until it has made one. It
 	// is read-only here: CreateWorkload ignores it, and only RecordObservations
@@ -163,6 +166,7 @@ func (w Workload) prepareForCreate() (Workload, error) {
 		w.DesiredState = DesiredRunning
 	}
 	w.Observed = nil
+	w.Ports = append([]ServicePort(nil), w.Ports...)
 	w.CreatedAt = w.CreatedAt.UTC()
 	if w.UpdatedAt.IsZero() {
 		w.UpdatedAt = w.CreatedAt
@@ -390,6 +394,41 @@ func (f EventFilter) limit() int {
 	return f.Limit
 }
 
+// NodeReason is why one node cannot take a replica.
+type NodeReason struct {
+	NodeID  string `json:"node_id"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// Unschedulable records that the scheduler found no valid node for one replica
+// of a service's current revision, and why. A record exists only while the
+// replica is waiting: placing it, or no longer wanting it, removes the record.
+type Unschedulable struct {
+	ServiceID    string       `json:"service_id"`
+	Revision     int          `json:"revision"`
+	ReplicaIndex int          `json:"replica_index"`
+	Code         string       `json:"code"`
+	Message      string       `json:"message"`
+	Nodes        []NodeReason `json:"nodes"`
+
+	// Since is when this code and message first applied.
+	Since time.Time `json:"since"`
+}
+
+// SameReason reports whether u gives the same explanation as v.
+func (u Unschedulable) SameReason(v Unschedulable) bool {
+	if u.Code != v.Code || u.Message != v.Message || len(u.Nodes) != len(v.Nodes) {
+		return false
+	}
+	for i := range u.Nodes {
+		if u.Nodes[i] != v.Nodes[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // Lease is a named, time-limited claim by one manager. Token increases every
 // time the lease changes hands, so a manager that lost its lease without
 // noticing can be told apart from the current holder (a fencing token).
@@ -489,6 +528,20 @@ type EventRepository interface {
 	ListEvents(ctx context.Context, f EventFilter) ([]Event, error)
 }
 
+// SchedulingRepository stores the scheduler's explanations for replicas it
+// could not place. Placements themselves are workloads.
+type SchedulingRepository interface {
+	// ReplaceUnschedulable makes items the complete set of unschedulable
+	// replicas. Records absent from items are removed. A record whose code,
+	// message and node reasons are unchanged is left as it is, keeping Since;
+	// the others are written with Since set to at. It returns the records that
+	// are new or changed, so callers can report each change once.
+	ReplaceUnschedulable(ctx context.Context, items []Unschedulable, at time.Time) (changed []Unschedulable, err error)
+	// ListUnschedulable returns the records of one service, or of all services
+	// when serviceID is empty, ordered by service, revision and replica index.
+	ListUnschedulable(ctx context.Context, serviceID string) ([]Unschedulable, error)
+}
+
 // LeaseRepository stores named leases with fencing tokens, the building block
 // for "only one manager does this" duties such as a reconciler. Managers
 // pass their own clock, so they need synchronized clocks (NTP).
@@ -510,6 +563,7 @@ type Repositories interface {
 	EnrollmentRepository
 	WorkloadRepository
 	ServiceRepository
+	SchedulingRepository
 	EventRepository
 	LeaseRepository
 }

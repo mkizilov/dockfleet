@@ -142,7 +142,13 @@ var serviceTests = []serviceTest{
 	{"validation", testServiceValidation},
 	{"unsafe options", testServiceUnsafeOptions},
 	{"request limits and secrets", testServiceRequestLimits},
-	{"no placement or scheduling", testServiceDoesNotSchedule},
+	{"defining a service schedules nothing", testServiceDoesNotSchedule},
+	{"status shows the scheduler's assignments", testServiceStatusShowsAssignments},
+	{"status explains an unschedulable replica", testServiceStatusExplainsWhyNot},
+	{"status names the reason for every node", testServiceStatusNamesEveryReason},
+	{"status across revisions, scaling and deletion", testServiceStatusAcrossRevisionsScalingAndDeletion},
+	{"standalone workloads use the same scheduler", testWorkloadsUseTheSameScheduler},
+	{"the node view explains availability", testNodeViewExplainsAvailability},
 	{"events", testServiceEvents},
 }
 

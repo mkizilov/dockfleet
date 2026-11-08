@@ -17,8 +17,10 @@ import (
 	"github.com/dockfleet/dockfleet/internal/config"
 	"github.com/dockfleet/dockfleet/internal/netutil"
 	"github.com/dockfleet/dockfleet/internal/pki"
+	"github.com/dockfleet/dockfleet/internal/placement"
 	"github.com/dockfleet/dockfleet/internal/protocol"
 	"github.com/dockfleet/dockfleet/internal/registry"
+	"github.com/dockfleet/dockfleet/internal/scheduler"
 	"github.com/dockfleet/dockfleet/internal/store"
 )
 
@@ -33,12 +35,18 @@ const (
 
 // Manager is the control plane: the admin HTTP API plus the agent-facing gRPC service.
 type Manager struct {
-	cfg      config.Manager
-	store    store.Store
-	registry *registry.Registry
-	logger   *slog.Logger
-	apiTLS   *tls.Config
-	grpcTLS  *tls.Config
+	cfg       config.Manager
+	store     store.Store
+	registry  *registry.Registry
+	scheduler *placement.Scheduler
+	logger    *slog.Logger
+	apiTLS    *tls.Config
+	grpcTLS   *tls.Config
+}
+
+// overcommit is the configured factors as the scheduler takes them.
+func overcommit(cfg config.Manager) scheduler.Overcommit {
+	return scheduler.Overcommit{CPU: cfg.CPUOvercommit, Memory: cfg.MemoryOvercommit}
 }
 
 // New prepares the manager. TLS material is loaded eagerly so a bad
@@ -48,7 +56,14 @@ type Manager struct {
 // token) and the agent gRPC listener requires a client certificate signed by
 // the client CA; the certificate files are re-read when they change.
 func New(cfg config.Manager, st store.Store, logger *slog.Logger) (*Manager, error) {
-	m := &Manager{cfg: cfg, store: st, registry: registry.New(st, logger).WithInstanceID(cfg.InstanceID), logger: logger}
+	m := &Manager{
+		cfg: cfg, store: st, logger: logger,
+		registry: registry.New(st, logger).WithInstanceID(cfg.InstanceID),
+		scheduler: placement.New(placement.Config{
+			Store: st, Logger: logger, NodeTTL: cfg.NodeTTL, Overcommit: overcommit(cfg),
+			Interval: cfg.SchedulerInterval, InstanceID: cfg.InstanceID,
+		}),
+	}
 	if cfg.TLSCertFile != "" {
 		var err error
 		m.apiTLS, err = pki.ServerTLS(pki.ServerConfig{CertFile: cfg.TLSCertFile, KeyFile: cfg.TLSKeyFile, Logger: logger})
@@ -104,6 +119,7 @@ func (m *Manager) Serve(ctx context.Context, apiLn, grpcLn net.Listener) error {
 			NodeTTL:    m.cfg.NodeTTL,
 			Logger:     m.logger,
 			InstanceID: m.cfg.InstanceID,
+			Overcommit: overcommit(m.cfg),
 		}),
 		TLSConfig:         m.apiTLS,
 		ReadHeaderTimeout: 10 * time.Second,
@@ -136,6 +152,13 @@ func (m *Manager) Serve(ctx context.Context, apiLn, grpcLn net.Listener) error {
 			errCh <- fmt.Errorf("grpc server: %w", err)
 		}
 	}()
+	if m.cfg.SchedulerInterval > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.scheduler.Run(watchCtx)
+		}()
+	}
 	if m.cfg.TLSCertFile != "" {
 		wg.Add(1)
 		go func() {

@@ -188,6 +188,54 @@ func TestLoadAgentRejectsInvalid(t *testing.T) {
 	}
 }
 
+func TestLoadManagerSchedulerSettings(t *testing.T) {
+	c, err := LoadManager(getenv(managerEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.SchedulerInterval != 5*time.Second || c.CPUOvercommit != 1 || c.MemoryOvercommit != 1 {
+		t.Fatalf("defaults: interval %s, CPU overcommit %v, memory overcommit %v; nothing is oversubscribed unless asked", c.SchedulerInterval, c.CPUOvercommit, c.MemoryOvercommit)
+	}
+
+	vars := managerEnv()
+	vars["DOCKFLEET_SCHEDULER_INTERVAL"] = "2s"
+	vars["DOCKFLEET_SCHEDULER_CPU_OVERCOMMIT"] = "2.5"
+	vars["DOCKFLEET_SCHEDULER_MEMORY_OVERCOMMIT"] = "1"
+	c, err = LoadManager(getenv(vars))
+	if err != nil || c.SchedulerInterval != 2*time.Second || c.CPUOvercommit != 2.5 || c.MemoryOvercommit != 1 {
+		t.Fatalf("explicit settings: %+v, %v", c, err)
+	}
+
+	for _, tt := range []struct{ key, value string }{
+		{"DOCKFLEET_SCHEDULER_INTERVAL", "0s"},
+		{"DOCKFLEET_SCHEDULER_INTERVAL", "soon"},
+		{"DOCKFLEET_SCHEDULER_CPU_OVERCOMMIT", "0.5"},
+		{"DOCKFLEET_SCHEDULER_CPU_OVERCOMMIT", "0"},
+		{"DOCKFLEET_SCHEDULER_CPU_OVERCOMMIT", "-2"},
+		{"DOCKFLEET_SCHEDULER_CPU_OVERCOMMIT", "8.5"},
+		{"DOCKFLEET_SCHEDULER_CPU_OVERCOMMIT", "lots"},
+		{"DOCKFLEET_SCHEDULER_CPU_OVERCOMMIT", "NaN"},
+		{"DOCKFLEET_SCHEDULER_CPU_OVERCOMMIT", "Inf"},
+		{"DOCKFLEET_SCHEDULER_MEMORY_OVERCOMMIT", "0.9"},
+		{"DOCKFLEET_SCHEDULER_MEMORY_OVERCOMMIT", "100"},
+	} {
+		vars := managerEnv()
+		vars[tt.key] = tt.value
+		if _, err := LoadManager(getenv(vars)); err == nil || !strings.Contains(err.Error(), tt.key) {
+			t.Errorf("%s=%q: error = %v, want one naming the setting", tt.key, tt.value, err)
+		}
+	}
+
+	// The boundaries themselves are fine.
+	for _, v := range []string{"1", "1.0", "8"} {
+		vars := managerEnv()
+		vars["DOCKFLEET_SCHEDULER_CPU_OVERCOMMIT"] = v
+		if _, err := LoadManager(getenv(vars)); err != nil {
+			t.Errorf("overcommit %s rejected: %v", v, err)
+		}
+	}
+}
+
 func TestLoadManagerInstanceID(t *testing.T) {
 	first, err := LoadManager(getenv(managerEnv()))
 	if err != nil {

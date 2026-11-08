@@ -221,6 +221,7 @@ func testServiceValidation(t *testing.T, e *serviceEnv) {
 		{"read-only id", func(d def) { d["id"] = "abc" }, []string{"id"}},
 		{"read-only version", func(d def) { d["version"] = 3 }, []string{"version"}},
 		{"read-only revision", func(d def) { d["revision"] = 3 }, []string{"revision"}},
+		{"read-only status: scheduling is not something a definition asks for", func(d def) { d["status"] = def{"scheduled_replicas": 3} }, []string{"status"}},
 		{"read-only timestamps", func(d def) { d["created_at"] = "2026-01-01T00:00:00Z"; d["deleted_at"] = nil }, []string{"created_at", "deleted_at"}},
 	}
 	for _, tt := range cases {
