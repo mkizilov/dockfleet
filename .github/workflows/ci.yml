@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install pinned code generators
+        run: make tools
+      - name: Lint and generate protobuf code
+        run: |
+          make proto-lint
+          make proto
+      # Writes go.sum when it is not committed yet. Commit go.sum once generated.
+      - name: Resolve modules
+        run: make tidy
+      - name: Format, vet and unit tests
+        run: make check
+      - name: Build
+        run: make build
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16.4-alpine
+        env:
+          POSTGRES_USER: dockfleet
+          POSTGRES_PASSWORD: dockfleet-ci
+          POSTGRES_DB: dockfleet
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dockfleet -d dockfleet"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      DOCKFLEET_TEST_DATABASE_URL: postgres://dockfleet:dockfleet-ci@127.0.0.1:5432/dockfleet?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: make tools
+      - run: make proto
+      - run: make tidy
+      - name: PostgreSQL integration tests
+        run: go test -race -count=1 -tags integration ./internal/store/...

@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package dockfleet.v1;
+
+option go_package = "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/v1;dockfleetv1";
+
+// NodeService is served by the manager and called by agents.
+service NodeService {
+  // RegisterNode announces a node and its declared capacity. It is idempotent
+  // and is repeated by an agent whenever the manager forgets the node.
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+
+  // Heartbeat refreshes the liveness timestamp of a registered node.
+  // It returns NOT_FOUND when the node is not registered.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+message RegisterNodeRequest {
+  string node_id = 1;
+  string name = 2;
+  int64 cpu_millis = 3;
+  int64 memory_bytes = 4;
+  map<string, string> labels = 5;
+  string agent_version = 6;
+}
+
+message RegisterNodeResponse {
+  // Interval at which the agent should send heartbeats.
+  int64 heartbeat_interval_ms = 1;
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+}
+
+message HeartbeatResponse {}

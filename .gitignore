@@ -4,3 +4,10 @@
 .venv/
 _opam/
 .DS_Store
+
+# Build output and generated protobuf code (run `make proto`)
+/bin/
+/internal/protocol/dockfleet/
+*.test
+*.out
+coverage.*
