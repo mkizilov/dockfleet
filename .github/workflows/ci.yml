@@ -19,7 +19,7 @@ jobs:
           cache: false
       - name: Install pinned generators, lint and generate protobuf code
         run: make generate
-      # Writes go.sum when it is not committed yet. Commit go.sum once generated.
+      # go.sum is committed; this keeps it and go.mod complete.
       - name: Resolve modules
         run: make tidy
       - name: Format, vet and unit tests
@@ -55,7 +55,28 @@ jobs:
       - run: make proto
       - run: make tidy
       - name: PostgreSQL integration tests
-        run: go test -race -count=1 -tags integration ./internal/store/... ./internal/api/... ./internal/placement/... ./internal/reconcile/...
+        run: go test -race -count=1 -tags integration ./internal/store/... ./internal/api/... ./internal/placement/... ./internal/reconcile/... ./internal/integration/...
+
+  etcd:
+    runs-on: ubuntu-latest
+    env:
+      DOCKFLEET_TEST_ETCD_ENDPOINTS: http://127.0.0.1:21234
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: make tools
+      - run: make proto
+      - run: make tidy
+      - name: Start etcd
+        run: make etcd-test-up
+      - name: etcd integration tests
+        run: make test-etcd
+      - name: Stop etcd
+        if: always()
+        run: make etcd-test-down
 
   docker:
     runs-on: ubuntu-latest

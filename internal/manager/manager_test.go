@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/dockfleet/dockfleet/internal/config"
+	"github.com/dockfleet/dockfleet/internal/election"
 	"github.com/dockfleet/dockfleet/internal/logstream"
 	"github.com/dockfleet/dockfleet/internal/pki"
 	"github.com/dockfleet/dockfleet/internal/protocol"
@@ -148,9 +149,6 @@ func TestServeStreamsContainerLogsAndShutsDownWithAnOpenStream(t *testing.T) {
 	if _, err := st.CreateEnrollment(bg, store.Enrollment{NodeID: "node-1", CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.CreateWorkload(bg, store.Workload{ID: "w1", Name: "web", Image: "nginx", CPUMillis: 1, MemoryBytes: 1, NodeID: "node-1", CreatedAt: time.Now()}); err != nil {
-		t.Fatal(err)
-	}
 	m, err := New(cfg, st, discardLogger())
 	if err != nil {
 		t.Fatal(err)
@@ -176,9 +174,17 @@ func TestServeStreamsContainerLogsAndShutsDownWithAnOpenStream(t *testing.T) {
 	defer client.Close()
 	callCtx, callCancel := context.WithTimeout(ctx, 20*time.Second)
 	defer callCancel()
+	// The administrator's requests outlive the manager's context: the test ends
+	// the manager while a response is open and must still read the end of it.
+	httpCtx, httpCancel := context.WithTimeout(bg, 30*time.Second)
+	defer httpCancel()
 	session, err := client.Register(callCtx, protocol.NodeInfo{ID: "node-1", Name: "Node 1", CPUMillis: 1000, MemoryBytes: 1 << 30})
 	if err != nil {
 		t.Fatalf("Register: %v", err)
+	}
+	// A workload can only be placed on a node that has registered.
+	if _, err := st.CreateWorkload(bg, store.Workload{ID: "w1", Name: "web", Image: "nginx", CPUMillis: 1, MemoryBytes: 1, NodeID: "node-1", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
 	}
 	conn, err := client.Logs(callCtx, "node-1", session.ID)
 	if err != nil {
@@ -207,7 +213,7 @@ func TestServeStreamsContainerLogsAndShutsDownWithAnOpenStream(t *testing.T) {
 	}
 
 	get := func(token string) *http.Response {
-		req, err := http.NewRequestWithContext(callCtx, http.MethodGet, "http://"+testLogsAPIAddr+"/v1/workloads/w1/logs?follow=true&tail=5", nil)
+		req, err := http.NewRequestWithContext(httpCtx, http.MethodGet, "http://"+testLogsAPIAddr+"/v1/workloads/w1/logs?follow=true&tail=5", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -447,6 +453,13 @@ func TestServeExportsMetricsAndServesTheDashboard(t *testing.T) {
 	if resp, _ := do(http.MethodGet, "/v1/nodes", "", nil); resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("/v1/nodes without credentials = %d", resp.StatusCode)
 	}
+	// Without etcd this manager is the only one: it says so, and leads by itself.
+	if resp, body := do(http.MethodGet, "/v1/cluster", cfg.APIToken, nil); resp.StatusCode != http.StatusOK || !strings.Contains(body, `"mode":"single"`) || !strings.Contains(body, `"role":"single"`) {
+		t.Errorf("/v1/cluster = %d: %s", resp.StatusCode, body)
+	}
+	if st := m.Leadership(); st.Role != election.Leader || st.ID != "observe-test" {
+		t.Errorf("a manager without an election has leadership %+v", st)
+	}
 	if resp, _ := do(http.MethodGet, "/healthz", "", nil); resp.StatusCode != http.StatusOK {
 		t.Errorf("/healthz = %d", resp.StatusCode)
 	}
@@ -459,6 +472,19 @@ func TestServeExportsMetricsAndServesTheDashboard(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Serve did not return after context cancellation")
+	}
+}
+
+// A cluster that is configured but has no way to elect is a mistake, not a manager
+// that quietly runs as the only one: two of them would both lead.
+func TestHighAvailabilityNeedsAnElectionBackend(t *testing.T) {
+	cfg := testConfig()
+	cfg.EtcdEndpoints = []string{"http://127.0.0.1:2379"}
+	if _, err := New(cfg, store.NewMemory(), discardLogger()); err == nil || !strings.Contains(err.Error(), "no election backend") {
+		t.Fatalf("New with endpoints and no backend = %v, want it refused", err)
+	}
+	if _, err := New(testConfig(), store.NewMemory(), discardLogger()); err != nil {
+		t.Fatalf("a single manager is built without one: %v", err)
 	}
 }
 

@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
+	"net/url"
 	"os"
 	"path"
 	"runtime"
@@ -81,6 +83,34 @@ type Manager struct {
 	// DashboardEnabled serves the administrative dashboard under /dashboard.
 	MetricsEnabled   bool
 	DashboardEnabled bool
+
+	// High availability. With EtcdEndpoints set, several managers share the
+	// PostgreSQL database and elect one leader through a lease in etcd; only the
+	// leader schedules and reconciles. Without it the manager is the only one
+	// and needs no etcd. ElectionTTL is how long the leader's lease lasts
+	// without being renewed, so how long a failover takes at most (plus a third).
+	// An https endpoint is reached with mutual TLS: the CA that signed etcd's
+	// certificate, and this manager's own certificate and key. Plaintext is only
+	// for etcd on loopback.
+	EtcdEndpoints []string
+	EtcdCAFile    string
+	EtcdCertFile  string
+	EtcdKeyFile   string
+	EtcdPrefix    string
+	ElectionTTL   time.Duration
+}
+
+// HAEnabled reports whether the manager takes part in a leader election.
+func (m Manager) HAEnabled() bool { return len(m.EtcdEndpoints) > 0 }
+
+// EtcdTLSEnabled reports whether any etcd endpoint is reached over TLS.
+func (m Manager) EtcdTLSEnabled() bool {
+	for _, e := range m.EtcdEndpoints {
+		if strings.HasPrefix(e, "https://") {
+			return true
+		}
+	}
+	return false
 }
 
 // TLSEnabled reports whether the manager serves TLS. TLS always means mutual
@@ -91,9 +121,13 @@ func (m Manager) TLSEnabled() bool {
 
 // Agent is the agent process configuration. Token must never be logged.
 type Agent struct {
-	LogLevel      string
-	LogFormat     string
-	ManagerAddr   string
+	LogLevel    string
+	LogFormat   string
+	ManagerAddr string
+	// ManagerAddrs are the managers to talk to: DOCKFLEET_MANAGER_ADDRS when a
+	// high-availability cluster is configured, otherwise just ManagerAddr. Only
+	// the leader of a cluster answers, and the agent finds it.
+	ManagerAddrs  []string
 	Token         string
 	TLSCAFile     string
 	TLSCertFile   string
@@ -171,6 +205,12 @@ func LoadManager(get Getenv) (Manager, error) {
 	c.LogWriteTimeout = duration(get, "DOCKFLEET_LOG_WRITE_TIMEOUT", 30*time.Second, &errs)
 	c.MetricsEnabled = boolean(get, "DOCKFLEET_METRICS_ENABLED", true, &errs)
 	c.DashboardEnabled = boolean(get, "DOCKFLEET_DASHBOARD_ENABLED", true, &errs)
+	c.EtcdEndpoints = splitList(get("DOCKFLEET_ETCD_ENDPOINTS"))
+	c.EtcdCAFile = env(get, "DOCKFLEET_ETCD_CA_FILE", "")
+	c.EtcdCertFile = env(get, "DOCKFLEET_ETCD_CERT_FILE", "")
+	c.EtcdKeyFile = env(get, "DOCKFLEET_ETCD_KEY_FILE", "")
+	c.EtcdPrefix = env(get, "DOCKFLEET_ETCD_PREFIX", "/dockfleet")
+	c.ElectionTTL = duration(get, "DOCKFLEET_ELECTION_TTL", 15*time.Second, &errs)
 
 	switch c.Store {
 	case "postgres":
@@ -225,10 +265,81 @@ func LoadManager(get Getenv) (Manager, error) {
 		fail("DOCKFLEET_NODE_UNAVAILABLE_AFTER (%s) must be longer than DOCKFLEET_NODE_TTL (%s): a node is suspect before it is unavailable", c.NodeUnavailableAfter, c.NodeTTL)
 	}
 
+	loadHA(get, &c, fail)
+
 	if err := errors.Join(errs...); err != nil {
 		return Manager{}, err
 	}
 	return c, nil
+}
+
+// Bounds of the election TTL. etcd counts leases in whole seconds, and a TTL
+// of a few seconds would let an ordinary pause of the leader's process end its term.
+const (
+	minElectionTTL = 5 * time.Second
+	maxElectionTTL = 5 * time.Minute
+	maxEtcdPrefix  = 128
+)
+
+// loadHA validates the high-availability settings. Everything here is only
+// checked when DOCKFLEET_ETCD_ENDPOINTS is set: a single manager ignores it.
+func loadHA(get Getenv, c *Manager, fail func(string, ...any)) {
+	if !c.HAEnabled() {
+		for _, name := range []string{"DOCKFLEET_ETCD_CA_FILE", "DOCKFLEET_ETCD_CERT_FILE", "DOCKFLEET_ETCD_KEY_FILE"} {
+			if get(name) != "" {
+				fail("%s is set but DOCKFLEET_ETCD_ENDPOINTS is not: set the endpoints to turn on high availability, or unset the etcd settings", name)
+			}
+		}
+		return
+	}
+	if c.Store != "postgres" {
+		fail("DOCKFLEET_ETCD_ENDPOINTS needs DOCKFLEET_STORE=postgres: managers that elect a leader must share their state, and the in-memory store is private to one process")
+	}
+	if get("DOCKFLEET_INSTANCE_ID") == "" {
+		fail("DOCKFLEET_INSTANCE_ID must be set, unique per manager, when DOCKFLEET_ETCD_ENDPOINTS is set: it names the leader in the cluster, the audit trail and the metrics")
+	}
+	if c.ElectionTTL < minElectionTTL || c.ElectionTTL > maxElectionTTL {
+		fail("DOCKFLEET_ELECTION_TTL (%s) must be between %s and %s", c.ElectionTTL, minElectionTTL, maxElectionTTL)
+	}
+	// A failover takes up to four thirds of the TTL (the lease must lapse, then a
+	// follower's next campaign wins), and the agents notice a heartbeat later. All
+	// of it has to fit in the lease the agents fence themselves by, or every
+	// change of leader would stop the containers of the fleet.
+	if c.ElectionTTL >= minElectionTTL && c.NodeLease < 2*c.ElectionTTL+c.HeartbeatInterval {
+		fail("DOCKFLEET_NODE_LEASE (%s) must be at least twice DOCKFLEET_ELECTION_TTL plus DOCKFLEET_HEARTBEAT_INTERVAL (%s), so that agents find a new leader before their lease runs out and they stop their containers", c.NodeLease, 2*c.ElectionTTL+c.HeartbeatInterval)
+	}
+	badChar := func(r rune) bool { return r <= ' ' || r == 0x7f }
+	if len(c.EtcdPrefix) < 2 || !strings.HasPrefix(c.EtcdPrefix, "/") || strings.HasSuffix(c.EtcdPrefix, "/") || len(c.EtcdPrefix) > maxEtcdPrefix || strings.ContainsFunc(c.EtcdPrefix, badChar) {
+		fail("DOCKFLEET_ETCD_PREFIX %q must be a path such as /dockfleet: it starts with /, does not end with one, has no spaces or control characters, and is at most %d characters", c.EtcdPrefix, maxEtcdPrefix)
+	}
+
+	secure := false
+	seen := map[string]bool{}
+	for _, raw := range c.EtcdEndpoints {
+		u, err := url.Parse(raw)
+		switch {
+		case err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.User != nil:
+			fail("DOCKFLEET_ETCD_ENDPOINTS entry %q must look like https://host:2379 (or http://127.0.0.1:2379 for development)", raw)
+			continue
+		case u.Scheme == "http" && !netutil.IsLoopbackAddr(u.Host):
+			fail("DOCKFLEET_ETCD_ENDPOINTS entry %q is plaintext to a host that is not loopback; use https with DOCKFLEET_ETCD_CA_FILE (and a client certificate): there is no plaintext fallback", raw)
+		}
+		if u.Scheme == "https" {
+			secure = true
+		}
+		if seen[u.Host] {
+			fail("DOCKFLEET_ETCD_ENDPOINTS lists %s twice", u.Host)
+		}
+		seen[u.Host] = true
+	}
+	files := []string{c.EtcdCAFile, c.EtcdCertFile, c.EtcdKeyFile}
+	anyFile := files[0] != "" || files[1] != "" || files[2] != ""
+	switch {
+	case secure && (files[0] == "" || files[1] == "" || files[2] == ""):
+		fail("an https etcd endpoint needs DOCKFLEET_ETCD_CA_FILE, DOCKFLEET_ETCD_CERT_FILE and DOCKFLEET_ETCD_KEY_FILE together: managers reach etcd with mutual TLS, because whoever can write the leadership key decides who leads")
+	case !secure && anyFile:
+		fail("DOCKFLEET_ETCD_CA_FILE, DOCKFLEET_ETCD_CERT_FILE and DOCKFLEET_ETCD_KEY_FILE apply to https endpoints, and none of the endpoints is one")
+	}
 }
 
 // LoadAgent reads and validates agent configuration.
@@ -240,6 +351,10 @@ func LoadAgent(get Getenv) (Agent, error) {
 	c.LogLevel = env(get, "DOCKFLEET_LOG_LEVEL", "info")
 	c.LogFormat = env(get, "DOCKFLEET_LOG_FORMAT", "json")
 	c.ManagerAddr = env(get, "DOCKFLEET_MANAGER_ADDR", "127.0.0.1:21281")
+	c.ManagerAddrs = splitList(get("DOCKFLEET_MANAGER_ADDRS"))
+	if len(c.ManagerAddrs) == 0 {
+		c.ManagerAddrs = []string{c.ManagerAddr}
+	}
 	c.Token = env(get, "DOCKFLEET_AGENT_TOKEN", "")
 	c.TLSCAFile = env(get, "DOCKFLEET_TLS_CA_FILE", "")
 	c.TLSCertFile = env(get, "DOCKFLEET_TLS_CERT_FILE", "")
@@ -288,9 +403,21 @@ func LoadAgent(get Getenv) (Agent, error) {
 		if len(c.Token) < minTokenLength {
 			fail("DOCKFLEET_AGENT_TOKEN must be set to at least %d characters when TLS is not configured", minTokenLength)
 		}
-		if !netutil.IsLoopbackAddr(c.ManagerAddr) {
-			fail("DOCKFLEET_MANAGER_ADDR=%q is not a loopback address; configure mutual TLS (DOCKFLEET_TLS_CA_FILE, DOCKFLEET_TLS_CERT_FILE, DOCKFLEET_TLS_KEY_FILE): plaintext is never used for remote managers", c.ManagerAddr)
+		for _, addr := range c.ManagerAddrs {
+			if !netutil.IsLoopbackAddr(addr) {
+				fail("manager address %q is not a loopback address; configure mutual TLS (DOCKFLEET_TLS_CA_FILE, DOCKFLEET_TLS_CERT_FILE, DOCKFLEET_TLS_KEY_FILE): plaintext is never used for remote managers", addr)
+			}
 		}
+	}
+	seenAddr := map[string]bool{}
+	for _, addr := range c.ManagerAddrs {
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			fail("manager address %q must look like host:port", addr)
+		}
+		if seenAddr[addr] {
+			fail("manager address %q is listed twice", addr)
+		}
+		seenAddr[addr] = true
 	}
 
 	if err := errors.Join(errs...); err != nil {

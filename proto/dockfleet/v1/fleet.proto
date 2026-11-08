@@ -31,6 +31,13 @@ option go_package = "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/
 // Failures that the agent can act on carry a ProtocolError in the gRPC status
 // details. See docs/protocol.md.
 //
+// High availability: with several managers (docs/high-availability.md) only
+// the leader answers an agent, and every answer that carries instructions
+// (RegisterNode, Heartbeat) carries the control_plane_epoch of the leader's
+// term. The epoch grows with every change of leader. An agent that has seen an
+// epoch refuses answers with a lower one: they come from a manager that has
+// been replaced, and acting on them could undo what the new leader decided.
+//
 // Container logs: the manager never connects to agents either, so an agent
 // that is registered opens one long-lived Logs stream and serves the log
 // requests the manager sends down it. See docs/logs.md.
@@ -209,6 +216,13 @@ enum ProtocolErrorCode {
   // The client certificate is expired, not yet valid, or carries no node
   // identity. Renew it; a new connection picks up the renewed certificate.
   PROTOCOL_ERROR_CODE_CERTIFICATE_INVALID = 7;
+  // The manager is part of a high-availability cluster and is not its leader.
+  // Try another manager; the agent keeps its containers as they are.
+  PROTOCOL_ERROR_CODE_NOT_LEADER = 8;
+  // The answer carried a control_plane_epoch lower than one the agent has
+  // already seen. The agent raises this itself and ignores the answer; it is
+  // not sent over the wire.
+  PROTOCOL_ERROR_CODE_STALE_CONTROL_PLANE = 9;
 }
 
 // ProtocolError is attached to the gRPC status details of failed calls.
@@ -235,6 +249,10 @@ message RegisterNodeResponse {
   // How long a successful Heartbeat keeps the session's lease, counted from
   // when the agent sent the request. 0 from a manager that grants none.
   int64 lease_ms = 5;
+  // The epoch of the control plane that sent this answer (see the note on high
+  // availability above). 0 until a leader was ever elected, which is always so
+  // when there is a single manager.
+  int64 control_plane_epoch = 6;
 }
 
 message HeartbeatRequest {
@@ -249,6 +267,8 @@ message HeartbeatResponse {
   // stopped. A workload leaves the list only when the manager deleted it after
   // the node confirmed that the container is gone.
   repeated WorkloadAssignment assignments = 1;
+  // The epoch of the control plane that sent this answer; see RegisterNodeResponse.
+  int64 control_plane_epoch = 2;
 }
 
 message DeregisterNodeRequest {

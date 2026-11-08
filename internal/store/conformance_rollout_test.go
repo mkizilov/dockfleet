@@ -38,11 +38,11 @@ func testRolloutPolicy(t *testing.T, s Store) {
 		t.Fatalf("stored service = %+v", got)
 	}
 	for name, p := range map[string]RolloutPolicy{
-		"negative surge":        {MaxSurge: -1},
-		"negative unavailable":  {MaxUnavailable: -1, MaxSurge: 1},
-		"too much surge":        {MaxSurge: MaxRolloutReplicas + 1},
-		"too long a deadline":   {MaxSurge: 1, ProgressDeadlineSeconds: MaxProgressDeadlineSeconds + 1},
-		"a negative deadline":   {MaxSurge: 1, ProgressDeadlineSeconds: -5},
+		"negative surge":       {MaxSurge: -1},
+		"negative unavailable": {MaxUnavailable: -1, MaxSurge: 1},
+		"too much surge":       {MaxSurge: MaxRolloutReplicas + 1},
+		"too long a deadline":  {MaxSurge: 1, ProgressDeadlineSeconds: MaxProgressDeadlineSeconds + 1},
+		"a negative deadline":  {MaxSurge: 1, ProgressDeadlineSeconds: -5},
 	} {
 		_, err := s.CreateService(ctx, NewService{ID: "x", Name: "x", Spec: webSpec(), At: testTime, Rollout: p})
 		if !errors.Is(err, ErrInvalid) {

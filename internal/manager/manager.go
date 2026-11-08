@@ -17,6 +17,7 @@ import (
 	"github.com/dockfleet/dockfleet/internal/api"
 	"github.com/dockfleet/dockfleet/internal/config"
 	"github.com/dockfleet/dockfleet/internal/dashboard"
+	"github.com/dockfleet/dockfleet/internal/election"
 	"github.com/dockfleet/dockfleet/internal/logstream"
 	"github.com/dockfleet/dockfleet/internal/metrics"
 	"github.com/dockfleet/dockfleet/internal/netutil"
@@ -52,6 +53,45 @@ type Manager struct {
 	logger     *slog.Logger
 	apiTLS     *tls.Config
 	grpcTLS    *tls.Config
+
+	// elector is nil for a manager that runs alone. With one, only the leader
+	// schedules and reconciles, and only the leader answers agents; the loops
+	// below are built afresh for each term (see leaderDuty). schedulingObserver
+	// and reconcileObserver are what each term's loops report to.
+	elector            *election.Elector
+	schedulingObserver placement.Observer
+	reconcileObserver  reconcile.Observer
+}
+
+// Option changes how a Manager is built.
+type Option func(*Manager)
+
+// WithElection makes the manager one of several that share the control plane:
+// it takes part in an election on the backend (etcd), and only the elected
+// leader schedules, reconciles and answers agents. Without it the manager is the
+// only one and needs no backend.
+func WithElection(backend election.Backend) Option {
+	return func(m *Manager) {
+		m.elector = election.New(election.Config{
+			Backend:  backend,
+			ID:       m.cfg.InstanceID,
+			Key:      m.cfg.EtcdPrefix + "/leader",
+			TTL:      m.cfg.ElectionTTL,
+			Begin:    m.beginTerm,
+			Duties:   []election.Duty{m.leaderDuty},
+			OnChange: m.onLeadershipChange,
+			Logger:   m.logger,
+		})
+	}
+}
+
+// Leadership says whether this manager leads. A manager without an election is
+// its own leader in every way but the epoch, which it does not use.
+func (m *Manager) Leadership() election.Status {
+	if m.elector == nil {
+		return election.Status{ID: m.cfg.InstanceID, Role: election.Leader}
+	}
+	return m.elector.Status()
 }
 
 // overcommit is the configured factors as the scheduler takes them.
@@ -78,7 +118,7 @@ func (l loopMetrics) RolloutFailed(service string) { l.m.DeploymentFailed(servic
 // With TLS configured, the admin API serves HTTPS (authenticated by its bearer
 // token) and the agent gRPC listener requires a client certificate signed by
 // the client CA; the certificate files are re-read when they change.
-func New(cfg config.Manager, st store.Store, logger *slog.Logger) (*Manager, error) {
+func New(cfg config.Manager, st store.Store, logger *slog.Logger, opts ...Option) (*Manager, error) {
 	// Silence from before this manager started is not counted against a node:
 	// a manager that was down cannot tell a dead node from one it could not hear.
 	timing := scheduler.Timing{SuspectAfter: cfg.NodeTTL, UnavailableAfter: cfg.NodeUnavailableAfter, Since: time.Now()}
@@ -92,6 +132,7 @@ func New(cfg config.Manager, st store.Store, logger *slog.Logger) (*Manager, err
 	}
 	m := &Manager{
 		cfg: cfg, store: st, logger: logger, timing: timing, metrics: instruments,
+		schedulingObserver: schedulingObserver, reconcileObserver: reconcileObserver,
 		registry: registry.New(st, logger).WithInstanceID(cfg.InstanceID),
 		scheduler: placement.New(placement.Config{
 			Store: st, Logger: logger, NodeTTL: cfg.NodeTTL, Timing: timing, Overcommit: overcommit(cfg),
@@ -105,6 +146,12 @@ func New(cfg config.Manager, st store.Store, logger *slog.Logger) (*Manager, err
 	m.logs = logstream.NewHub(logstream.HubConfig{
 		MaxStreams: cfg.LogMaxStreams, Window: cfg.LogWindowBytes, ReconnectWait: cfg.LogReconnectWait, Logger: logger,
 	})
+	for _, opt := range opts {
+		opt(m)
+	}
+	if cfg.HAEnabled() && m.elector == nil {
+		return nil, errors.New("high availability is configured (DOCKFLEET_ETCD_ENDPOINTS) but no election backend was given")
+	}
 	if cfg.TLSCertFile != "" {
 		var err error
 		m.apiTLS, err = pki.ServerTLS(pki.ServerConfig{CertFile: cfg.TLSCertFile, KeyFile: cfg.TLSKeyFile, Logger: logger})
@@ -128,7 +175,12 @@ func (m *Manager) Sessions() []registry.Session {
 // that is enabled. The dashboard reads through the API's own handler, so what
 // it shows is what an API client is allowed to see.
 func (m *Manager) httpHandler() (http.Handler, error) {
+	var cluster api.Cluster
+	if m.elector != nil {
+		cluster = m.elector // (a nil *Elector in the interface would not be nil)
+	}
 	admin := api.New(api.Config{
+		Cluster:         cluster,
 		Store:           m.store,
 		Token:           m.cfg.APIToken,
 		NodeTTL:         m.cfg.NodeTTL,
@@ -186,6 +238,9 @@ func (m *Manager) Serve(ctx context.Context, apiLn, grpcLn net.Listener) error {
 		}
 	}
 	nodes := protocol.NewNodeServer(m.registry, m.cfg.HeartbeatInterval, m.logger).WithLease(m.cfg.NodeLease).WithLogs(m.logs, 0)
+	if m.elector != nil {
+		nodes.WithFencing(m.elector)
+	}
 	serverOpts := protocol.ServerOptions{
 		TLS:              m.grpcTLS,
 		Token:            m.cfg.AgentToken,
@@ -238,19 +293,34 @@ func (m *Manager) Serve(ctx context.Context, apiLn, grpcLn net.Listener) error {
 			errCh <- fmt.Errorf("grpc server: %w", err)
 		}
 	}()
-	if m.cfg.SchedulerInterval > 0 {
-		wg.Add(1)
+	// The election runs on a context of its own, which ends first when the manager
+	// shuts down: a leader gives up its lease before it stops serving, so another
+	// manager takes over at once and the agents are never left with a leader that
+	// is about to go.
+	electCtx, stopElection := context.WithCancel(ctx)
+	defer stopElection()
+	electionDone := make(chan struct{})
+	if m.elector != nil {
 		go func() {
-			defer wg.Done()
-			m.scheduler.Run(watchCtx)
+			defer close(electionDone)
+			m.elector.Run(electCtx)
 		}()
-	}
-	if m.cfg.ReconcileInterval > 0 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			m.reconciler.Run(watchCtx)
-		}()
+	} else {
+		close(electionDone)
+		if m.cfg.SchedulerInterval > 0 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				m.scheduler.Run(watchCtx)
+			}()
+		}
+		if m.cfg.ReconcileInterval > 0 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				m.reconciler.Run(watchCtx)
+			}()
+		}
 	}
 	if m.cfg.TLSCertFile != "" {
 		wg.Add(1)
@@ -269,6 +339,9 @@ func (m *Manager) Serve(ctx context.Context, apiLn, grpcLn net.Listener) error {
 		errs = append(errs, err)
 		m.logger.Error("server failed, shutting down", "error", err)
 	}
+
+	stopElection()
+	<-electionDone
 
 	// Open log streams would hold both servers up until the shutdown timeout:
 	// end them first, so that clients and agents see the manager go away.

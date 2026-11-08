@@ -38,6 +38,10 @@ func runStoreConformance(t *testing.T, newStore func(t *testing.T) Store) {
 		{"service deletion", testServiceDeletion},
 		{"events", testEvents},
 		{"leases", testLeases},
+		{"control plane epochs", testControlPlane},
+		{"control plane epochs in transactions", testControlPlaneInTransactions},
+		{"control plane epochs are handed out one at a time", testBeginTermsConcurrently},
+		{"the next term waits for transactions that checked the epoch", testNextTermWaitsForTransactionsThatCheckedTheEpoch},
 		{"transactions", testTransactions},
 		{"transaction rollbacks", testTransactionRollbacks},
 	}

@@ -496,3 +496,177 @@ func TestLoadManagerObservabilitySettings(t *testing.T) {
 		}
 	}
 }
+
+func haEnv() map[string]string {
+	m := managerEnv()
+	m["DOCKFLEET_ETCD_ENDPOINTS"] = "http://127.0.0.1:2379"
+	m["DOCKFLEET_INSTANCE_ID"] = "manager-1"
+	return m
+}
+
+// Without etcd a manager is the only one: nothing about the cluster is needed,
+// and leader election is off.
+func TestSingleManagerNeedsNoEtcd(t *testing.T) {
+	c, err := LoadManager(getenv(managerEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.HAEnabled() || len(c.EtcdEndpoints) != 0 {
+		t.Fatalf("high availability is on without endpoints: %+v", c)
+	}
+	// A random instance ID is fine for a manager that is alone.
+	if !strings.HasPrefix(c.InstanceID, "manager-") {
+		t.Errorf("instance ID = %q", c.InstanceID)
+	}
+	mem := managerEnv()
+	mem["DOCKFLEET_STORE"] = "memory"
+	if c, err := LoadManager(getenv(mem)); err != nil || c.HAEnabled() {
+		t.Errorf("the in-memory store with a single manager = %+v, %v", c, err)
+	}
+}
+
+func TestLoadManagerHighAvailability(t *testing.T) {
+	c, err := LoadManager(getenv(haEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.HAEnabled() || len(c.EtcdEndpoints) != 1 || c.EtcdEndpoints[0] != "http://127.0.0.1:2379" || c.EtcdPrefix != "/dockfleet" || c.ElectionTTL != 15*time.Second || c.InstanceID != "manager-1" {
+		t.Fatalf("unexpected HA settings: %+v", c)
+	}
+
+	secure := haEnv()
+	secure["DOCKFLEET_ETCD_ENDPOINTS"] = "https://etcd-1.example.com:2379, https://etcd-2.example.com:2379"
+	secure["DOCKFLEET_ETCD_CA_FILE"] = "/etc/dockfleet/etcd-ca.pem"
+	secure["DOCKFLEET_ETCD_CERT_FILE"] = "/etc/dockfleet/etcd.pem"
+	secure["DOCKFLEET_ETCD_KEY_FILE"] = "/etc/dockfleet/etcd-key.pem"
+	secure["DOCKFLEET_ETCD_PREFIX"] = "/prod/dockfleet"
+	secure["DOCKFLEET_ELECTION_TTL"] = "30s"
+	secure["DOCKFLEET_NODE_LEASE"] = "90s"
+	secure["DOCKFLEET_NODE_UNAVAILABLE_AFTER"] = "3m"
+	c, err = LoadManager(getenv(secure))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.EtcdEndpoints) != 2 || c.EtcdCAFile == "" || c.EtcdPrefix != "/prod/dockfleet" || c.ElectionTTL != 30*time.Second {
+		t.Fatalf("unexpected secure HA settings: %+v", c)
+	}
+
+	if !c.EtcdTLSEnabled() || haCfg(t).EtcdTLSEnabled() {
+		t.Errorf("TLS enabled: %v for https endpoints, %v for a loopback http one", c.EtcdTLSEnabled(), haCfg(t).EtcdTLSEnabled())
+	}
+}
+
+func haCfg(t *testing.T) Manager {
+	t.Helper()
+	c, err := LoadManager(getenv(haEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func TestLoadManagerHighAvailabilityRejectsUnsafeSettings(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(map[string]string)
+		wantErr string
+	}{
+		{"the in-memory store", func(m map[string]string) { m["DOCKFLEET_STORE"] = "memory" }, "DOCKFLEET_STORE=postgres"},
+		{"no instance ID", func(m map[string]string) { delete(m, "DOCKFLEET_INSTANCE_ID") }, "DOCKFLEET_INSTANCE_ID must be set"},
+		{"plaintext etcd on another host", func(m map[string]string) { m["DOCKFLEET_ETCD_ENDPOINTS"] = "http://etcd.example.com:2379" }, "plaintext"},
+		{"plaintext etcd on a private address", func(m map[string]string) { m["DOCKFLEET_ETCD_ENDPOINTS"] = "http://10.0.0.5:2379" }, "plaintext"},
+		{"an endpoint that is no URL", func(m map[string]string) { m["DOCKFLEET_ETCD_ENDPOINTS"] = "etcd:2379" }, "must look like"},
+		{"an endpoint with a path", func(m map[string]string) { m["DOCKFLEET_ETCD_ENDPOINTS"] = "http://127.0.0.1:2379/v3" }, "must look like"},
+		{"an endpoint with credentials", func(m map[string]string) { m["DOCKFLEET_ETCD_ENDPOINTS"] = "http://user:pw@127.0.0.1:2379" }, "must look like"},
+		{"the same endpoint twice", func(m map[string]string) {
+			m["DOCKFLEET_ETCD_ENDPOINTS"] = "http://127.0.0.1:2379,http://127.0.0.1:2379"
+		}, "twice"},
+		{"a TTL too short", func(m map[string]string) { m["DOCKFLEET_ELECTION_TTL"] = "2s" }, "DOCKFLEET_ELECTION_TTL"},
+		{"a TTL too long", func(m map[string]string) { m["DOCKFLEET_ELECTION_TTL"] = "1h" }, "DOCKFLEET_ELECTION_TTL"},
+		{"a TTL that is no duration", func(m map[string]string) { m["DOCKFLEET_ELECTION_TTL"] = "soon" }, "DOCKFLEET_ELECTION_TTL"},
+		{"a lease a failover does not fit in", func(m map[string]string) { m["DOCKFLEET_ELECTION_TTL"] = "30s" }, "DOCKFLEET_NODE_LEASE"},
+		{"a prefix without a slash", func(m map[string]string) { m["DOCKFLEET_ETCD_PREFIX"] = "dockfleet" }, "DOCKFLEET_ETCD_PREFIX"},
+		{"a prefix with a trailing slash", func(m map[string]string) { m["DOCKFLEET_ETCD_PREFIX"] = "/dockfleet/" }, "DOCKFLEET_ETCD_PREFIX"},
+		{"the root as the prefix", func(m map[string]string) { m["DOCKFLEET_ETCD_PREFIX"] = "/" }, "DOCKFLEET_ETCD_PREFIX"},
+		{"a prefix with a space", func(m map[string]string) { m["DOCKFLEET_ETCD_PREFIX"] = "/dock fleet" }, "DOCKFLEET_ETCD_PREFIX"},
+		{"https without any TLS files", func(m map[string]string) { m["DOCKFLEET_ETCD_ENDPOINTS"] = "https://etcd.example.com:2379" }, "mutual TLS"},
+		{"https without a client certificate", func(m map[string]string) {
+			m["DOCKFLEET_ETCD_ENDPOINTS"] = "https://etcd.example.com:2379"
+			m["DOCKFLEET_ETCD_CA_FILE"] = "/etc/dockfleet/etcd-ca.pem"
+		}, "mutual TLS"},
+		{"https with a certificate and no key", func(m map[string]string) {
+			m["DOCKFLEET_ETCD_ENDPOINTS"] = "https://etcd.example.com:2379"
+			m["DOCKFLEET_ETCD_CA_FILE"] = "/etc/dockfleet/etcd-ca.pem"
+			m["DOCKFLEET_ETCD_CERT_FILE"] = "/etc/dockfleet/etcd.pem"
+		}, "mutual TLS"},
+		{"a mix of https without TLS files and loopback http", func(m map[string]string) {
+			m["DOCKFLEET_ETCD_ENDPOINTS"] = "http://127.0.0.1:2379,https://etcd.example.com:2379"
+		}, "mutual TLS"},
+		{"TLS files for a plaintext endpoint", func(m map[string]string) { m["DOCKFLEET_ETCD_CA_FILE"] = "/etc/dockfleet/etcd-ca.pem" }, "apply to https endpoints"},
+		{"etcd TLS files without endpoints", func(m map[string]string) {
+			delete(m, "DOCKFLEET_ETCD_ENDPOINTS")
+			m["DOCKFLEET_ETCD_CA_FILE"] = "/etc/dockfleet/etcd-ca.pem"
+		}, "DOCKFLEET_ETCD_ENDPOINTS is not"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vars := haEnv()
+			tt.mutate(vars)
+			_, err := LoadManager(getenv(vars))
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want it to mention %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// A lease just long enough for a failover is accepted, one second short is not.
+func TestLoadManagerHighAvailabilityLeaseBound(t *testing.T) {
+	for _, tt := range []struct {
+		lease string
+		ok    bool
+	}{{"40s", true}, {"39s", false}, {"5m", true}} {
+		vars := haEnv()
+		vars["DOCKFLEET_NODE_LEASE"] = tt.lease // 2*15s election TTL + 10s heartbeat = 40s
+		vars["DOCKFLEET_NODE_UNAVAILABLE_AFTER"] = "6m"
+		_, err := LoadManager(getenv(vars))
+		if (err == nil) != tt.ok {
+			t.Errorf("lease %s: error = %v, want ok=%v", tt.lease, err, tt.ok)
+		}
+	}
+}
+
+func TestLoadAgentManagerAddresses(t *testing.T) {
+	single, err := LoadAgent(getenv(agentEnv()))
+	if err != nil || len(single.ManagerAddrs) != 1 || single.ManagerAddrs[0] != "127.0.0.1:21281" {
+		t.Fatalf("default = %+v, %v", single.ManagerAddrs, err)
+	}
+
+	vars := agentEnv()
+	vars["DOCKFLEET_MANAGER_ADDRS"] = "127.0.0.1:21281, 127.0.0.1:21282,[::1]:21283"
+	c, err := LoadAgent(getenv(vars))
+	if err != nil || len(c.ManagerAddrs) != 3 || c.ManagerAddrs[1] != "127.0.0.1:21282" {
+		t.Fatalf("list = %+v, %v", c.ManagerAddrs, err)
+	}
+
+	for name, tt := range map[string]struct{ addrs, want string }{
+		"a remote address without TLS": {"127.0.0.1:21281,manager-2.example.com:21281", "not a loopback address"},
+		"a duplicate":                  {"127.0.0.1:21281,127.0.0.1:21281", "listed twice"},
+		"no port":                      {"127.0.0.1", "host:port"},
+	} {
+		bad := agentEnv()
+		bad["DOCKFLEET_MANAGER_ADDRS"] = tt.addrs
+		if _, err := LoadAgent(getenv(bad)); err == nil || !strings.Contains(err.Error(), tt.want) {
+			t.Errorf("%s: error = %v, want it to mention %q", name, err, tt.want)
+		}
+	}
+
+	// With mutual TLS, remote managers are fine.
+	tls := agentEnv()
+	delete(tls, "DOCKFLEET_AGENT_TOKEN")
+	tls["DOCKFLEET_TLS_CA_FILE"], tls["DOCKFLEET_TLS_CERT_FILE"], tls["DOCKFLEET_TLS_KEY_FILE"] = "/ca.pem", "/agent.pem", "/agent-key.pem"
+	tls["DOCKFLEET_MANAGER_ADDRS"] = "manager-1.example.com:21281,manager-2.example.com:21281"
+	if c, err := LoadAgent(getenv(tls)); err != nil || len(c.ManagerAddrs) != 2 {
+		t.Errorf("remote managers with mutual TLS = %+v, %v", c.ManagerAddrs, err)
+	}
+}

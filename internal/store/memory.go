@@ -27,6 +27,7 @@ type memState struct {
 	events       []Event
 	nextEventID  int64
 	leases       map[string]Lease
+	controlPlane ControlPlane
 
 	unschedulable map[slotKey]Unschedulable
 	rollouts      map[rolloutKey]Rollout
@@ -57,6 +58,7 @@ func newMemState() memState {
 		revisions:    map[string][]Revision{},
 		nextEventID:  1,
 		leases:       map[string]Lease{},
+		controlPlane: ControlPlane{ElectedAt: time.Unix(0, 0).UTC()},
 
 		unschedulable: map[slotKey]Unschedulable{},
 		rollouts:      map[rolloutKey]Rollout{},
@@ -174,6 +176,7 @@ func (s memState) clone() memState {
 	for k, v := range s.leases {
 		c.leases[k] = v
 	}
+	c.controlPlane = s.controlPlane
 	for k, v := range s.unschedulable {
 		c.unschedulable[k] = cloneUnschedulable(v)
 	}
@@ -845,6 +848,34 @@ func (m *Memory) ListEvents(_ context.Context, f EventFilter) ([]Event, error) {
 		}
 	}
 	return out, nil
+}
+
+// ---- control plane ----
+
+func (m *Memory) GetControlPlane(context.Context) (ControlPlane, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.s.controlPlane, nil
+}
+
+func (m *Memory) BeginTerm(_ context.Context, leader string, at time.Time) (current, previous ControlPlane, err error) {
+	if !ValidName(leader) {
+		return ControlPlane{}, ControlPlane{}, fmt.Errorf("%w: a leader needs a valid instance ID", ErrInvalid)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	previous = m.s.controlPlane
+	m.s.controlPlane = ControlPlane{Epoch: previous.Epoch + 1, Leader: leader, ElectedAt: at.UTC()}
+	return m.s.controlPlane, previous, nil
+}
+
+func (m *Memory) CheckEpoch(_ context.Context, epoch int64) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.s.controlPlane.Epoch != epoch {
+		return fmt.Errorf("%w (acting under epoch %d, current is %d, led by %s)", ErrStaleLeader, epoch, m.s.controlPlane.Epoch, m.s.controlPlane.Leader)
+	}
+	return nil
 }
 
 // ---- leases ----

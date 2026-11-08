@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/dockfleet/dockfleet/internal/election"
 	"github.com/dockfleet/dockfleet/internal/rollout"
 	"github.com/dockfleet/dockfleet/internal/scheduler"
 	"github.com/dockfleet/dockfleet/internal/store"
@@ -33,6 +34,13 @@ type Config struct {
 	Timing scheduler.Timing
 	// Observer, when set, is told how the loop is doing.
 	Observer Observer
+	// Fence, when set, makes every pass act under the epoch of the leader's term:
+	// the pass asks for the epoch before it starts (a manager that does not lead
+	// fails it with election.ErrNotLeader and nothing changes) and checks inside
+	// its transaction that the epoch is still the current one, so a leader that
+	// has been replaced cannot stop, delete or record anything. Nil is a single
+	// manager.
+	Fence election.Fence
 	// Now defaults to time.Now; tests set it.
 	Now func() time.Time
 }
@@ -202,10 +210,22 @@ func (r *Reconciler) trackRollouts(ctx context.Context, tx store.Tx, defs []stor
 func (r *Reconciler) RunOnce(ctx context.Context) (Report, error) {
 	var report Report
 	var failed []string
+	var epoch int64
+	if r.cfg.Fence != nil {
+		var err error
+		if epoch, err = r.cfg.Fence.Epoch(); err != nil {
+			return Report{}, err
+		}
+	}
 	err := r.cfg.Store.InTx(ctx, func(tx store.Tx) error {
 		report, failed = Report{}, nil
 		if err := tx.LockPlacement(ctx); err != nil {
 			return err
+		}
+		if r.cfg.Fence != nil {
+			if err := tx.CheckEpoch(ctx, epoch); err != nil {
+				return err
+			}
 		}
 		defs, err := tx.ListDefinitions(ctx, true)
 		if err != nil {
@@ -279,6 +299,9 @@ func (r *Reconciler) RunOnce(ctx context.Context) (Report, error) {
 		report.Rollouts = changed
 		return nil
 	})
+	if errors.Is(err, store.ErrStaleLeader) {
+		r.cfg.Fence.Fenced(epoch)
+	}
 	if err != nil {
 		return Report{}, err
 	}
@@ -288,6 +311,12 @@ func (r *Reconciler) RunOnce(ctx context.Context) (Report, error) {
 		}
 	}
 	return report, nil
+}
+
+// leadershipLost is whether a pass was refused because this manager is not (or
+// no longer) the leader.
+func leadershipLost(err error) bool {
+	return errors.Is(err, election.ErrNotLeader) || errors.Is(err, store.ErrStaleLeader)
 }
 
 // Run makes a pass at once and then every Interval until ctx ends. A pass that
@@ -315,6 +344,12 @@ func (r *Reconciler) pass(ctx context.Context) {
 	defer cancel()
 	began := time.Now()
 	report, err := r.RunOnce(passCtx)
+	if leadershipLost(err) {
+		// Not a failure of reconciling: another manager leads, or this one stopped
+		// leading while the pass ran, and nothing was saved.
+		r.cfg.Logger.Info("reconciliation pass skipped: this manager does not lead", "reason", err.Error())
+		return
+	}
 	if r.cfg.Observer != nil && (err == nil || ctx.Err() == nil) {
 		r.cfg.Observer.ReconcilePass(time.Since(began), report, err)
 	}

@@ -87,8 +87,9 @@ func (s *server) collectFleet(ctx context.Context) ([]metrics.Family, error) {
 
 	counts := map[string]int{}
 	used := scheduler.UsedByNode(workloads)
+	timing := s.healthTiming(ctx)
 	for _, n := range nodes {
-		v := s.view(n, used[n.ID])
+		v := s.view(n, used[n.ID], timing)
 		counts[v.Health]++
 		healthy.Add(bool01(v.Health == store.NodeHealthy), "node", n.ID)
 		cpu.Add(float64(n.CPUMillis), "node", n.ID, "kind", "capacity")

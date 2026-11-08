@@ -84,6 +84,18 @@ func IsCertificateInvalid(err error) bool {
 	return ErrorCode(err) == dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_CERTIFICATE_INVALID
 }
 
+// IsNotLeader reports that the manager is in a high-availability cluster and
+// is not its leader.
+func IsNotLeader(err error) bool {
+	return ErrorCode(err) == dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_LEADER
+}
+
+// IsStaleControlPlane reports that an answer was refused because it came from
+// a control plane older than one the agent has already heard from.
+func IsStaleControlPlane(err error) bool {
+	return ErrorCode(err) == dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_STALE_CONTROL_PLANE
+}
+
 // IsUnimplemented reports that the manager does not offer the call at all: it
 // is older than the feature, or the feature is switched off there. Retrying
 // cannot change that.
@@ -91,12 +103,17 @@ func IsUnimplemented(err error) bool { return status.Code(err) == codes.Unimplem
 
 // NeedsRegistration reports that the manager has no usable session for the
 // node and the agent must register again. For NOT_ENROLLED the registration
-// will keep failing until an administrator enrolls the node again.
+// will keep failing until an administrator enrolls the node again. A manager
+// that is not the leader, or an answer from a control plane that has been
+// replaced, also means the session is not worth keeping: registering again
+// looks for the leader.
 func NeedsRegistration(err error) bool {
 	switch ErrorCode(err) {
 	case dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_REGISTERED,
 		dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_SESSION_SUPERSEDED,
-		dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_ENROLLED:
+		dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_ENROLLED,
+		dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_LEADER,
+		dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_STALE_CONTROL_PLANE:
 		return true
 	}
 	return false

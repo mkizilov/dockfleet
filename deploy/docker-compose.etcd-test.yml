@@ -1,0 +1,36 @@
+name: dockfleet-etcd-test
+
+# A disposable single-member etcd for `make test-etcd`: the election client
+# and the managers' leader election are tested against a real etcd, not only
+# against the fake in internal/etcdfake. Start it with `make etcd-test-up`, point
+# the tests at it with
+#
+#   export DOCKFLEET_TEST_ETCD_ENDPOINTS=http://127.0.0.1:21234
+#
+# and delete it with `make etcd-test-down`.
+#
+# It is published on loopback only and speaks plaintext, which DockFleet allows
+# for loopback and nowhere else. Its data is in memory. The short election and
+# heartbeat timeouts let it grant the one-second leases the tests ask for (a
+# default etcd grants at least two); they are for this test member and nothing
+# else: a production etcd keeps its defaults.
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.35
+    command:
+      - etcd
+      - --name=dockfleet-test
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://127.0.0.1:21234
+      - --heartbeat-interval=20
+      - --election-timeout=200
+    ports:
+      - "127.0.0.1:${DOCKFLEET_TEST_ETCD_PORT:-21234}:2379"
+    tmpfs:
+      - /etcd-data
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
+      interval: 2s
+      timeout: 3s
+      retries: 20

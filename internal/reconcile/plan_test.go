@@ -243,7 +243,9 @@ func withPolicy(s store.Service, unavailable, surge int, paused bool) store.Serv
 }
 
 // notReady is a replica whose container exists but has not reported running.
-func notReady(w store.Workload) store.Workload { return observed(w, store.WorkloadPending, w.Generation) }
+func notReady(w store.Workload) store.Workload {
+	return observed(w, store.WorkloadPending, w.Generation)
+}
 
 // The reconciler retires old replicas as far as the service's policy allows:
 // ready ones only while at least the wanted count minus max_unavailable stay

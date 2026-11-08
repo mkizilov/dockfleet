@@ -168,6 +168,13 @@ func (a *Agent) checkDocker(ctx context.Context) {
 	a.cfg.Logger.Info("docker engine reachable")
 }
 
+// notLeaderRetry is how long the agent waits between registration attempts
+// while the managers it knows say none of them leads: an election is running,
+// and the answer is a few seconds away, so the wait does not grow the way it
+// does for a manager that is down. A lease that runs out first would stop the
+// node's containers (see DOCKFLEET_NODE_LEASE).
+const notLeaderRetry = time.Second
+
 // register retries until it succeeds, ctx ends, or the manager rejects the
 // registration permanently. It also returns when the successful request was sent.
 func (a *Agent) register(ctx context.Context) (protocol.Session, time.Time, error) {
@@ -189,7 +196,10 @@ func (a *Agent) register(ctx context.Context) (protocol.Session, time.Time, erro
 			a.cfg.Logger.Error("manager rejected registration", "error", err)
 			return protocol.Session{}, time.Time{}, fmt.Errorf("registration rejected: %w", err)
 		}
-		if protocol.IsNotEnrolled(err) {
+		if protocol.IsNotLeader(err) {
+			delay = min(delay, max(a.cfg.RetryMin, notLeaderRetry))
+			a.cfg.Logger.Warn("no manager is the leader right now; looking again", "retry_in", delay)
+		} else if protocol.IsNotEnrolled(err) {
 			a.cfg.Logger.Error("this node is not enrolled; an administrator must enroll it", "node_id", a.cfg.Node.ID, "retry_in", delay)
 		} else {
 			a.cfg.Logger.Warn("registration failed", "error", err, "retry_in", delay)

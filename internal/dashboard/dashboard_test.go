@@ -496,7 +496,10 @@ func TestLoginAndLogoutRefuseOtherSites(t *testing.T) {
 			t.Errorf("logout from %s = %d, want 403", name, rec.Code)
 		}
 	}
-	same := func(r *http.Request) { r.Header.Set("Origin", "http://example.com"); r.Header.Set("Sec-Fetch-Site", "same-origin") }
+	same := func(r *http.Request) {
+		r.Header.Set("Origin", "http://example.com")
+		r.Header.Set("Sec-Fetch-Site", "same-origin")
+	}
 	if rec := e.do(http.MethodPost, "/dashboard/login", body, same); rec.Code != http.StatusSeeOther {
 		t.Errorf("login from the same origin = %d", rec.Code)
 	}

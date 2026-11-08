@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 
+	"github.com/dockfleet/dockfleet/internal/election"
 	"github.com/dockfleet/dockfleet/internal/logstream"
 	dockfleetv1 "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/v1"
 	"github.com/dockfleet/dockfleet/internal/registry"
@@ -65,6 +66,15 @@ type Registry interface {
 	CheckSession(ctx context.Context, nodeID, sessionID string) error
 }
 
+// Fencing says whether this manager may serve agents, and under which
+// control-plane epoch. A manager without one serves with epoch 0.
+type Fencing interface {
+	// Epoch returns the epoch to put on answers. It returns election.ErrNotLeader
+	// while the manager is not the leader of its cluster. *election.Elector
+	// implements it.
+	Epoch() (int64, error)
+}
+
 // NodeServer implements the agent-facing NodeService.
 type NodeServer struct {
 	dockfleetv1.UnimplementedNodeServiceServer
@@ -73,6 +83,7 @@ type NodeServer struct {
 	lease    time.Duration
 	logger   *slog.Logger
 	version  *dockfleetv1.ProtocolVersion
+	fencing  Fencing
 
 	// logs receives the container logs agents stream; nil means the manager
 	// does not serve them. logCheck is how often an open log stream is checked
@@ -92,6 +103,45 @@ func NewNodeServer(reg Registry, interval time.Duration, logger *slog.Logger) *N
 func (s *NodeServer) WithLease(d time.Duration) *NodeServer {
 	s.lease = d
 	return s
+}
+
+// WithFencing makes the server answer only while f allows it, and stamp the
+// epoch f gives on the answers that carry instructions.
+func (s *NodeServer) WithFencing(f Fencing) *NodeServer {
+	s.fencing = f
+	return s
+}
+
+// epoch is the epoch to answer under, or the error to answer with: NOT_LEADER
+// when this manager does not lead its cluster.
+func (s *NodeServer) epoch(ctx context.Context) (int64, error) {
+	if s.fencing == nil {
+		return 0, nil
+	}
+	epoch, err := s.fencing.Epoch()
+	switch {
+	case err == nil:
+		return epoch, nil
+	case errors.Is(err, election.ErrNotLeader):
+		return 0, newStatusError(codes.FailedPrecondition, dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_LEADER,
+			"this manager is not the leader; try another manager", s.version)
+	}
+	return 0, s.internal(ctx, "read the control-plane epoch", err)
+}
+
+// stillEpoch checks, after the instructions were read, that the term they are
+// answered under has not ended in the meantime: an answer is never sent by a
+// manager that stopped leading while it was being made.
+func (s *NodeServer) stillEpoch(ctx context.Context, epoch int64) error {
+	now, err := s.epoch(ctx)
+	if err != nil {
+		return err
+	}
+	if now != epoch {
+		return newStatusError(codes.FailedPrecondition, dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_LEADER,
+			"the control-plane epoch changed while the answer was prepared; try again", s.version)
+	}
+	return nil
 }
 
 // WithVersion overrides the protocol version the server speaks. It exists to
@@ -235,6 +285,10 @@ func (s *NodeServer) RegisterNode(ctx context.Context, req *dockfleetv1.Register
 	if err := s.checkIdentity(ctx, req.GetIdentity().GetNodeId()); err != nil {
 		return nil, err
 	}
+	epoch, err := s.epoch(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if err := checkAgentVersion(s.version, req.GetProtocolVersion()); err != nil {
 		s.logger.WarnContext(ctx, "registration rejected", "reason", err.Error())
 		return nil, newStatusError(codes.FailedPrecondition, dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_INCOMPATIBLE_VERSION, err.Error(), s.version)
@@ -271,19 +325,27 @@ func (s *NodeServer) RegisterNode(ctx context.Context, req *dockfleetv1.Register
 	if err != nil {
 		return nil, s.internal(ctx, "register node", err)
 	}
+	if err := s.stillEpoch(ctx, epoch); err != nil {
+		return nil, err
+	}
 	s.logger.InfoContext(ctx, "node registered", "node_id", id.GetNodeId(), "name", id.GetName(), "session", session.ID,
-		"agent_protocol", formatVersion(req.GetProtocolVersion()), "assignments", len(workloads))
+		"agent_protocol", formatVersion(req.GetProtocolVersion()), "assignments", len(workloads), "epoch", epoch)
 	return &dockfleetv1.RegisterNodeResponse{
 		ProtocolVersion:     s.version,
 		SessionId:           session.ID,
 		HeartbeatIntervalMs: s.interval.Milliseconds(),
 		Assignments:         toAssignments(workloads),
 		LeaseMs:             s.lease.Milliseconds(),
+		ControlPlaneEpoch:   epoch,
 	}, nil
 }
 
 func (s *NodeServer) Heartbeat(ctx context.Context, req *dockfleetv1.HeartbeatRequest) (*dockfleetv1.HeartbeatResponse, error) {
 	if err := s.checkIdentity(ctx, req.GetNodeId()); err != nil {
+		return nil, err
+	}
+	epoch, err := s.epoch(ctx)
+	if err != nil {
 		return nil, err
 	}
 	if len(req.GetStatuses()) > maxStatuses {
@@ -321,11 +383,17 @@ func (s *NodeServer) Heartbeat(ctx context.Context, req *dockfleetv1.HeartbeatRe
 	if err != nil {
 		return nil, s.sessionError(ctx, "heartbeat", req.GetNodeId(), err)
 	}
-	return &dockfleetv1.HeartbeatResponse{Assignments: toAssignments(workloads)}, nil
+	if err := s.stillEpoch(ctx, epoch); err != nil {
+		return nil, err
+	}
+	return &dockfleetv1.HeartbeatResponse{Assignments: toAssignments(workloads), ControlPlaneEpoch: epoch}, nil
 }
 
 func (s *NodeServer) DeregisterNode(ctx context.Context, req *dockfleetv1.DeregisterNodeRequest) (*dockfleetv1.DeregisterNodeResponse, error) {
 	if err := s.checkIdentity(ctx, req.GetNodeId()); err != nil {
+		return nil, err
+	}
+	if _, err := s.epoch(ctx); err != nil {
 		return nil, err
 	}
 	if err := s.registry.Deregister(ctx, req.GetNodeId(), req.GetSessionId()); err != nil {

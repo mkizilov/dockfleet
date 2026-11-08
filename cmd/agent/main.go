@@ -75,7 +75,7 @@ func run() error {
 	}
 	defer engine.Close()
 
-	clientCfg := protocol.ClientConfig{Addr: cfg.ManagerAddr, Token: cfg.Token}
+	clientCfg := protocol.ClientConfig{Addrs: cfg.ManagerAddrs, Token: cfg.Token}
 	if cfg.TLSEnabled() {
 		if err := checkIdentity(cfg); err != nil {
 			return err
@@ -120,7 +120,7 @@ func run() error {
 		Labels:       cfg.Labels,
 		AgentVersion: version.Version,
 	}
-	logger.Info("starting dockfleet agent", "version", version.Version, "node_id", cfg.NodeID, "manager_addr", cfg.ManagerAddr, "mutual_tls", cfg.TLSEnabled())
+	logger.Info("starting dockfleet agent", "version", version.Version, "node_id", cfg.NodeID, "manager_addrs", cfg.ManagerAddrs, "mutual_tls", cfg.TLSEnabled())
 	// The agent treats zero as "the default" and a negative number as "none";
 	// in the environment zero means none.
 	logRequests := cfg.LogRequests

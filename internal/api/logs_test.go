@@ -134,7 +134,9 @@ func (a *simAgent) handle(d logstream.Down) {
 }
 
 // write makes a container write a line (stdout) at the time n ms after logT0.
-func (a *simAgent) write(workload string, n int, text string) { a.writeTo(workload, n, logstream.StreamStdout, text) }
+func (a *simAgent) write(workload string, n int, text string) {
+	a.writeTo(workload, n, logstream.StreamStdout, text)
+}
 
 func (a *simAgent) writeTo(workload string, n int, stream, text string) {
 	a.mu.Lock()
@@ -332,7 +334,9 @@ func texts(recs []logRecord) []string {
 	return out
 }
 
-func sameStrings(a, b []string) bool { return strings.Join(a, "\x00") == strings.Join(b, "\x00") && len(a) == len(b) }
+func sameStrings(a, b []string) bool {
+	return strings.Join(a, "\x00") == strings.Join(b, "\x00") && len(a) == len(b)
+}
 
 // withLogs puts a hub behind the handlers.
 func (e *serviceEnv) withLogs(cfg logstream.HubConfig, writeTimeout time.Duration) *logstream.Hub {
@@ -385,7 +389,9 @@ func (e *serviceEnv) logWorkloads() {
 func (e *serviceEnv) logFleet(hub *logstream.Hub) (n1, n2 *simAgent) {
 	e.t.Helper()
 	e.logWorkloads()
-	line := func(n int, text string) logstream.Line { return logstream.Line{Time: at(n), Stream: logstream.StreamStdout, Text: text} }
+	line := func(n int, text string) logstream.Line {
+		return logstream.Line{Time: at(n), Stream: logstream.StreamStdout, Text: text}
+	}
 	n1 = attachSim(e.t, hub, "n1", map[string][]logstream.Line{
 		"w-web-1":    {line(1, "a1"), line(4, "a2")},
 		"w-web-r2-1": {line(6, "c1")},
@@ -576,7 +582,9 @@ func testLogStreamResumesWhenAnAgentReconnects(t *testing.T, e *serviceEnv) {
 	}
 
 	// The agent comes back, having written another line meanwhile. Only that one is new.
-	line := func(n int, text string) logstream.Line { return logstream.Line{Time: at(n), Stream: logstream.StreamStdout, Text: text} }
+	line := func(n int, text string) logstream.Line {
+		return logstream.Line{Time: at(n), Stream: logstream.StreamStdout, Text: text}
+	}
 	attachSim(t, hub, "n1", map[string][]logstream.Line{"w-web-1": {line(1, "a1"), line(4, "a2"), line(30, "a3")}})
 	if rec := c.record(); rec.Type != "notice" || rec.Kind != "resumed" {
 		t.Fatalf("notice = %+v", rec)
@@ -589,7 +597,9 @@ func testLogStreamResumesWhenAnAgentReconnects(t *testing.T, e *serviceEnv) {
 func testLogStreamReportsNodesItCannotReach(t *testing.T, e *serviceEnv) {
 	hub := e.withLogs(logstream.HubConfig{}, 0)
 	e.logWorkloads()
-	line := func(n int, text string) logstream.Line { return logstream.Line{Time: at(n), Stream: logstream.StreamStdout, Text: text} }
+	line := func(n int, text string) logstream.Line {
+		return logstream.Line{Time: at(n), Stream: logstream.StreamStdout, Text: text}
+	}
 	// Only n1 is connected to this manager.
 	attachSim(t, hub, "n1", map[string][]logstream.Line{"w-web-1": {line(1, "a1")}, "w-web-r2-1": {line(6, "c1")}})
 	recs := e.getLogs("/v1/services/web/logs?tail=5").records()

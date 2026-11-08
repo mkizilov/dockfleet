@@ -424,17 +424,17 @@ func TestSDKCreateSendsTheHardenedBody(t *testing.T) {
 		Labels     map[string]string
 		Tty        bool
 		HostConfig struct {
-			Privileged  bool
-			CapDrop     []string
-			CapAdd      []string
-			SecurityOpt []string
-			NetworkMode string
-			Binds       []string
-			Devices     []any
-			PidMode     string
-			Memory      int64
-			NanoCpus    int64
-			PidsLimit   int64
+			Privileged    bool
+			CapDrop       []string
+			CapAdd        []string
+			SecurityOpt   []string
+			NetworkMode   string
+			Binds         []string
+			Devices       []any
+			PidMode       string
+			Memory        int64
+			NanoCpus      int64
+			PidsLimit     int64
 			RestartPolicy struct{ Name string }
 			PortBindings  map[string][]struct{ HostIp, HostPort string }
 		}
@@ -520,7 +520,7 @@ func TestSDKInspectLogsAndStats(t *testing.T) {
 		switch r.Path {
 		case "/containers/c1/logs":
 			q := r.Query
-			if q.Get("tail") != "50" || q.Get("stdout") != "1" || q.Get("stderr") != "1" || q.Get("timestamps") != "1" || !strings.HasPrefix(q.Get("since"), "2026-03-01T09:00:00") {
+			if q.Get("tail") != "50" || q.Get("stdout") != "1" || q.Get("stderr") != "1" || q.Get("timestamps") != "1" || q.Get("since") != "1772355600.000000000" { // the SDK sends 2026-03-01T09:00:00Z as Unix time
 				t.Errorf("logs query = %v", q)
 			}
 		case "/containers/c1/stats":

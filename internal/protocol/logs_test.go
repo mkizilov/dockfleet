@@ -547,7 +547,7 @@ func TestLogsEndsOnAnInvalidMessageFromTheAgent(t *testing.T) {
 	// A second, raw stream (this one replaces the first on the hub) that sends nonsense.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	raw, err := c.nodes.Logs(ctx)
+	raw, err := c.node().Logs(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,7 +570,7 @@ func TestLogsNoHelloEndsTheStream(t *testing.T) {
 	c := env.client(t, serverToken, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	raw, err := c.nodes.Logs(ctx)
+	raw, err := c.node().Logs(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}

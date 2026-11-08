@@ -50,6 +50,10 @@ func TestPostgresConformance(t *testing.T) {
 		if _, err := p.pool.Exec(context.Background(), `TRUNCATE `+allTables+` RESTART IDENTITY CASCADE`); err != nil {
 			t.Fatal(err)
 		}
+		// control_plane is one row that the migration inserts: put it back, do not empty it.
+		if _, err := p.pool.Exec(context.Background(), `UPDATE control_plane SET epoch = 0, leader = '', elected_at = to_timestamp(0)`); err != nil {
+			t.Fatal(err)
+		}
 		return p
 	})
 }

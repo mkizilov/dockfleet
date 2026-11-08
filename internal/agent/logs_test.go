@@ -102,7 +102,9 @@ func (c *fakeLogConn) credit(id string, n int) {
 	c.down <- logstream.Down{Credit: &logstream.Credit{RequestID: id, Bytes: n}}
 }
 
-func (c *fakeLogConn) cancel(id string) { c.down <- logstream.Down{Cancel: &logstream.Cancel{RequestID: id}} }
+func (c *fakeLogConn) cancel(id string) {
+	c.down <- logstream.Down{Cancel: &logstream.Cancel{RequestID: id}}
+}
 
 // texts are the lines received for a request, in order.
 func (c *fakeLogConn) texts(id string) []string {

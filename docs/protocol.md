@@ -61,7 +61,7 @@ agent                                          manager
 
 ## Versioning
 
-`ProtocolVersion {major, minor}` is sent in `RegisterNodeRequest` and returned in `RegisterNodeResponse`. This build speaks `1.4` (`protocol.VersionMajor` / `protocol.VersionMinor`). 1.1 added the `NOT_ENROLLED`, `IDENTITY_MISMATCH` and `CERTIFICATE_INVALID` error codes. 1.2 made assignments instructions: `WorkloadAssignment` gained `generation`, `desired_state`, `command`, `env`, `ports` and `restart_policy`, and `WorkloadStatus` gained `acknowledged_generation`, `container_id`, `exit_code`, `oom_killed` and `restart_count`. 1.3 added failure handling: `RegisterNodeResponse.lease_ms`, `RestartPolicy.backoff_seconds` and `max_backoff_seconds`, the `HealthCheck` message in `WorkloadAssignment.health_check`, and `WorkloadStatus.health`. 1.4 added container logs: the `Logs` RPC and its messages (`LogsRequest`, `LogsResponse` and what they carry). All are optional fields or new calls, so older peers ignore them; an unspecified `desired_state` means `RUNNING`, and an agent that is not sent a lease never fences itself.
+`ProtocolVersion {major, minor}` is sent in `RegisterNodeRequest` and returned in `RegisterNodeResponse`. This build speaks `1.5` (`protocol.VersionMajor` / `protocol.VersionMinor`). 1.1 added the `NOT_ENROLLED`, `IDENTITY_MISMATCH` and `CERTIFICATE_INVALID` error codes. 1.2 made assignments instructions: `WorkloadAssignment` gained `generation`, `desired_state`, `command`, `env`, `ports` and `restart_policy`, and `WorkloadStatus` gained `acknowledged_generation`, `container_id`, `exit_code`, `oom_killed` and `restart_count`. 1.3 added failure handling: `RegisterNodeResponse.lease_ms`, `RestartPolicy.backoff_seconds` and `max_backoff_seconds`, the `HealthCheck` message in `WorkloadAssignment.health_check`, and `WorkloadStatus.health`. 1.4 added container logs: the `Logs` RPC and its messages (`LogsRequest`, `LogsResponse` and what they carry). 1.5 added high availability: `control_plane_epoch` in `RegisterNodeResponse` and `HeartbeatResponse`, and the error codes `NOT_LEADER` and `STALE_CONTROL_PLANE`. All are optional fields, new error codes or new calls, so older peers ignore them; an unspecified `desired_state` means `RUNNING`, and an agent that is not sent a lease never fences itself.
 
 | Rule | Who checks |
 | ---- | ---------- |
@@ -89,6 +89,14 @@ Bump the minor for backward-compatible additions (new optional fields or RPCs) a
 - **Flow control.** The agent sends a request's lines only while it has credit for them; the manager returns credit as the reader takes lines out. Lines beyond the credit end the request. Streams have no deadline, and the manager's periodic recycling of connections ends them like any other: the agent opens the stream again and the manager resumes the requests that follow.
 - **One stream per node.** A newer stream of the same node replaces the older one. The manager only accepts lines and ends for requests it opened on that very stream.
 
+## High availability
+
+With several managers ([high-availability.md](high-availability.md)) only the leader answers an agent. A follower answers every agent call, and opens no log stream, with `FAILED_PRECONDITION` and `NOT_LEADER`; the leader stamps `RegisterNodeResponse` and `HeartbeatResponse` with `control_plane_epoch`, the epoch of its term (0 from a manager that is alone or older: such an answer is accepted as long as no epoch has been heard, and never lowers one).
+
+- **Client.** `ClientConfig.Addrs` lists the managers. `Register` goes round them once, starting with the one that answered last, until one leads; it moves on from a manager that is `NOT_LEADER`, that cannot be reached, or whose answer has an epoch that is too low. `Heartbeat` goes to the manager the node registered with, because the session is that manager's; if that one cannot be reached or says `NOT_LEADER`, the next call goes to another, which answers `NOT_REGISTERED` or `NOT_LEADER`, and the agent registers again. A refused answer is dropped whole: the agent applies nothing from it.
+- **Epoch.** The client keeps the highest epoch heard (in memory) and refuses lower ones. An epoch equal to or higher than it is accepted, whoever sends it.
+- **Server.** `NodeServer.WithFencing` takes the election. The epoch is read before an answer is prepared and checked again before it is sent; if the term changed in between, `NOT_LEADER` is sent. The `Logs` stream is refused by a follower, and closed by a manager that stops leading.
+
 ## Errors
 
 Failures an agent can act on carry a `ProtocolError` in the gRPC status details (`protocol.Error` in Go; `protocol.ErrorCode(err)` reads it). The `supported_version` field holds the sender's own version.
@@ -102,6 +110,8 @@ Failures an agent can act on carry a `ProtocolError` in the gRPC status details 
 | `NOT_ENROLLED` | `PERMISSION_DENIED` | The node ID has no active enrollment (never enrolled, or revoked) | Keep retrying with backoff and log an error; an administrator enrolls the node |
 | `IDENTITY_MISMATCH` | `PERMISSION_DENIED` | `node_id` differs from the client certificate identity | Fatal |
 | `CERTIFICATE_INVALID` | `UNAUTHENTICATED` | Client certificate expired, not yet valid, or without a node identity (found on an open connection) | Keep running; a renewed certificate is used on reconnect |
+| `NOT_LEADER` | `FAILED_PRECONDITION` | The manager is part of a high-availability cluster and does not lead it (or stopped leading while it prepared the answer) | Try the next manager; register again, about once a second, until one leads |
+| `STALE_CONTROL_PLANE` | (raised by the agent; never sent) | An answer carried a `control_plane_epoch` lower than one the agent has heard | The answer is ignored (its assignments are not applied); register again |
 | (none) | `UNAUTHENTICATED` | Bad or missing token (plaintext mode) | Fatal |
 | (none) | `UNAVAILABLE` | Includes TLS handshake failures: untrusted, expired or wrongly named certificates | Retry; the cause is in the error text |
 | (none) | `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `INTERNAL` | Transient | Retry: backoff (1s to 30s) while registering, next tick while heartbeating |

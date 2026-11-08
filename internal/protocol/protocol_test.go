@@ -389,7 +389,7 @@ func TestVersionNegotiation(t *testing.T) {
 func TestMissingVersionIsIncompatible(t *testing.T) {
 	env := newEnv(t, nil)
 	c := env.client(t, serverToken, nil)
-	_, err := c.nodes.RegisterNode(ctxWithTimeout(t), &dockfleetv1.RegisterNodeRequest{
+	_, err := c.node().RegisterNode(ctxWithTimeout(t), &dockfleetv1.RegisterNodeRequest{
 		Identity: &dockfleetv1.NodeIdentity{NodeId: "node-1", Name: "n"},
 		Capacity: &dockfleetv1.NodeCapacity{CpuMillis: 1, MemoryBytes: 1},
 	})
@@ -410,7 +410,7 @@ func (f fixedRegisterClient) RegisterNode(context.Context, *dockfleetv1.Register
 func TestClientRejectsIncompatibleManagerResponse(t *testing.T) {
 	env := newEnv(t, nil)
 	c := env.client(t, serverToken, nil)
-	c.nodes = fixedRegisterClient{resp: &dockfleetv1.RegisterNodeResponse{
+	c.eps[0].nodes = fixedRegisterClient{resp: &dockfleetv1.RegisterNodeResponse{
 		ProtocolVersion: &dockfleetv1.ProtocolVersion{Major: 2},
 		SessionId:       "s",
 	}}
@@ -419,7 +419,7 @@ func TestClientRejectsIncompatibleManagerResponse(t *testing.T) {
 		t.Fatalf("error = %v, want INCOMPATIBLE_VERSION", err)
 	}
 
-	c.nodes = fixedRegisterClient{resp: &dockfleetv1.RegisterNodeResponse{
+	c.eps[0].nodes = fixedRegisterClient{resp: &dockfleetv1.RegisterNodeResponse{
 		ProtocolVersion: &dockfleetv1.ProtocolVersion{Major: VersionMajor, Minor: VersionMinor + 5},
 		SessionId:       "s",
 	}}

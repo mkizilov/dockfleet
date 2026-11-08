@@ -2,15 +2,19 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/dockfleet/dockfleet/internal/config"
+	"github.com/dockfleet/dockfleet/internal/etcd"
 	"github.com/dockfleet/dockfleet/internal/logging"
 	"github.com/dockfleet/dockfleet/internal/manager"
+	"github.com/dockfleet/dockfleet/internal/pki"
 	"github.com/dockfleet/dockfleet/internal/store"
 	"github.com/dockfleet/dockfleet/internal/version"
 )
@@ -57,7 +61,16 @@ func run() error {
 	}
 	defer st.Close()
 
-	m, err := manager.New(cfg, st, logger)
+	var opts []manager.Option
+	if cfg.HAEnabled() {
+		backend, err := newElectionBackend(cfg, logger)
+		if err != nil {
+			return err
+		}
+		defer backend.Close()
+		opts = append(opts, manager.WithElection(backend))
+	}
+	m, err := manager.New(cfg, st, logger, opts...)
 	if err != nil {
 		return err
 	}
@@ -73,6 +86,24 @@ func run() error {
 		return fmt.Errorf("listen on gRPC address: %w", err)
 	}
 
-	logger.Info("starting dockfleet manager", "version", version.Version, "store", cfg.Store, "instance_id", cfg.InstanceID)
+	logger.Info("starting dockfleet manager", "version", version.Version, "store", cfg.Store, "instance_id", cfg.InstanceID,
+		"high_availability", cfg.HAEnabled(), "etcd_endpoints", len(cfg.EtcdEndpoints))
 	return m.Serve(ctx, apiLn, grpcLn)
+}
+
+// newElectionBackend connects to etcd, with mutual TLS unless it is on loopback.
+func newElectionBackend(cfg config.Manager, logger *slog.Logger) (*etcd.Client, error) {
+	var tlsConfig *tls.Config
+	if cfg.EtcdTLSEnabled() {
+		var err error
+		tlsConfig, err = pki.ClientTLS(pki.ClientConfig{CAFile: cfg.EtcdCAFile, CertFile: cfg.EtcdCertFile, KeyFile: cfg.EtcdKeyFile, Logger: logger})
+		if err != nil {
+			return nil, fmt.Errorf("etcd TLS: %w", err)
+		}
+	}
+	client, err := etcd.New(etcd.Config{Endpoints: cfg.EtcdEndpoints, TLS: tlsConfig})
+	if err != nil {
+		return nil, err
+	}
+	return client, nil
 }

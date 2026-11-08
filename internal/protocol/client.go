@@ -6,15 +6,18 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
-	dockfleetv1 "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/v1"
 	"github.com/dockfleet/dockfleet/internal/netutil"
+	dockfleetv1 "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/v1"
 )
 
 var (
@@ -45,12 +48,20 @@ type Session struct {
 	// when the agent sent it; zero when the manager grants none.
 	Lease       time.Duration
 	Assignments []*dockfleetv1.WorkloadAssignment
+	// Epoch is the control-plane epoch of the manager that registered the node;
+	// 0 when the managers have never elected a leader.
+	Epoch int64
 }
 
 // ClientConfig configures Dial.
 type ClientConfig struct {
 	// Addr is the manager's host:port (or any gRPC target when Dialer is set).
 	Addr string
+	// Addrs lists the managers of a high-availability cluster, in the order to
+	// try them; when set it replaces Addr. Only the leader answers, so the
+	// client looks for it: a manager that says it is not the leader, or cannot
+	// be reached, is skipped, and the next call starts with the one that answered.
+	Addrs []string
 	// TLS enables mutual TLS when non-nil: it must verify the manager and
 	// present the agent certificate (see pki.ClientTLS). Without it Addr must
 	// be loopback and Token authenticates the agent.
@@ -69,10 +80,17 @@ type ClientConfig struct {
 	DialOptions []grpc.DialOption
 }
 
-// Client is the agent's connection to the manager.
+type endpoint struct {
+	addr  string
+	conn  *grpc.ClientConn
+	nodes dockfleetv1.NodeServiceClient
+}
+
+// Client is the agent's connection to the manager (or managers).
 type Client struct {
-	conn    *grpc.ClientConn
-	nodes   dockfleetv1.NodeServiceClient
+	eps     []*endpoint
+	cur     atomic.Int32 // the endpoint that answered last
+	epoch   atomic.Int64 // the highest control-plane epoch heard
 	version *dockfleetv1.ProtocolVersion
 }
 
@@ -80,8 +98,16 @@ type Client struct {
 // lazily and re-established automatically with backoff, so an unreachable
 // manager surfaces as errors on calls rather than here.
 func Dial(cfg ClientConfig) (*Client, error) {
-	if cfg.TLS == nil && cfg.Dialer == nil && !netutil.IsLoopbackAddr(cfg.Addr) {
-		return nil, ErrInsecureRemote
+	addrs := cfg.Addrs
+	if len(addrs) == 0 {
+		addrs = []string{cfg.Addr}
+	}
+	if cfg.TLS == nil && cfg.Dialer == nil {
+		for _, addr := range addrs {
+			if !netutil.IsLoopbackAddr(addr) {
+				return nil, ErrInsecureRemote
+			}
+		}
 	}
 	var opts []grpc.DialOption
 	if cfg.TLS != nil {
@@ -107,21 +133,96 @@ func Dial(cfg ClientConfig) (*Client, error) {
 		opts = append(opts, grpc.WithContextDialer(cfg.Dialer))
 	}
 	opts = append(opts, cfg.DialOptions...)
-	conn, err := grpc.NewClient(cfg.Addr, opts...)
-	if err != nil {
-		return nil, fmt.Errorf("dial manager: %w", err)
-	}
+
 	version := cfg.Version
 	if version == nil {
 		version = CurrentVersion()
 	}
-	return &Client{conn: conn, nodes: dockfleetv1.NewNodeServiceClient(conn), version: version}, nil
+	c := &Client{version: version}
+	for _, addr := range addrs {
+		conn, err := grpc.NewClient(addr, opts...)
+		if err != nil {
+			c.Close()
+			return nil, fmt.Errorf("dial manager: %w", err)
+		}
+		c.eps = append(c.eps, &endpoint{addr: addr, conn: conn, nodes: dockfleetv1.NewNodeServiceClient(conn)})
+	}
+	return c, nil
+}
+
+// node is the current endpoint's service client.
+func (c *Client) node() dockfleetv1.NodeServiceClient { return c.eps[c.cur.Load()].nodes }
+
+// Epoch is the highest control-plane epoch this client has heard from a manager.
+func (c *Client) Epoch() int64 { return c.epoch.Load() }
+
+// Endpoint is the address of the manager the client talks to now.
+func (c *Client) Endpoint() string { return c.eps[c.cur.Load()].addr }
+
+// admit records the epoch an answer carries, or refuses the answer: an epoch
+// lower than one already heard comes from a control plane that has been
+// replaced, and what it says may undo what its successor decided.
+func (c *Client) admit(epoch int64) error {
+	for {
+		seen := c.epoch.Load()
+		if epoch < seen {
+			return &Error{
+				Code:    dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_STALE_CONTROL_PLANE,
+				Message: fmt.Sprintf("the manager answers under control-plane epoch %d, but epoch %d has been heard: it has been replaced", epoch, seen),
+			}
+		}
+		if epoch == seen || c.epoch.CompareAndSwap(seen, epoch) {
+			return nil
+		}
+	}
+}
+
+// movesOn is whether a failed call is worth making to the next manager: this
+// one is not the leader, answered for a control plane that has been replaced, or
+// cannot be reached.
+func movesOn(err error) bool {
+	if IsNotLeader(err) || IsStaleControlPlane(err) {
+		return true
+	}
+	switch status.Code(err) {
+	case codes.Unavailable, codes.DeadlineExceeded:
+		return true
+	}
+	return false
 }
 
 // Register announces the node. A manager speaking an incompatible protocol is
-// reported as an *Error with code INCOMPATIBLE_VERSION.
+// reported as an *Error with code INCOMPATIBLE_VERSION. With several managers it
+// goes round them, once, until one that leads answers; the time of the call is
+// shared among them.
 func (c *Client) Register(ctx context.Context, n NodeInfo) (Session, error) {
-	resp, err := c.nodes.RegisterNode(ctx, &dockfleetv1.RegisterNodeRequest{
+	var last error
+	deadline, hasDeadline := ctx.Deadline()
+	first := int(c.cur.Load())
+	for i := 0; i < len(c.eps); i++ {
+		idx := (first + i) % len(c.eps)
+		attempt, cancel := ctx, context.CancelFunc(func() {})
+		if hasDeadline && len(c.eps)-i > 1 {
+			attempt, cancel = context.WithTimeout(ctx, time.Until(deadline)/time.Duration(len(c.eps)-i))
+		}
+		session, err := c.registerAt(attempt, c.eps[idx], n)
+		cancel()
+		if err == nil {
+			c.cur.Store(int32(idx))
+			return session, nil
+		}
+		last = err
+		if ctx.Err() != nil || !movesOn(err) {
+			return Session{}, err
+		}
+		// The next call, if this one runs out of time, starts with the next manager.
+		c.cur.Store(int32((idx + 1) % len(c.eps)))
+	}
+	return Session{}, last
+}
+
+func (c *Client) registerAt(ctx context.Context, ep *endpoint, n NodeInfo) (Session, error) {
+	resp, err := ep.nodes.RegisterNode(ctx, &dockfleetv1.RegisterNodeRequest{
 		ProtocolVersion: c.version,
 		Identity: &dockfleetv1.NodeIdentity{
 			NodeId:       n.ID,
@@ -144,30 +245,54 @@ func (c *Client) Register(ctx context.Context, n NodeInfo) (Session, error) {
 	if resp.GetSessionId() == "" {
 		return Session{}, errors.New("manager returned an empty session id")
 	}
+	if err := c.admit(resp.GetControlPlaneEpoch()); err != nil {
+		return Session{}, err
+	}
 	return Session{
 		ID:                resp.GetSessionId(),
 		HeartbeatInterval: time.Duration(resp.GetHeartbeatIntervalMs()) * time.Millisecond,
 		Lease:             time.Duration(resp.GetLeaseMs()) * time.Millisecond,
 		Assignments:       resp.GetAssignments(),
+		Epoch:             resp.GetControlPlaneEpoch(),
 	}, nil
 }
 
 // Heartbeat sends liveness and workload statuses and returns the complete set
-// of workloads currently assigned to the node.
+// of workloads currently assigned to the node. It goes to the manager that
+// registered the node, because the session is that manager's; if that manager
+// cannot be reached, the next call goes to another, which will tell the agent to
+// register again. An answer from a control plane older than one already heard is
+// refused, as an *Error with code STALE_CONTROL_PLANE, and its assignments are
+// not returned.
 func (c *Client) Heartbeat(ctx context.Context, nodeID, sessionID string, statuses []*dockfleetv1.WorkloadStatus) ([]*dockfleetv1.WorkloadAssignment, error) {
-	resp, err := c.nodes.Heartbeat(ctx, &dockfleetv1.HeartbeatRequest{NodeId: nodeID, SessionId: sessionID, Statuses: statuses})
+	idx := int(c.cur.Load())
+	resp, err := c.eps[idx].nodes.Heartbeat(ctx, &dockfleetv1.HeartbeatRequest{NodeId: nodeID, SessionId: sessionID, Statuses: statuses})
 	if err != nil {
-		return nil, decodeError(err)
+		err = decodeError(err)
+		if len(c.eps) > 1 && ctx.Err() == nil && movesOn(err) {
+			c.cur.CompareAndSwap(int32(idx), int32((idx+1)%len(c.eps)))
+		}
+		return nil, err
+	}
+	if err := c.admit(resp.GetControlPlaneEpoch()); err != nil {
+		return nil, err
 	}
 	return resp.GetAssignments(), nil
 }
 
 // Deregister ends the session; call it on clean shutdown.
 func (c *Client) Deregister(ctx context.Context, nodeID, sessionID string) error {
-	_, err := c.nodes.DeregisterNode(ctx, &dockfleetv1.DeregisterNodeRequest{NodeId: nodeID, SessionId: sessionID})
+	_, err := c.node().DeregisterNode(ctx, &dockfleetv1.DeregisterNodeRequest{NodeId: nodeID, SessionId: sessionID})
 	return decodeError(err)
 }
 
+// Close closes every connection.
 func (c *Client) Close() error {
-	return c.conn.Close()
+	var first error
+	for _, ep := range c.eps {
+		if err := ep.conn.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
 }

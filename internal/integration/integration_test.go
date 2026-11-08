@@ -384,7 +384,10 @@ func TestAssignedWorkloadsAreReportedBack(t *testing.T) {
 
 	// Let the agent heartbeat a few more times, then check it left the other node's workload alone.
 	n, _ := m.node("sim-1")
-	waitFor(t, "more heartbeats", func() bool { cur, _ := m.node("sim-1"); return cur.LastHeartbeat.After(n.LastHeartbeat.Add(2 * heartbeatEvery)) })
+	waitFor(t, "more heartbeats", func() bool {
+		cur, _ := m.node("sim-1")
+		return cur.LastHeartbeat.After(n.LastHeartbeat.Add(2 * heartbeatEvery))
+	})
 	other, err := m.store.GetWorkload(ctx, "w-theirs")
 	if err != nil || other.Phase() != store.WorkloadScheduled || other.Observed != nil {
 		t.Fatalf("another node's workload must not be touched: %+v, %v", other, err)

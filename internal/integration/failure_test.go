@@ -487,7 +487,13 @@ func TestAgentsFenceThemselvesDuringALongManagerOutageAndCarryOnAfterwards(t *te
 		id := f.m.sessionID("sim-1")
 		return id != "" && id != oldSession
 	})
-	waitFor(t, "the container to run again", f.runningOn(svc, 1, "sim-1"))
+	// The store still holds the report from before the outage, so only the engine
+	// says whether the container really runs again.
+	waitFor(t, "the container to run again", func() bool {
+		got := f.engines["sim-1"].Managed()
+		return len(got) == 1 && got[0].State == docker.StateRunning
+	})
+	waitFor(t, "the replica to be reported running again", f.runningOn(svc, 1, "sim-1"))
 	e := f.engines["sim-1"]
 	if e.Count("create") != 1 || e.Count("start") != 2 || e.Count("remove") != 0 {
 		t.Fatalf("the same container must run again, not a new one: %v", e.Calls())
@@ -605,7 +611,10 @@ func TestUnhealthyContainerIsRestarted(t *testing.T) {
 		t.Fatalf("calls = %v", engine.Calls())
 	}
 	events := f.events("workload", id)
-	if countAction(events, "workload.unhealthy") != 1 || countAction(events, "workload.restarted") != 1 {
+	// The restart is always reported, through the restart count. The unhealthy
+	// interval before it is only reported if a heartbeat falls into it, which a
+	// prompt restart makes unlikely (the registry's tests cover that event).
+	if countAction(events, "workload.restarted") != 1 || countAction(events, "workload.unhealthy") > 1 {
 		t.Fatalf("events = %+v", events)
 	}
 	if r := f.replica("probe"); r.Health != store.HealthHealthy || r.RestartCount != 1 {

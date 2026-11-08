@@ -44,6 +44,11 @@ type Config struct {
 	// Metrics, when set, serves GET /metrics (admin token required) and records
 	// request latency. Nil turns both off.
 	Metrics *metrics.Metrics
+	// Cluster, when set, says how the managers sharing this control plane are
+	// organized (leader election): it serves GET /v1/cluster, restricts what
+	// only a leader may do, and anchors node health at the current term. Nil is
+	// a single manager.
+	Cluster Cluster
 	// Logs serves container logs; nil turns the log endpoints off.
 	Logs LogSource
 	// LogWriteTimeout is how long a log response waits for its client to take
@@ -70,6 +75,7 @@ type server struct {
 	logWriteTimeout time.Duration
 
 	metrics *metrics.Metrics
+	cluster Cluster
 }
 
 // New returns the administrative HTTP handler. /healthz and /readyz are open;
@@ -89,7 +95,7 @@ func New(cfg Config) http.Handler {
 	if s.now == nil {
 		s.now = time.Now
 	}
-	s.logs, s.logWriteTimeout, s.metrics = cfg.Logs, cfg.LogWriteTimeout, cfg.Metrics
+	s.logs, s.logWriteTimeout, s.metrics, s.cluster = cfg.Logs, cfg.LogWriteTimeout, cfg.Metrics, cfg.Cluster
 	if s.logWriteTimeout <= 0 {
 		s.logWriteTimeout = defaultLogWriteTimeout
 	}
@@ -100,6 +106,7 @@ func New(cfg Config) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /readyz", s.readyz)
+	mux.Handle("GET /v1/cluster", s.auth(s.getCluster))
 	mux.Handle("GET /v1/nodes", s.auth(s.listNodes))
 	mux.Handle("GET /v1/nodes/{id}", s.auth(s.getNode))
 	mux.Handle("POST /v1/workloads", s.auth(s.createWorkload))
@@ -109,6 +116,9 @@ func New(cfg Config) http.Handler {
 	mux.Handle("GET /v1/services/{name}/logs", s.auth(s.serviceLogs))
 	if s.metrics != nil {
 		s.metrics.Registry.AddCollector("fleet", s.collectFleet)
+		if s.cluster != nil {
+			s.metrics.Registry.AddCollector("cluster", s.collectCluster)
+		}
 		mux.Handle("GET /metrics", s.auth(s.serveMetrics))
 	}
 	mux.Handle("POST /v1/enrollments", s.auth(s.createEnrollment))
@@ -274,14 +284,29 @@ type nodeView struct {
 	Allocated      allocation `json:"allocated"`
 }
 
-func (s *server) view(n store.Node, used scheduler.Used) nodeView {
+// healthTiming is the timing nodes are judged by. With several managers,
+// silence from before the current leader's term began is not counted, because
+// the leader does not count it either: agents need time to find a new leader.
+// The start of the term is in the shared database, so every manager agrees.
+func (s *server) healthTiming(ctx context.Context) scheduler.Timing {
+	t := s.timing
+	if s.cluster == nil {
+		return t
+	}
+	if cp, err := s.store.GetControlPlane(ctx); err == nil && cp.ElectedAt.After(t.Since) {
+		t.Since = cp.ElectedAt
+	}
+	return t
+}
+
+func (s *server) view(n store.Node, used scheduler.Used, timing scheduler.Timing) nodeView {
 	now := s.now()
 	v := nodeView{Node: n, Status: "ready", StatusReason: scheduler.Unavailability(n, now, s.nodeTTL)}
 	if v.StatusReason != "" {
 		v.Status = "not_ready"
 	}
-	v.Health = s.timing.Health(n, now)
-	v.HealthReason = s.timing.HealthReason(v.Health)
+	v.Health = timing.Health(n, now)
+	v.HealthReason = timing.HealthReason(v.Health)
 	if n.Health == v.Health && !n.HealthSince.IsZero() {
 		since := n.HealthSince.UTC()
 		v.HealthSince = &since
@@ -307,9 +332,10 @@ func (s *server) listNodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	used := scheduler.UsedByNode(workloads)
+	timing := s.healthTiming(r.Context())
 	views := make([]nodeView, 0, len(nodes))
 	for _, n := range nodes {
-		views = append(views, s.view(n, used[n.ID]))
+		views = append(views, s.view(n, used[n.ID], timing))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"nodes": views})
 }
@@ -329,7 +355,7 @@ func (s *server) getNode(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.view(n, scheduler.UsedByNode(workloads)[n.ID]))
+	writeJSON(w, http.StatusOK, s.view(n, scheduler.UsedByNode(workloads)[n.ID], s.healthTiming(r.Context())))
 }
 
 // unschedulableError is a placement the scheduler could not make.
@@ -390,6 +416,11 @@ func (s *server) createWorkload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, msg)
 		return
 	}
+	// Placing a workload is scheduling, which only the leader does.
+	epoch, ok := s.leaderEpoch(w)
+	if !ok {
+		return
+	}
 
 	id := store.NewID()
 	var created store.Workload
@@ -397,6 +428,11 @@ func (s *server) createWorkload(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		if err := tx.LockPlacement(ctx); err != nil {
 			return err
+		}
+		if s.cluster != nil {
+			if err := tx.CheckEpoch(ctx, epoch); err != nil {
+				return err
+			}
 		}
 		now := s.now().UTC()
 		cluster, err := placement.ReadCluster(ctx, tx, now, s.nodeTTL)
@@ -428,6 +464,10 @@ func (s *server) createWorkload(w http.ResponseWriter, r *http.Request) {
 		writeUnschedulable(w, unschedulable.u)
 	case errors.Is(err, store.ErrConflict):
 		writeError(w, http.StatusConflict, "a workload with this name already exists")
+	case errors.Is(err, store.ErrStaleLeader):
+		// Another manager was elected while the request ran; nothing was saved.
+		s.cluster.Fenced(epoch)
+		s.notLeader(w)
 	case err != nil:
 		s.internalError(w, r, err)
 	default:

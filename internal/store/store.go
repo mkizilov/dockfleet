@@ -45,6 +45,10 @@ var (
 	ErrInvalid = errors.New("invalid value")
 	// ErrLeaseHeld means another holder owns an unexpired lease.
 	ErrLeaseHeld = errors.New("lease is held by another manager")
+	// ErrStaleLeader means the control plane is in a newer epoch than the caller
+	// acts under: another manager has been elected since, and the caller's
+	// change must not be made.
+	ErrStaleLeader = errors.New("a newer control-plane epoch exists; this manager is no longer the leader")
 )
 
 // Observed workload phases. WorkloadScheduled is never stored: it is what
@@ -706,6 +710,23 @@ type Lease struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
+// ControlPlane is the shared record of the managers' leadership. Epoch is the
+// fencing token: it grows by one every time a manager is elected leader, and a
+// leader acts under the epoch it was given. Anything that decides or changes
+// the cluster checks, in the same transaction as its writes, that its epoch is
+// still the current one, so a leader that has been replaced cannot write.
+//
+// Leadership itself is decided elsewhere (etcd, internal/election); this is
+// where the result is written down, next to the data it protects.
+type ControlPlane struct {
+	// Epoch is 0 until a leader was elected for the first time.
+	Epoch int64 `json:"epoch"`
+	// Leader is the instance ID of the manager that began the epoch.
+	Leader string `json:"leader"`
+	// ElectedAt is when the epoch began (the Unix epoch while there is none).
+	ElectedAt time.Time `json:"elected_at"`
+}
+
 // NodeRepository stores nodes (observed state).
 type NodeRepository interface {
 	// UpsertNode inserts or updates a node. An existing node keeps its RegisteredAt.
@@ -852,6 +873,20 @@ type LeaseRepository interface {
 	GetLease(ctx context.Context, name string) (Lease, error)
 }
 
+// ControlPlaneRepository stores the fencing epoch.
+type ControlPlaneRepository interface {
+	GetControlPlane(ctx context.Context) (ControlPlane, error)
+	// BeginTerm starts a new epoch for leader and returns it with the one it
+	// replaced. Of two managers that call it at once, one gets the lower epoch
+	// and the other the higher; the higher one is the current one.
+	BeginTerm(ctx context.Context, leader string, at time.Time) (current, previous ControlPlane, err error)
+	// CheckEpoch returns ErrStaleLeader unless epoch is the current epoch. Inside
+	// a transaction it also holds the epoch in place until the transaction ends:
+	// a BeginTerm made by another manager waits for it, so the transaction's
+	// writes either happen before the next leader's term or not at all.
+	CheckEpoch(ctx context.Context, epoch int64) error
+}
+
 // Repositories is every repository. Inside a transaction they all see the
 // same snapshot and commit or roll back together.
 type Repositories interface {
@@ -863,6 +898,7 @@ type Repositories interface {
 	RolloutRepository
 	EventRepository
 	LeaseRepository
+	ControlPlaneRepository
 }
 
 // Tx is a transaction.

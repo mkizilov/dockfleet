@@ -122,40 +122,42 @@ func unreachableDocker() *dockerfake.Fake {
 }
 
 type running struct {
-	t      *testing.T
-	cancel context.CancelFunc
-	done   chan error
-	once   sync.Once
-	result error
+	t        *testing.T
+	cancel   context.CancelFunc
+	finished chan struct{} // closed when Run has returned; result is set before that
+	result   error
 }
 
 func start(t *testing.T, a *Agent) *running {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	r := &running{t: t, cancel: cancel, done: make(chan error, 1)}
-	go func() { r.done <- a.Run(ctx) }()
+	r := &running{t: t, cancel: cancel, finished: make(chan struct{})}
+	go func() {
+		r.result = a.Run(ctx)
+		close(r.finished)
+	}()
 	t.Cleanup(func() { _ = r.stop() })
 	return r
 }
 
-// stop cancels the agent and returns what Run returned.
+// stop cancels the agent and returns what Run returned. It can be called again
+// after wait, or after an earlier stop.
 func (r *running) stop() error {
-	r.once.Do(func() {
-		r.cancel()
-		select {
-		case r.result = <-r.done:
-		case <-time.After(5 * time.Second):
-			r.t.Error("agent did not stop after context cancellation")
-		}
-	})
+	r.cancel()
+	select {
+	case <-r.finished:
+	case <-time.After(5 * time.Second):
+		r.t.Error("agent did not stop after context cancellation")
+		return nil
+	}
 	return r.result
 }
 
 // wait returns Run's result without canceling, for agents expected to exit on their own.
 func (r *running) wait() error {
 	select {
-	case err := <-r.done:
-		return err
+	case <-r.finished:
+		return r.result
 	case <-time.After(5 * time.Second):
 		r.t.Fatal("agent did not exit on its own")
 		return nil

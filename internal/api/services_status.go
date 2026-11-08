@@ -357,10 +357,10 @@ func (s *server) nodeStates(ctx context.Context) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	now := s.now()
+	now, timing := s.now(), s.healthTiming(ctx)
 	out := make(map[string]string, len(nodes))
 	for _, n := range nodes {
-		out[n.ID] = s.timing.Health(n, now)
+		out[n.ID] = timing.Health(n, now)
 	}
 	return out, nil
 }

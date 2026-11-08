@@ -3,6 +3,7 @@ package docker
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net/http"
@@ -45,7 +46,7 @@ func TestLogReaderSplitsLinesAndParsesTimestamps(t *testing.T) {
 		frame(streamStdout, stamped(0, "one\n")),
 		frame(streamStderr, stamped(time.Millisecond, "two\n")),
 		frame(streamStdout, stamped(2*time.Millisecond, "three\n")+stamped(3*time.Millisecond, "four\n")),
-		frame(streamStdout, stamped(4*time.Millisecond, "\n")),     // an empty line
+		frame(streamStdout, stamped(4*time.Millisecond, "\n")),       // an empty line
 		frame(streamStdout, stamped(5*time.Millisecond, "crlf\r\n")), // a Windows line break
 	)
 	got, err := drain(t, r)
@@ -116,8 +117,9 @@ func TestLogReaderKeepsReadingAHugeFrameInChunks(t *testing.T) {
 	// A frame of 40 MiB of one endless line followed by a short one: the reader
 	// must neither allocate the frame nor take long over it.
 	const size = 40 << 20
-	header := make([]byte, 0, frameHeaderLen)
-	header = append(header, streamStdout, 0, 0, 0, byte(size>>24), byte(size>>16), byte(size>>8), byte(size))
+	header := make([]byte, frameHeaderLen)
+	header[0] = streamStdout
+	binary.BigEndian.PutUint32(header[4:], size)
 	body := io.MultiReader(
 		bytes.NewReader(header),
 		strings.NewReader(stamped(0, "")),
@@ -323,8 +325,7 @@ func TestSDKStreamLogsSendsFollowAndTailAll(t *testing.T) {
 		if req.Method == http.MethodGet && req.Path == "/containers/c1/logs" {
 			seen = true
 			q := req.Query
-			// The SDK leaves tail out for "all", which is the daemon's default.
-			if _, set := q["tail"]; set || q.Get("follow") != "1" || q.Get("timestamps") != "1" || q.Get("stdout") != "1" || q.Get("stderr") != "1" {
+			if q.Get("tail") != "all" || q.Get("follow") != "1" || q.Get("timestamps") != "1" || q.Get("stdout") != "1" || q.Get("stderr") != "1" {
 				t.Errorf("logs query = %v", q)
 			}
 		}

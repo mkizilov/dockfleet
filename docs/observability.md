@@ -63,6 +63,19 @@ The registry is small and lives in `internal/metrics` (standard library only: no
 | `dockfleet_metrics_dropped_observations_total` | | Observations the registry refused (below). |
 | `dockfleet_metrics_collect_errors_total` | `collector` | Scrapes in which a collector failed. |
 
+With leader election ([high-availability.md](high-availability.md)) every manager also exports its part in it (and a manager without etcd exports none of these):
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `dockfleet_manager_is_leader` | | `1` if this manager leads, `0` if it follows. |
+| `dockfleet_manager_epoch` | | The epoch this manager acts under while it leads, `0` while it follows. |
+| `dockfleet_control_plane_epoch` | | The latest epoch in the shared database; the same on every manager. A leader whose `dockfleet_manager_epoch` is lower has been replaced. |
+| `dockfleet_cluster_leader` | `leader` | `1` for the leader as this manager knows it (the label is empty while it knows none). |
+| `dockfleet_leader_transitions_total` | | Times this manager became the leader or stopped being it. |
+| `dockfleet_election_errors_total` | | Election steps that failed against etcd or the database. |
+
+A scheduling or reconciliation pass that a manager does not make because it does not lead (or no longer leads) is not an error: it is not counted in `dockfleet_scheduling_errors_total` or `dockfleet_reconcile_errors_total`, nor as a pass. A follower's pass counters stay at zero.
+
 Notes on how they are kept honest:
 
 - **Request and scheduling latency.** HTTP latency is measured around the whole handler, including authentication, and is labeled with the **route pattern** the request matched (`/v1/services/{name}/scale`), never the raw path. A request that matched nothing is `unmatched`, and a method other than the standard ones is `OTHER`: a client cannot create label values. Scheduling and reconciliation latency are the duration of a whole pass, which is one transaction under the placement lock, so it includes waiting for that lock when several managers share the database.

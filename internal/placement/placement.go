@@ -24,12 +24,14 @@ package placement
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"strconv"
 	"time"
 
+	"github.com/dockfleet/dockfleet/internal/election"
 	"github.com/dockfleet/dockfleet/internal/rollout"
 	"github.com/dockfleet/dockfleet/internal/scheduler"
 	"github.com/dockfleet/dockfleet/internal/store"
@@ -184,6 +186,12 @@ type Config struct {
 	InstanceID string
 	// Observer, when set, is told how each pass of Run went.
 	Observer Observer
+	// Fence, when set, makes every pass act under the epoch of the leader's term:
+	// it asks for the epoch before it starts (a pass of a manager that does not
+	// lead fails with election.ErrNotLeader and changes nothing) and checks inside
+	// its transaction that the epoch is still the current one, so a leader that
+	// has been replaced cannot save a placement. Nil is a single manager.
+	Fence election.Fence
 	// Now defaults to time.Now; tests set it.
 	Now func() time.Time
 }
@@ -242,10 +250,22 @@ func (s *Scheduler) event(at time.Time, action, resourceType, resourceID, messag
 // has none. If anything fails nothing is saved and the next pass starts over.
 func (s *Scheduler) RunOnce(ctx context.Context) (Report, error) {
 	var report Report
+	var epoch int64
+	if s.cfg.Fence != nil {
+		var err error
+		if epoch, err = s.cfg.Fence.Epoch(); err != nil {
+			return Report{}, err
+		}
+	}
 	err := s.cfg.Store.InTx(ctx, func(tx store.Tx) error {
 		report = Report{}
 		if err := tx.LockPlacement(ctx); err != nil {
 			return err
+		}
+		if s.cfg.Fence != nil {
+			if err := tx.CheckEpoch(ctx, epoch); err != nil {
+				return err
+			}
 		}
 		now := s.cfg.Now().UTC()
 		cluster, err := ReadCluster(ctx, tx, now, s.cfg.NodeTTL)
@@ -310,6 +330,9 @@ func (s *Scheduler) RunOnce(ctx context.Context) (Report, error) {
 		report.Unschedulable, report.NewReasons = len(unplaced), len(changed)
 		return nil
 	})
+	if errors.Is(err, store.ErrStaleLeader) {
+		s.cfg.Fence.Fenced(epoch)
+	}
 	if err != nil {
 		return Report{}, err
 	}
@@ -326,6 +349,12 @@ func toRecord(svc store.Service, d scheduler.Decision) store.Unschedulable {
 		u.Nodes = append(u.Nodes, store.NodeReason{NodeID: nr.NodeID, Code: nr.Code, Message: nr.Message})
 	}
 	return u
+}
+
+// leadershipLost is whether a pass was refused because this manager is not (or
+// no longer) the leader.
+func leadershipLost(err error) bool {
+	return errors.Is(err, election.ErrNotLeader) || errors.Is(err, store.ErrStaleLeader)
 }
 
 // Run makes a pass at once and then every Interval until ctx ends. A pass that
@@ -353,6 +382,12 @@ func (s *Scheduler) pass(ctx context.Context) {
 	defer cancel()
 	began := time.Now()
 	report, err := s.RunOnce(passCtx)
+	if leadershipLost(err) {
+		// Not a failure of scheduling: another manager leads, or this one stopped
+		// leading while the pass ran, and nothing was saved.
+		s.cfg.Logger.Info("scheduling pass skipped: this manager does not lead", "reason", err.Error())
+		return
+	}
 	if s.cfg.Observer != nil && (err == nil || ctx.Err() == nil) {
 		s.cfg.Observer.SchedulingPass(time.Since(began), report, err)
 	}

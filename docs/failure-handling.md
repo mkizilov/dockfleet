@@ -147,3 +147,4 @@ Restart policy and health check are per service.
 - Lease and silence limits are the same for every node.
 - Restart counts and backoff are kept in the agent's memory.
 - Standalone workloads are not moved.
+- The failure of a **manager** is the subject of [high-availability.md](high-availability.md): with several managers and etcd, another one takes over, node health is counted from the start of its term so that the failover is not mistaken for a failure of the nodes, and agents that cannot find a leader before their lease runs out fence themselves exactly as they do for any other manager outage. The lease must therefore be at least `2 × DOCKFLEET_ELECTION_TTL + DOCKFLEET_HEARTBEAT_INTERVAL`, which the manager checks at startup when high availability is on.

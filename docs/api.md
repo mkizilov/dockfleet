@@ -28,6 +28,7 @@ A service definition is **desired state**: it says what an administrator wants, 
 | `POST /v1/services/{name}/rollback` | Return to an earlier spec, as a new revision | `200`, `ETag` |
 | `GET /v1/services/{name}/logs` | Stream the logs of the service's replicas (see [Container logs](#container-logs)) | `200`, streaming |
 | `GET /v1/workloads/{id}/logs` | Stream the logs of one workload | `200`, streaming |
+| `GET /v1/cluster` | How this manager sits among the managers that share the control plane: its role, who leads, the epoch (see [Several managers](#several-managers)) | `200` |
 
 Services are addressed by **name**, which is unique among live services. A deleted service's name can be used again by a new service (with a new `id`), so a deleted service is no longer addressable by name; `GET /v1/services?include_deleted=true` still lists it.
 
@@ -265,6 +266,26 @@ The parameters, the output, resuming an interrupted response with a cursor, what
 - a response never buffers more than a small window, whatever the client does: a client that takes no data for `DOCKFLEET_LOG_WRITE_TIMEOUT` (30 s) is dropped, and `DOCKFLEET_LOG_MAX_STREAMS` (32) streams can be open at once (`429` beyond);
 - a container whose node is not connected to this manager, or that has no container yet, is reported in the stream as a `notice`, not as a failure of the request;
 - `400` lists every invalid parameter, `404` means no such service or workload or no replica that matches, `503` that the manager does not serve logs.
+
+## Several managers
+
+With leader election ([high-availability.md](high-availability.md)), any manager serves the API. Everything that only records what an administrator wants (services, scaling, rollouts, enrollments) and everything that only reads works on every manager, because it is written to or read from the shared database and protected by versions as before. What decides things for the cluster is the leader's.
+
+- `GET /v1/cluster` answers on every manager:
+
+  ```json
+  {
+    "mode": "high-availability", "instance_id": "manager-2", "role": "leader", "leader": "manager-2",
+    "epoch": 7, "since": "2026-03-01T09:00:00Z", "valid_until": "2026-03-01T09:00:12Z",
+    "control_plane": {"epoch": 7, "leader": "manager-2", "elected_at": "2026-03-01T09:00:00Z"},
+    "transitions": 1, "errors": 0
+  }
+  ```
+
+  `mode` is `single` (and `role` `single`, `epoch` 0) for a manager without etcd. `epoch` is the epoch this manager acts under while it leads, `0` while it follows; `control_plane` is what the database records, so a leader whose `epoch` is lower than `control_plane.epoch` has been replaced and has not noticed yet. `leader` is the leader as this manager knows it (itself, or the last holder it saw).
+- `POST /v1/workloads` places a workload, which is scheduling, so only the leader does it. A follower, or a leader that was replaced while the request ran, answers `503` with `{"error": "...", "code": "not_leader", "leader": "manager-1"}` (the `leader` only when it knows) and `Retry-After: 1`, and places nothing; send the request to the leader.
+- Node health in `GET /v1/nodes` and in a service's status counts silence from the start of the leader's current term at the earliest, on every manager, so a failover does not make healthy nodes look unavailable.
+- `GET /metrics` on each manager adds its election metrics ([observability.md](observability.md)). The container log endpoints need the agents' streams, which only the leader has.
 
 ## Not yet
 

@@ -259,6 +259,9 @@ func TestRollingUpdateReplacesGraduallyWithinThePolicy(t *testing.T) {
 			policy := fmt.Sprintf(`,"rollout":{"max_unavailable":%d,"max_surge":%d}`, p.unavailable, p.surge)
 			admin.createDefinition("web", definition(want, "app:1", "", policy))
 			waitFor(t, "four replicas", admin.converged("web", want, engines...))
+			// The reconciler records revision 1 as complete on a pass of its own; a new
+			// revision put before that would find it superseded instead.
+			waitFor(t, "revision 1 to be recorded as rolled out", admin.rolloutIs("web", store.RolloutComplete, 1))
 			first := workloadIDs(managedOn(engines...))
 			watch := admin.watch("web", want)
 
@@ -306,6 +309,7 @@ func TestFailingReplacementsAreReportedAndRolledBack(t *testing.T) {
 
 	admin.createDefinition("web", definition(3, "app:1", "", `,"rollout":{"progress_deadline_seconds":2}`))
 	waitFor(t, "three replicas", admin.converged("web", 3, engines...))
+	waitFor(t, "revision 1 to be recorded as rolled out", admin.rolloutIs("web", store.RolloutComplete, 1))
 	first := admin.workloads("web")
 	watch := admin.watch("web", 3)
 
@@ -397,6 +401,7 @@ func TestRolloutWithoutRoomWaitsAndSaysSo(t *testing.T) {
 	m, admin, engines := newRolloutFleet(t, "sim-1")
 	admin.createDefinition("web", definition(want, "app:1", "", `,"rollout":{"progress_deadline_seconds":2}`))
 	waitFor(t, "four replicas", admin.converged("web", want, engines...))
+	waitFor(t, "revision 1 to be recorded as rolled out", admin.rolloutIs("web", store.RolloutComplete, 1))
 	first := admin.workloads("web")
 	watch := admin.watch("web", want)
 
@@ -451,6 +456,7 @@ func TestPausedRolloutStandsStillUntilResumed(t *testing.T) {
 	_, admin, engines := newRolloutFleet(t, "sim-1", "sim-2")
 	admin.createDefinition("web", definition(3, "app:1", healthSpec, `,"rollout":{"progress_deadline_seconds":2}`))
 	waitFor(t, "three replicas", admin.converged("web", 3, engines...))
+	waitFor(t, "revision 1 to be recorded as rolled out", admin.rolloutIs("web", store.RolloutComplete, 1))
 	watch := admin.watch("web", 3)
 
 	// The new image's health check is still starting, so the rollout stops at its first step.
@@ -522,6 +528,7 @@ func TestRollbackAfterACompletedRolloutIsGradual(t *testing.T) {
 	_, admin, engines := newRolloutFleet(t, "sim-1", "sim-2")
 	admin.createDefinition("web", definition(3, "app:1", "", ""))
 	waitFor(t, "three replicas", admin.converged("web", 3, engines...))
+	waitFor(t, "revision 1 to be recorded as rolled out", admin.rolloutIs("web", store.RolloutComplete, 1))
 	admin.putDefinition("web", definition(3, "app:2", "", ""))
 	waitFor(t, "the first rollout to complete", admin.rolloutIs("web", store.RolloutComplete, 2))
 	waitFor(t, "three replicas of the new image", admin.converged("web", 3, engines...))

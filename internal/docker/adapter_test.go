@@ -155,11 +155,11 @@ func newTestAdapter(t *testing.T, f *fakeBackend) *Adapter {
 func seed(f *fakeBackend) {
 	f.add("aaa", "running", managedBy(testNode, "w-b"))
 	f.add("bbb", "exited", managedBy(testNode, "w-a"))
-	f.add("ccc", "running", nil)                                                                                    // not ours at all
+	f.add("ccc", "running", nil)                                                                                     // not ours at all
 	f.add("ddd", "running", map[string]string{"com.docker.compose.project": "shop"})                                 // someone else's labels
-	f.add("eee", "running", managedBy("other-node", "w-c"))                                                         // ours, but another node's
+	f.add("eee", "running", managedBy("other-node", "w-c"))                                                          // ours, but another node's
 	f.add("fff", "running", map[string]string{LabelManaged: "false", LabelNodeID: testNode, LabelWorkloadID: "w-d"}) // label says unmanaged
-	f.add("ggg", "running", map[string]string{LabelManaged: "true", LabelNodeID: testNode})                         // no workload identity
+	f.add("ggg", "running", map[string]string{LabelManaged: "true", LabelNodeID: testNode})                          // no workload identity
 }
 
 func TestListReturnsOnlyThisNodesManagedContainers(t *testing.T) {

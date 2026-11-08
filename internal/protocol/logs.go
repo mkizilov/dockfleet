@@ -49,6 +49,9 @@ func (s *NodeServer) Logs(stream dockfleetv1.NodeService_LogsServer) error {
 	if s.logs == nil {
 		return status.Error(codes.Unimplemented, "this manager does not serve container logs")
 	}
+	if _, err := s.epoch(stream.Context()); err != nil {
+		return err
+	}
 	hello, err := s.readHello(stream)
 	if err != nil {
 		return err
@@ -125,6 +128,12 @@ func (s *NodeServer) watchSession(ctx context.Context, cancel context.CancelFunc
 			return
 		case <-tick.C:
 		}
+		// A manager that stops leading serves no agent any more, streams included.
+		if _, lead := s.epoch(ctx); lead != nil && ctx.Err() == nil && IsNotLeader(decodeError(lead)) {
+			ended.Store(&lead)
+			cancel()
+			return
+		}
 		err := s.registry.CheckSession(ctx, nodeID, sessionID)
 		switch {
 		case err == nil, ctx.Err() != nil:
@@ -167,7 +176,7 @@ func (c *serverLogs) Recv() (logstream.Up, error) {
 // stream (the session is not current, the node is not enrolled, or it does not
 // serve logs) reports it in the error of Recv, or of this call.
 func (c *Client) Logs(ctx context.Context, nodeID, sessionID string) (logstream.AgentConn, error) {
-	stream, err := c.nodes.Logs(ctx)
+	stream, err := c.node().Logs(ctx)
 	if err != nil {
 		return nil, decodeError(err)
 	}

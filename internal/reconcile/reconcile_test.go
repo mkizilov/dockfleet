@@ -315,6 +315,7 @@ var reconcileTests = []reconcileTest{
 	{"scaling up beyond the cluster places what fits and waits for the rest", testScaleUpBeyondCapacity},
 	{"repeating a pass changes nothing", testPassesAreIdempotent},
 	{"a failed pass saves nothing", testFailedPassIsRolledBack},
+	{"a leader that was replaced changes nothing", testReplacedLeaderChangesNothing},
 	{"the loop retires replicas and stops", testRunLoop},
 	{"the observer is told of a failed rollout once it is saved", testObserverIsToldOfAFailedRolloutOnceItIsSaved},
 	{"the observer sees every pass of the loop", testObserverSeesEveryPassOfTheLoop},
@@ -684,9 +685,17 @@ func testLostOnlyNode(t *testing.T, newStore func(t *testing.T) store.Store) {
 
 	delete(e.down, "n1")
 	e.settle()
-	now := e.wantReplicas("web", 1, 1, "nginx:1.0")[0]
-	if now.ID == old.ID || now.NodeID != "n1" || e.events("replica.removed") != 1 {
-		t.Fatalf("after the node returned: %+v, %d removals", now, e.events("replica.removed"))
+	// The old workload held its slot until the returning node confirmed that its
+	// container is gone, so the replacement is not necessarily replica 1: the
+	// number is only a label, and everything else about it is checked.
+	list := e.workloads("web")
+	if len(list) != 1 {
+		t.Fatalf("web has %d workloads after the node returned, want only the replacement:\n%s", len(list), e.describe())
+	}
+	now := list[0]
+	if now.ID == old.ID || now.NodeID != "n1" || now.ServiceRevision != 1 || now.Image != "nginx:1.0" || now.DesiredState != store.DesiredRunning ||
+		now.Observed == nil || now.Observed.State != store.WorkloadRunning || now.Observed.AckedGeneration != now.Generation || e.events("replica.removed") != 1 {
+		t.Fatalf("after the node returned: %+v (observed %+v), %d removals", now, now.Observed, e.events("replica.removed"))
 	}
 }
 

@@ -758,6 +758,51 @@ func scanLease(row pgx.Row) (Lease, error) {
 	return l, nil
 }
 
+func (q *queries) GetControlPlane(ctx context.Context) (ControlPlane, error) {
+	var c ControlPlane
+	err := q.db.QueryRow(ctx, `SELECT epoch, leader, elected_at FROM control_plane WHERE id`).Scan(&c.Epoch, &c.Leader, &c.ElectedAt)
+	if err != nil {
+		return ControlPlane{}, mapError(err)
+	}
+	c.ElectedAt = c.ElectedAt.UTC()
+	return c, nil
+}
+
+func (q *queries) BeginTerm(ctx context.Context, leader string, at time.Time) (current, previous ControlPlane, err error) {
+	if !ValidName(leader) {
+		return ControlPlane{}, ControlPlane{}, fmt.Errorf("%w: a leader needs a valid instance ID", ErrInvalid)
+	}
+	// One statement: the row is locked by the subquery, so of two managers that
+	// begin a term at once, the second waits for the first and then increments
+	// what the first wrote.
+	err = q.db.QueryRow(ctx,
+		`UPDATE control_plane AS c
+		 SET epoch = c.epoch + 1, leader = $1, elected_at = $2
+		 FROM (SELECT id, epoch, leader, elected_at FROM control_plane WHERE id FOR UPDATE) AS p
+		 WHERE c.id = p.id
+		 RETURNING c.epoch, c.leader, c.elected_at, p.epoch, p.leader, p.elected_at`,
+		leader, at.UTC()).Scan(&current.Epoch, &current.Leader, &current.ElectedAt, &previous.Epoch, &previous.Leader, &previous.ElectedAt)
+	if err != nil {
+		return ControlPlane{}, ControlPlane{}, mapError(err)
+	}
+	current.ElectedAt, previous.ElectedAt = current.ElectedAt.UTC(), previous.ElectedAt.UTC()
+	return current, previous, nil
+}
+
+func (q *queries) CheckEpoch(ctx context.Context, epoch int64) error {
+	// FOR SHARE keeps BeginTerm (FOR UPDATE) waiting until this transaction ends,
+	// and makes this read wait for a BeginTerm that is already running.
+	var c ControlPlane
+	err := q.db.QueryRow(ctx, `SELECT epoch, leader FROM control_plane WHERE id FOR SHARE`).Scan(&c.Epoch, &c.Leader)
+	if err != nil {
+		return mapError(err)
+	}
+	if c.Epoch != epoch {
+		return fmt.Errorf("%w (acting under epoch %d, current is %d, led by %s)", ErrStaleLeader, epoch, c.Epoch, c.Leader)
+	}
+	return nil
+}
+
 func (q *queries) AcquireLease(ctx context.Context, name, holder string, ttl time.Duration, now time.Time) (Lease, error) {
 	if !ValidName(name) || !ValidName(holder) || ttl <= 0 {
 		return Lease{}, fmt.Errorf("%w: a lease needs a valid name, holder and a positive ttl", ErrInvalid)

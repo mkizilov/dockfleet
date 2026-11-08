@@ -170,6 +170,7 @@ var placementTests = []placementTest{
 	{"overcommit is off unless configured", testOvercommit},
 	{"the same input gives the same placement", testDeterminism},
 	{"a failed pass saves nothing", testFailedPassIsRolledBack},
+	{"a leader that was replaced saves nothing", testReplacedLeaderSavesNothing},
 	{"the loop places replicas and stops", testRunLoop},
 }
 
@@ -462,15 +463,30 @@ func testHostPorts(t *testing.T, e *env) {
 	if got := e.placed("other"); !reflect.DeepEqual(got, map[int]string{1: "n2"}) {
 		t.Fatalf("other = %v, want it on the node whose port was freed", got)
 	}
-	if len(e.waiting("web")) != 1 {
-		t.Fatalf("web#3 should still be waiting: %+v", e.waiting("web"))
+	// The service still wants three replicas and web#2 is stopped but still holds
+	// its slot, so a replacement is created in the next free one: web#3 and web#4 wait.
+	var waitingWeb []int
+	for _, u := range e.waiting("web") {
+		waitingWeb = append(waitingWeb, u.ReplicaIndex)
+	}
+	if !reflect.DeepEqual(waitingWeb, []int{3, 4}) {
+		t.Fatalf("web replicas waiting = %v, want [3 4]: %+v", waitingWeb, e.waiting("web"))
 	}
 
-	// Stopping that one in turn lets web#3 in.
+	// Winding "other" down (its count to zero, its replica stopped) frees the port
+	// again, and web#3, which comes before web#4 in name order, takes it; web#4
+	// keeps waiting. (Stopping its replica alone would only have it replaced.)
+	other, err := e.st.GetServiceByName(e.ctx(), "other")
+	e.must(err)
+	_, err = e.st.ScaleService(e.ctx(), other.ID, 0, 0, e.clock)
+	e.must(err)
 	_, err = e.st.SetWorkloadDesiredState(e.ctx(), e.workloadOf("other", 1), store.DesiredStopped, e.clock)
 	e.must(err)
-	if report := e.run(); report.Placed != 1 || report.Unschedulable != 0 {
+	if report := e.run(); report.Placed != 1 || report.Unschedulable != 1 {
 		t.Fatalf("report = %+v", report)
+	}
+	if left := e.waiting("web"); len(left) != 1 || left[0].ReplicaIndex != 4 {
+		t.Fatalf("web replicas still waiting = %+v, want only #4", left)
 	}
 	if got := e.placed("web"); got[3] != "n2" {
 		t.Fatalf("placement = %v, want replica 3 on n2", got)

@@ -14,6 +14,7 @@ PROTOC_GEN_GO_GRPC_VERSION := v1.5.1
 
 COMPOSE := docker compose --env-file config/dev.env -f deploy/docker-compose.yml
 DOCKER_TEST_COMPOSE := docker compose -f deploy/docker-compose.docker-test.yml
+ETCD_TEST_COMPOSE := docker compose -f deploy/docker-compose.etcd-test.yml
 PKGS    := ./...
 
 # Development credentials live in PKI_DIR, which is git-ignored.
@@ -74,9 +75,9 @@ cover: ## Run unit tests and print per-package coverage
 	$(GO) test -count=1 -cover $(PKGS)
 
 .PHONY: test-integration
-test-integration: ## Run PostgreSQL integration tests: store, API, scheduling and reconciliation (needs `make compose-up`)
+test-integration: ## Run PostgreSQL integration tests: store, API, scheduling, reconciliation and the multi-manager cluster (needs `make compose-up`)
 	set -a; . config/dev.env; set +a; \
-	DOCKFLEET_TEST_DATABASE_URL="$$DOCKFLEET_DATABASE_URL" $(GO) test -race -count=1 -tags integration ./internal/store/... ./internal/api/... ./internal/placement/... ./internal/reconcile/...
+	DOCKFLEET_TEST_DATABASE_URL="$$DOCKFLEET_DATABASE_URL" $(GO) test -race -count=1 -tags integration ./internal/store/... ./internal/api/... ./internal/placement/... ./internal/reconcile/... ./internal/integration/...
 
 .PHONY: test-docker
 test-docker: ## Run the Docker Engine tests: the adapter and a service deployment (set DOCKFLEET_TEST_DOCKER_HOST, e.g. tcp://127.0.0.1:21297 after `make docker-test-up`)
@@ -91,6 +92,19 @@ docker-test-up: ## Start a disposable Docker daemon on 127.0.0.1:21297 for `make
 .PHONY: docker-test-down
 docker-test-down: ## Stop the disposable Docker daemon and delete its images and containers
 	$(DOCKER_TEST_COMPOSE) down --volumes
+
+.PHONY: test-etcd
+test-etcd: ## Run the etcd tests: the election client and the managers' election against a real etcd (set DOCKFLEET_TEST_ETCD_ENDPOINTS, e.g. http://127.0.0.1:21234 after `make etcd-test-up`)
+	@test -n "$$DOCKFLEET_TEST_ETCD_ENDPOINTS" || { echo "set DOCKFLEET_TEST_ETCD_ENDPOINTS to an etcd, e.g. http://127.0.0.1:21234 after 'make etcd-test-up'"; exit 1; }
+	$(GO) test -race -count=1 -tags etcdintegration -run RealEtcd -v ./internal/etcd/ ./internal/integration/
+
+.PHONY: etcd-test-up
+etcd-test-up: ## Start a disposable single-member etcd on 127.0.0.1:21234 for `make test-etcd`
+	$(ETCD_TEST_COMPOSE) up -d --wait
+
+.PHONY: etcd-test-down
+etcd-test-down: ## Stop the disposable etcd and delete its data
+	$(ETCD_TEST_COMPOSE) down --volumes
 
 .PHONY: check-secrets
 check-secrets: ## Fail if a private key is tracked by git
