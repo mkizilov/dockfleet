@@ -45,14 +45,14 @@ tools: ## Install pinned buf and protoc plugins into .tools/bin
 
 .PHONY: proto
 proto: ## Generate Go code from proto/ (required before build and test)
-	buf generate proto
+	$(TOOLS_BIN)/buf generate proto
 
 .PHONY: generate
 generate: tools proto-lint proto ## One-shot reproducible bindings: pinned tools, lint, generate
 
 .PHONY: proto-lint
 proto-lint: ## Lint the protobuf definitions
-	buf lint proto
+	$(TOOLS_BIN)/buf lint proto
 
 .PHONY: tidy
 tidy: ## Resolve dependencies and write go.sum (needs network)
@@ -152,7 +152,7 @@ tools-lint: ## Install the pinned file linters and secret scanner: actionlint an
 
 .PHONY: lint-files
 lint-files: ## Lint the CI workflow, the shell scripts, the Dockerfile and the Compose files (needs `make tools-lint`)
-	actionlint -shellcheck=$(VENV)/bin/shellcheck .github/workflows/*.yml
+	$(TOOLS_BIN)/actionlint -shellcheck=$(VENV)/bin/shellcheck .github/workflows/*.yml
 	$(VENV)/bin/shellcheck scripts/*.sh
 	$(VENV)/bin/hadolint Dockerfile
 	$(VENV)/bin/check-jsonschema --builtin-schema vendor.github-workflows .github/workflows/*.yml
@@ -160,7 +160,7 @@ lint-files: ## Lint the CI workflow, the shell scripts, the Dockerfile and the C
 
 .PHONY: scan-secrets
 scan-secrets: ## Scan every committed revision for secrets with gitleaks (needs `make tools-lint`; the known false positives are in .gitleaksignore)
-	gitleaks git --redact --no-banner .
+	$(TOOLS_BIN)/gitleaks git --redact --no-banner .
 
 .PHONY: notices
 notices: ## Regenerate THIRD_PARTY_NOTICES.md from the dependencies the released binaries link (needs the protobuf code: `make proto`)
