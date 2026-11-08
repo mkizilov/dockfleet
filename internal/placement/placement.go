@@ -243,7 +243,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) (Report, error) {
 					Image: spec.Image, CPUMillis: spec.CPUMillis, MemoryBytes: spec.MemoryBytes,
 					NodeID: d.NodeID, DesiredState: store.DesiredRunning,
 					ServiceID: svc.ID, ServiceRevision: svc.CurrentRevision, ReplicaIndex: d.Replica.Index,
-					Ports: spec.Ports, CreatedAt: now,
+					Ports: spec.Ports, Command: spec.Command, Env: spec.Env, RestartPolicy: spec.RestartPolicy, CreatedAt: now,
 				})
 				if err != nil {
 					return fmt.Errorf("assign %s: %w", d.Replica.Label(), err)

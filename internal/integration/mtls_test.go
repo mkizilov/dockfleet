@@ -164,13 +164,13 @@ func TestMutualTLSTrustedNodeRegistersAndReceivesWork(t *testing.T) {
 
 	waitFor(t, "registration over mutual TLS", func() bool { return m.sessionID("sim-1") != "" })
 	if _, err := m.store.CreateWorkload(context.Background(), store.Workload{
-		ID: "w1", Name: "web", Image: "nginx", CPUMillis: 1, MemoryBytes: 1, NodeID: "sim-1", CreatedAt: time.Now(),
+		ID: "w1", Name: "web", Image: "nginx", CPUMillis: 100, MemoryBytes: 64 << 20, NodeID: "sim-1", CreatedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "the workload to be reported back over mutual TLS", func() bool {
 		w, err := m.store.GetWorkload(context.Background(), "w1")
-		return err == nil && w.Phase() == store.WorkloadPending
+		return err == nil && w.Phase() == store.WorkloadRunning && w.Observed.AckedGeneration == 1
 	})
 	n, ok := m.node("sim-1")
 	if !ok || !scheduler.Ready(n, time.Now(), time.Minute) {

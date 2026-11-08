@@ -12,6 +12,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/dockfleet/dockfleet/internal/docker"
+	"github.com/dockfleet/dockfleet/internal/dockerfake"
 	"github.com/dockfleet/dockfleet/internal/protocol"
 	dockfleetv1 "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/v1"
 )
@@ -88,12 +90,7 @@ func (f *fakeManager) deregistrations() []string {
 	return append([]string(nil), f.deregistered...)
 }
 
-type fakeDocker struct{ err error }
-
-func (d fakeDocker) Ping(context.Context) error { return d.err }
-func (d fakeDocker) Close() error               { return nil }
-
-func newTestAgent(m Manager, d fakeDocker) *Agent {
+func newTestAgent(m Manager, d *dockerfake.Fake) *Agent {
 	return New(Config{
 		Node:       protocol.NodeInfo{ID: "node-1"},
 		Manager:    m,
@@ -102,7 +99,15 @@ func newTestAgent(m Manager, d fakeDocker) *Agent {
 		RPCTimeout: time.Second,
 		RetryMin:   time.Millisecond,
 		RetryMax:   4 * time.Millisecond,
+		Resync:     5 * time.Millisecond,
 	})
+}
+
+// unreachableDocker fails its first ping, as an engine that is not up yet would.
+func unreachableDocker() *dockerfake.Fake {
+	d := dockerfake.New("node-1")
+	d.FailNext("ping", errors.New("no socket"), 1)
+	return d
 }
 
 type running struct {
@@ -158,12 +163,12 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 }
 
 func assignment(id string) *dockfleetv1.WorkloadAssignment {
-	return &dockfleetv1.WorkloadAssignment{WorkloadId: id, Name: id, Image: "img"}
+	return &dockfleetv1.WorkloadAssignment{WorkloadId: id, Name: id, Image: "img", Generation: 1, CpuMillis: 100, MemoryBytes: 64 << 20}
 }
 
 func TestRunRegistersHeartbeatsAndDeregistersOnShutdown(t *testing.T) {
 	m := &fakeManager{interval: 2 * time.Millisecond}
-	r := start(t, newTestAgent(m, fakeDocker{}))
+	r := start(t, newTestAgent(m, dockerfake.New("node-1")))
 
 	waitFor(t, "three heartbeats", func() bool { return len(m.calls()) >= 3 })
 	if err := r.stop(); err != nil {
@@ -185,7 +190,7 @@ func TestRunRegistersHeartbeatsAndDeregistersOnShutdown(t *testing.T) {
 func TestRunRetriesRegistrationUntilManagerIsAvailable(t *testing.T) {
 	down := status.Error(codes.Unavailable, "down")
 	m := &fakeManager{interval: 2 * time.Millisecond, registerErrs: []error{down, down, down}}
-	start(t, newTestAgent(m, fakeDocker{}))
+	start(t, newTestAgent(m, dockerfake.New("node-1")))
 
 	waitFor(t, "a heartbeat after retries", func() bool { return len(m.calls()) >= 1 })
 	if m.registers() != 4 {
@@ -202,7 +207,7 @@ func TestRunStopsOnPermanentRegistrationErrors(t *testing.T) {
 	for name, cause := range tests {
 		t.Run(name, func(t *testing.T) {
 			m := &fakeManager{registerErrs: []error{cause}}
-			r := start(t, newTestAgent(m, fakeDocker{}))
+			r := start(t, newTestAgent(m, dockerfake.New("node-1")))
 			err := r.wait()
 			if err == nil || !errors.Is(err, cause) {
 				t.Fatalf("Run returned %v, want an error wrapping %v", err, cause)
@@ -220,7 +225,7 @@ func TestRunStopsOnPermanentRegistrationErrors(t *testing.T) {
 func TestRunRetriesUntilTheNodeIsEnrolled(t *testing.T) {
 	notEnrolled := &protocol.Error{Code: dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_ENROLLED, Message: "ask an administrator"}
 	m := &fakeManager{interval: 2 * time.Millisecond, registerErrs: []error{notEnrolled, notEnrolled, notEnrolled}}
-	r := start(t, newTestAgent(m, fakeDocker{}))
+	r := start(t, newTestAgent(m, dockerfake.New("node-1")))
 
 	waitFor(t, "a heartbeat once enrolled", func() bool { return len(m.calls()) >= 1 })
 	if m.registers() != 4 {
@@ -234,7 +239,7 @@ func TestRunRetriesUntilTheNodeIsEnrolled(t *testing.T) {
 func TestRunStopsWhenTheManagerRejectsTheIdentity(t *testing.T) {
 	mismatch := &protocol.Error{Code: dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_IDENTITY_MISMATCH, Message: "certificate is for another node"}
 	m := &fakeManager{registerErrs: []error{mismatch}}
-	r := start(t, newTestAgent(m, fakeDocker{}))
+	r := start(t, newTestAgent(m, dockerfake.New("node-1")))
 	if err := r.wait(); !errors.Is(err, mismatch) {
 		t.Fatalf("Run returned %v, want the identity mismatch", err)
 	}
@@ -246,7 +251,7 @@ func TestRunStopsWhenTheManagerRejectsTheIdentity(t *testing.T) {
 func TestRunStopsOnPermanentHeartbeatRejection(t *testing.T) {
 	bad := status.Error(codes.Unauthenticated, "token rotated")
 	m := &fakeManager{interval: 2 * time.Millisecond, heartbeatErrs: []error{bad}}
-	r := start(t, newTestAgent(m, fakeDocker{}))
+	r := start(t, newTestAgent(m, dockerfake.New("node-1")))
 	if err := r.wait(); !errors.Is(err, bad) {
 		t.Fatalf("Run returned %v, want the rejection", err)
 	}
@@ -258,7 +263,7 @@ func TestRunStopsOnPermanentHeartbeatRejection(t *testing.T) {
 func TestRunKeepsGoingWhenTheCertificateIsRejectedTemporarily(t *testing.T) {
 	expired := &protocol.Error{Code: dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_CERTIFICATE_INVALID, Message: "client certificate has expired"}
 	m := &fakeManager{interval: 2 * time.Millisecond, heartbeatErrs: []error{expired, expired}}
-	start(t, newTestAgent(m, fakeDocker{}))
+	start(t, newTestAgent(m, dockerfake.New("node-1")))
 
 	waitFor(t, "heartbeats after the certificate errors", func() bool { return len(m.calls()) >= 4 })
 	if m.registers() != 1 {
@@ -269,7 +274,7 @@ func TestRunKeepsGoingWhenTheCertificateIsRejectedTemporarily(t *testing.T) {
 func TestRunRegistersAgainWhenSessionIsLost(t *testing.T) {
 	lost := &protocol.Error{Code: dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_REGISTERED, Message: "restarted"}
 	m := &fakeManager{interval: 2 * time.Millisecond, heartbeatErrs: []error{lost}}
-	start(t, newTestAgent(m, fakeDocker{}))
+	start(t, newTestAgent(m, dockerfake.New("node-1")))
 
 	waitFor(t, "a heartbeat on the second session", func() bool {
 		for _, c := range m.calls() {
@@ -287,7 +292,7 @@ func TestRunRegistersAgainWhenSessionIsLost(t *testing.T) {
 func TestRunSurvivesTransientHeartbeatFailures(t *testing.T) {
 	blip := status.Error(codes.Unavailable, "blip")
 	m := &fakeManager{interval: 2 * time.Millisecond, heartbeatErrs: []error{blip, blip, context.DeadlineExceeded}}
-	start(t, newTestAgent(m, fakeDocker{}))
+	start(t, newTestAgent(m, dockerfake.New("node-1")))
 
 	waitFor(t, "heartbeats after transient errors", func() bool { return len(m.calls()) >= 5 })
 	if m.registers() != 1 {
@@ -297,7 +302,7 @@ func TestRunSurvivesTransientHeartbeatFailures(t *testing.T) {
 
 func TestRunStopsWhileManagerIsDown(t *testing.T) {
 	m := &fakeManager{registerErrs: []error{status.Error(codes.Unavailable, "down")}}
-	a := newTestAgent(m, fakeDocker{})
+	a := newTestAgent(m, dockerfake.New("node-1"))
 	a.cfg.RetryMin = time.Hour
 	a.cfg.RetryMax = time.Hour
 	r := start(t, a)
@@ -311,58 +316,60 @@ func TestRunStopsWhileManagerIsDown(t *testing.T) {
 	}
 }
 
-func TestStatusReportsFollowAssignments(t *testing.T) {
-	m := &fakeManager{interval: 2 * time.Millisecond, assignments: []*dockfleetv1.WorkloadAssignment{assignment("w2"), assignment("w1")}}
-	start(t, newTestAgent(m, fakeDocker{}))
+// An assignment becomes a running container; the report says so and
+// acknowledges the instruction; and stopping the agent leaves the container
+// running for the next agent to find.
+func TestAgentRunsAssignedWorkloadsAndLeavesThemWhenItStops(t *testing.T) {
+	engine := dockerfake.New("node-1")
+	engine.AddImage("img")
+	web := assignment("w1")
+	web.Generation = 3
+	m := &fakeManager{interval: 2 * time.Millisecond, assignments: []*dockfleetv1.WorkloadAssignment{web}}
+	r := start(t, newTestAgent(m, engine))
 
-	waitFor(t, "a heartbeat", func() bool { return len(m.calls()) >= 1 })
-	first := m.calls()[0].statuses
-	if len(first) != 2 || first[0].GetWorkloadId() != "w1" || first[1].GetWorkloadId() != "w2" {
-		t.Fatalf("statuses must cover every assignment, ordered by ID: %v", first)
-	}
-	for _, st := range first {
-		if st.GetPhase() != dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_PENDING || st.GetMessage() != runtimeMissing {
-			t.Fatalf("unexpected status %v", st)
-		}
-	}
-
-	m.mu.Lock()
-	m.assignments = []*dockfleetv1.WorkloadAssignment{assignment("w1")}
-	m.mu.Unlock()
-	waitFor(t, "w2 to be dropped from reports", func() bool {
+	waitFor(t, "w1 to be reported running and acknowledged", func() bool {
 		calls := m.calls()
-		return len(calls[len(calls)-1].statuses) == 1
+		if len(calls) == 0 {
+			return false
+		}
+		for _, st := range calls[len(calls)-1].statuses {
+			if st.GetWorkloadId() == "w1" && st.GetPhase() == dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_RUNNING &&
+				st.GetAcknowledgedGeneration() == 3 && st.GetContainerId() != "" {
+				return true
+			}
+		}
+		return false
 	})
-}
-
-func TestReconcileKeepsExistingStatuses(t *testing.T) {
-	a := newTestAgent(&fakeManager{}, fakeDocker{})
-	a.reconcile([]*dockfleetv1.WorkloadAssignment{assignment("w1")})
-	a.statuses["w1"].Phase = dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_RUNNING
-	a.reconcile([]*dockfleetv1.WorkloadAssignment{assignment("w1"), assignment("w2")})
-
-	if a.statuses["w1"].GetPhase() != dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_RUNNING {
-		t.Error("reconcile must not reset a known workload")
+	if err := r.stop(); err != nil {
+		t.Fatalf("Run returned %v", err)
 	}
-	if a.statuses["w2"].GetPhase() != dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_PENDING {
-		t.Error("a new workload must start pending")
+	if managed := engine.Managed(); len(managed) != 1 || managed[0].WorkloadID != "w1" || managed[0].State != docker.StateRunning {
+		t.Fatalf("containers after the agent stopped = %+v; they must keep running", managed)
 	}
-	a.reconcile(nil)
-	if len(a.statuses) != 0 {
-		t.Errorf("unassigned workloads must be forgotten: %v", a.statuses)
+
+	// A new agent on the same node finds the container and does not create another.
+	m2 := &fakeManager{interval: 2 * time.Millisecond, assignments: []*dockfleetv1.WorkloadAssignment{web}}
+	start(t, newTestAgent(m2, engine))
+	waitFor(t, "the new agent to report w1", func() bool {
+		calls := m2.calls()
+		return len(calls) > 0 && len(calls[len(calls)-1].statuses) == 1 &&
+			calls[len(calls)-1].statuses[0].GetPhase() == dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_RUNNING
+	})
+	if engine.Count("create") != 1 || engine.Count("start") != 1 {
+		t.Fatalf("calls = %v; a restarted agent must adopt the container it finds", engine.Calls())
 	}
 }
 
 func TestRunToleratesUnreachableDocker(t *testing.T) {
 	m := &fakeManager{interval: 2 * time.Millisecond}
-	start(t, newTestAgent(m, fakeDocker{err: errors.New("no socket")}))
+	start(t, newTestAgent(m, unreachableDocker()))
 
 	waitFor(t, "a heartbeat", func() bool { return len(m.calls()) >= 1 })
 }
 
 func TestDeregisterFailureDoesNotFailShutdown(t *testing.T) {
 	m := &fakeManager{interval: 2 * time.Millisecond, deregisterErr: errors.New("manager gone")}
-	r := start(t, newTestAgent(m, fakeDocker{}))
+	r := start(t, newTestAgent(m, dockerfake.New("node-1")))
 
 	waitFor(t, "a heartbeat", func() bool { return len(m.calls()) >= 1 })
 	if err := r.stop(); err != nil {

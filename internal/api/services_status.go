@@ -23,8 +23,18 @@ type replicaStatus struct {
 	NodeID       string `json:"node_id"`
 	DesiredState string `json:"desired_state"`
 
+	// Generation counts the instructions given for the workload (its desired
+	// state changing), and Acknowledged says that its node has received the
+	// latest one.
+	Generation   int64 `json:"generation"`
+	Acknowledged bool  `json:"acknowledged"`
+
 	// Phase is what the node's agent last reported, or "scheduled" if it has not yet.
 	Phase string `json:"phase"`
+	// Message is the agent's own words for the phase, and ContainerID the
+	// container it reported; empty when the node has none.
+	Message     string `json:"message,omitempty"`
+	ContainerID string `json:"container_id,omitempty"`
 }
 
 // serviceStatus summarizes the scheduling of one service.
@@ -36,6 +46,10 @@ type serviceStatus struct {
 	// because no node could take them.
 	ScheduledReplicas     int `json:"scheduled_replicas"`
 	UnschedulableReplicas int `json:"unschedulable_replicas"`
+
+	// RunningReplicas counts the wanted replicas of the current revision whose
+	// agent reports the container running.
+	RunningReplicas int `json:"running_replicas"`
 
 	// Replicas are the service's workloads, by revision and index.
 	Replicas []replicaStatus `json:"replicas"`
@@ -53,12 +67,20 @@ func buildStatus(svc store.Service, workloads []store.Workload, waiting []store.
 		Unschedulable:   append([]store.Unschedulable{}, waiting...),
 	}
 	for _, w := range workloads {
-		st.Replicas = append(st.Replicas, replicaStatus{
+		r := replicaStatus{
 			Revision: w.ServiceRevision, Index: w.ReplicaIndex, WorkloadID: w.ID, WorkloadName: w.Name,
-			NodeID: w.NodeID, DesiredState: w.DesiredState, Phase: w.Phase(),
-		})
+			NodeID: w.NodeID, DesiredState: w.DesiredState, Generation: w.Generation, Phase: w.Phase(),
+		}
+		if w.Observed != nil {
+			r.Acknowledged = w.Observed.AckedGeneration >= w.Generation
+			r.Message, r.ContainerID = w.Observed.Message, w.Observed.ContainerID
+		}
+		st.Replicas = append(st.Replicas, r)
 		if w.ServiceRevision == svc.CurrentRevision && w.ReplicaIndex <= svc.Replicas && w.DesiredState == store.DesiredRunning {
 			st.ScheduledReplicas++
+			if w.Phase() == store.WorkloadRunning {
+				st.RunningReplicas++
+			}
 		}
 	}
 	sort.Slice(st.Replicas, func(i, j int) bool {

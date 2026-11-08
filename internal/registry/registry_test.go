@@ -307,7 +307,10 @@ func TestRegistrationAndItsEventSucceedOrFailTogether(t *testing.T) {
 	}
 }
 
-func TestStoppedWorkloadsAreNotAssigned(t *testing.T) {
+// A workload that is meant to stop stays in the assignments, now with the
+// desired state "stopped": that is the instruction to stop and remove its
+// container. It leaves the list only when the manager deletes it.
+func TestStoppedWorkloadsAreAssignedAsStopped(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 	s, _, _ := f.reg.Register(ctx, node("n1"))
@@ -317,13 +320,73 @@ func TestStoppedWorkloadsAreNotAssigned(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assigned, err := f.reg.Heartbeat(ctx, "n1", s.ID, nil)
-	if err != nil || len(assigned) != 1 || assigned[0].ID != "keep" {
-		t.Fatalf("heartbeat assignments = %+v, %v", assigned, err)
+	check := func(what string, got []store.Workload, err error) {
+		t.Helper()
+		if err != nil || len(got) != 2 ||
+			got[0].ID != "keep" || got[0].DesiredState != store.DesiredRunning || got[0].Generation != 1 ||
+			got[1].ID != "stop" || got[1].DesiredState != store.DesiredStopped || got[1].Generation != 2 {
+			t.Fatalf("%s assignments = %+v, %v", what, got, err)
+		}
 	}
+	assigned, err := f.reg.Heartbeat(ctx, "n1", s.ID, nil)
+	check("heartbeat", assigned, err)
 	_, onRegister, err := f.reg.Register(ctx, node("n1"))
-	if err != nil || len(onRegister) != 1 || onRegister[0].ID != "keep" {
-		t.Fatalf("registration assignments = %+v, %v", onRegister, err)
+	check("registration", onRegister, err)
+
+	if err := f.store.DeleteWorkload(ctx, "stop"); err != nil {
+		t.Fatal(err)
+	}
+	s2, _, _ := f.reg.Register(ctx, node("n1"))
+	if assigned, err := f.reg.Heartbeat(ctx, "n1", s2.ID, nil); err != nil || len(assigned) != 1 || assigned[0].ID != "keep" {
+		t.Fatalf("after the record was deleted: %+v, %v", assigned, err)
+	}
+}
+
+// What the agent acknowledges is stored beside the observation. It cannot
+// name a generation that does not exist yet, and it never goes back.
+func TestAcknowledgmentsAreClampedAndNeverGoBack(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	s, _, _ := f.reg.Register(ctx, node("n1"))
+	f.addWorkload(t, "w1", "n1")
+	exit := 0
+	report := func(acked int64) {
+		t.Helper()
+		f.clock = f.clock.Add(time.Second)
+		reports := []StatusReport{{WorkloadID: "w1", State: store.WorkloadRunning, ContainerID: "c1", ExitCode: &exit, RestartCount: 2, AckedGeneration: acked}}
+		if _, err := f.reg.Heartbeat(ctx, "n1", s.ID, reports); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stored := func() store.Observation {
+		t.Helper()
+		w, err := f.store.GetWorkload(ctx, "w1")
+		if err != nil || w.Observed == nil {
+			t.Fatalf("workload = %+v, %v", w, err)
+		}
+		return *w.Observed
+	}
+
+	report(99)
+	if o := stored(); o.AckedGeneration != 1 || o.ContainerID != "c1" || o.ExitCode == nil || *o.ExitCode != 0 || o.RestartCount != 2 {
+		t.Fatalf("observation = %+v; generation 99 does not exist, the workload is at generation 1", o)
+	}
+
+	if _, err := f.store.SetWorkloadDesiredState(ctx, "w1", store.DesiredStopped, f.clock); err != nil {
+		t.Fatal(err)
+	}
+	report(1)
+	if got := stored().AckedGeneration; got != 1 {
+		t.Fatalf("acknowledged generation = %d, want 1 until the agent sees generation 2", got)
+	}
+	report(2)
+	if got := stored().AckedGeneration; got != 2 {
+		t.Fatalf("acknowledged generation = %d, want 2", got)
+	}
+	report(1)
+	report(0)
+	if got := stored().AckedGeneration; got != 2 {
+		t.Fatalf("acknowledged generation went back to %d", got)
 	}
 }
 

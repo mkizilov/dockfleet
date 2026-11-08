@@ -1,12 +1,12 @@
 # Docker Engine adapter
 
-`internal/docker` is the agent's adapter for its **local** Docker Engine. It can list, create, start, stop and remove DockFleet's containers, read their state and logs, and report resource usage. It is not yet driven by the agent's heartbeat loop: today the agent only uses it to check that Docker is reachable. Turning assignments into running containers builds on this adapter.
+`internal/docker` is the agent's adapter for its **local** Docker Engine. It can list, create, start, stop and remove DockFleet's containers, read their state and logs, and report resource usage. The agent's runner (`internal/agent`) drives it from the manager's assignments: it creates, starts, stops and removes the containers of the workloads assigned to the node and nothing else ([reconciliation.md](reconciliation.md)). The runner depends on `docker.Runtime` only, so it is tested against `internal/dockerfake`, an in-memory engine that behaves like this adapter.
 
 ## Who talks to Docker
 
 Only the agent. The manager never connects to Docker and never needs a Docker socket:
 
-- `internal/manager`, `internal/api`, `internal/registry`, `internal/store`, `internal/scheduler`, `internal/placement`, `internal/protocol` and `cmd/manager` do not import `internal/docker` or any `github.com/docker/...` package. `TestManagerSideNeverImportsDocker` parses their imports (transitively) and fails the build if that changes.
+- `internal/manager`, `internal/api`, `internal/registry`, `internal/store`, `internal/scheduler`, `internal/placement`, `internal/reconcile`, `internal/protocol` and `cmd/manager` do not import `internal/docker` or any `github.com/docker/...` package. `TestManagerSideNeverImportsDocker` parses their imports (transitively) and fails the build if that changes.
 - The manager's configuration has no Docker settings, and `deploy/` files must not mention `docker.sock` (also tested).
 - Agents reach the manager only over gRPC (mutual TLS). The adapter accepts a `unix://` socket or a loopback `tcp://` address; any other TCP host is refused because the Engine API is unauthenticated and equivalent to root on the host (`DOCKFLEET_DOCKER_HOST`, default `unix:///var/run/docker.sock`).
 - The agent process needs access to the socket, which is root-equivalent on that machine. Run it as a dedicated user with access to the socket and nothing else, and treat the worker host accordingly.
@@ -70,7 +70,7 @@ The agent reads two optional settings and passes them to `docker.NewPolicy`; the
 | `DOCKFLEET_ALLOWED_BIND_ROOTS` | Comma-separated absolute directories bind mounts may live under (default: none) |
 | `DOCKFLEET_ALLOWED_CAPABILITIES` | Comma-separated capabilities containers may add (default: none). Never allowed: `ALL`, `SYS_ADMIN`, `SYS_PTRACE`, `SYS_MODULE`, `SYS_RAWIO`, `SYS_BOOT`, `SYS_TIME`, `SYS_RESOURCE`, `DAC_READ_SEARCH`, `NET_ADMIN`, `NET_RAW`, `MKNOD`, `SETFCAP`, `MAC_ADMIN`, `MAC_OVERRIDE`, `AUDIT_CONTROL`, `BPF`, `PERFMON`, `SYSLOG`, `LINUX_IMMUTABLE`, `CHECKPOINT_RESTORE`, `WAKE_ALARM`, `BLOCK_SUSPEND` |
 
-`PolicyConfig.AllowPublicPorts` exists for programmatic use but is not exposed as a setting yet: workload assignments do not carry ports.
+`PolicyConfig.AllowPublicPorts` exists for programmatic use but is not exposed as a setting yet. Assignments carry the service's ports, which the agent publishes on loopback (`127.0.0.1`) only; a spec that asks for more is refused by the policy and reported `FAILED`.
 
 ## Docker SDK
 
@@ -83,10 +83,14 @@ The adapter uses `github.com/docker/docker` (pinned in `go.mod`, with `github.co
 - `logs_stats_test.go`: log demultiplexing and limits, stats parsing (cgroup v1 and v2).
 - `sdk_test.go`: the real SDK code against a fake Docker Engine HTTP transport (no daemon, socket or port): request shapes, label filters, the hardened create body, error mapping.
 - `boundary_test.go`: the manager side never imports Docker.
-- `docker_integration_test.go` (build tag `dockerintegration`): the full lifecycle against a real daemon, including a bystander container that must survive untouched. Not part of `make test`:
+- `docker_integration_test.go` (build tag `dockerintegration`): the full lifecycle against a real daemon, including a bystander container that must survive untouched. `internal/integration/docker_test.go` (same tag) deploys a service through the whole control loop on a real daemon. Neither is part of `make test`:
 
 ```sh
-make test-docker DOCKFLEET_TEST_DOCKER_HOST=unix:///var/run/docker.sock
+make docker-test-up                         # a disposable daemon on 127.0.0.1:21297 (Docker in Docker)
+export DOCKFLEET_TEST_DOCKER_HOST=tcp://127.0.0.1:21297
+make test-docker
+make docker-test-down                       # deletes the daemon, its images and containers
 ```
 
-It pulls `alpine:3.20` (override with `DOCKFLEET_TEST_DOCKER_IMAGE`), creates short-lived containers named `dockfleet-itest-...`, and removes everything it creates. CI runs it in a job with the runner's Docker.
+They pull `alpine:3.20` (override with `DOCKFLEET_TEST_DOCKER_IMAGE`), create containers whose names start with `dockfleet-` for node IDs starting with `itest-` or `bystander-`, and remove everything they create. The disposable daemon keeps the tests off the host's Docker; `DOCKFLEET_TEST_DOCKER_HOST` may name any other local daemon, but never run them against one that holds containers you care about. CI runs them in a job with the runner's Docker.
+- `internal/dockerfake`: the in-memory engine the agent and integration tests use. It applies the container policy, addresses containers by workload ID, refuses duplicates and name conflicts, requires images to be pulled, and holds bystander containers that no operation can reach.

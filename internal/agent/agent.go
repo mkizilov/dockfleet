@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"sort"
+	"sync"
 	"time"
 
 	"github.com/dockfleet/dockfleet/internal/docker"
@@ -18,9 +18,6 @@ const (
 	defaultRPCTimeout = 5 * time.Second
 	defaultHeartbeat  = 10 * time.Second
 	dockerPingWait    = 5 * time.Second
-
-	// No container runtime exists yet, so assigned workloads stay pending.
-	runtimeMissing = "accepted; container runtime is not implemented yet"
 )
 
 // Manager is the agent's view of the control plane; *protocol.Client satisfies it.
@@ -34,22 +31,30 @@ type Manager interface {
 type Config struct {
 	Node    protocol.NodeInfo
 	Manager Manager
-	Docker  docker.Client
-	Logger  *slog.Logger
+	// Docker is the node's container runtime; the agent creates, starts,
+	// stops and removes containers through it, and only ever sees the ones
+	// DockFleet manages.
+	Docker docker.Runtime
+	Logger *slog.Logger
 	// RPCTimeout is the deadline for each manager call; zero means 5 seconds.
 	RPCTimeout time.Duration
 	// RetryMin and RetryMax bound the registration backoff; zero means 1s and 30s.
 	RetryMin time.Duration
 	RetryMax time.Duration
+	// Resync is how often containers are checked when nothing else prompts it
+	// (zero means 2 seconds). OrphanGrace is how long a managed container may
+	// go without an assignment before it is removed (zero means 2 minutes).
+	Resync      time.Duration
+	OrphanGrace time.Duration
 }
 
 // Agent keeps one node connected to the manager until its context is
-// canceled: it registers, heartbeats, mirrors assignments into status reports,
-// and registers again whenever the manager loses the session. It does not run
-// containers yet.
+// canceled: it registers, heartbeats, registers again whenever the manager
+// loses the session, and keeps the node's containers in line with the
+// assignments it receives, reporting what it finds.
 type Agent struct {
-	cfg      Config
-	statuses map[string]*dockfleetv1.WorkloadStatus
+	cfg    Config
+	runner *runner
 }
 
 func New(cfg Config) *Agent {
@@ -62,7 +67,7 @@ func New(cfg Config) *Agent {
 	if cfg.RetryMax <= 0 {
 		cfg.RetryMax = defaultRetryMax
 	}
-	return &Agent{cfg: cfg, statuses: map[string]*dockfleetv1.WorkloadStatus{}}
+	return &Agent{cfg: cfg, runner: newRunner(cfg.Docker, cfg.Logger, runnerConfig{Resync: cfg.Resync, OrphanGrace: cfg.OrphanGrace})}
 }
 
 // Run blocks until ctx is canceled and then returns nil after deregistering
@@ -73,8 +78,25 @@ func New(cfg Config) *Agent {
 // rejected credentials. A node that is not enrolled, or whose certificate is
 // expired, is retried: an administrator enrolling it or renewing the
 // certificate fixes it without restarting the agent.
+//
+// Containers are not stopped when the agent stops: they keep running, and the
+// next agent that starts on the node finds them and carries on.
 func (a *Agent) Run(ctx context.Context) error {
 	a.checkDocker(ctx)
+
+	// The runner works on its own so that a slow image pull never delays a heartbeat.
+	runCtx, stopRunner := context.WithCancel(ctx)
+	var runnerDone sync.WaitGroup
+	runnerDone.Add(1)
+	go func() {
+		defer runnerDone.Done()
+		a.runner.Run(runCtx)
+	}()
+	defer func() {
+		stopRunner()
+		runnerDone.Wait()
+	}()
+
 	for {
 		session, err := a.register(ctx)
 		if err != nil {
@@ -146,7 +168,7 @@ func (a *Agent) register(ctx context.Context) (protocol.Session, error) {
 // recognizes the session (true, nil: the caller registers again), or the
 // manager reports a failure that retrying cannot fix (an error).
 func (a *Agent) serve(ctx context.Context, session protocol.Session) (sessionLost bool, err error) {
-	a.reconcile(session.Assignments)
+	a.runner.Assign(session.Assignments)
 	interval := session.HeartbeatInterval
 	if interval <= 0 {
 		interval = defaultHeartbeat
@@ -162,11 +184,11 @@ func (a *Agent) serve(ctx context.Context, session protocol.Session) (sessionLos
 		}
 
 		callCtx, cancel := context.WithTimeout(ctx, a.cfg.RPCTimeout)
-		assigned, hbErr := a.cfg.Manager.Heartbeat(callCtx, a.cfg.Node.ID, session.ID, a.snapshot())
+		assigned, hbErr := a.cfg.Manager.Heartbeat(callCtx, a.cfg.Node.ID, session.ID, a.runner.Statuses())
 		cancel()
 		switch {
 		case hbErr == nil:
-			a.reconcile(assigned)
+			a.runner.Assign(assigned)
 		case ctx.Err() != nil:
 			return false, nil
 		case protocol.NeedsRegistration(hbErr):
@@ -191,39 +213,4 @@ func (a *Agent) deregister(ctx context.Context, session protocol.Session) {
 		return
 	}
 	a.cfg.Logger.Info("deregistered from manager")
-}
-
-// reconcile aligns the local status table with the assignments the manager
-// returned: new workloads start pending and unassigned ones are forgotten.
-func (a *Agent) reconcile(assigned []*dockfleetv1.WorkloadAssignment) {
-	desired := make(map[string]struct{}, len(assigned))
-	for _, w := range assigned {
-		id := w.GetWorkloadId()
-		desired[id] = struct{}{}
-		if _, known := a.statuses[id]; known {
-			continue
-		}
-		a.statuses[id] = &dockfleetv1.WorkloadStatus{
-			WorkloadId: id,
-			Phase:      dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_PENDING,
-			Message:    runtimeMissing,
-		}
-		a.cfg.Logger.Info("workload assigned", "workload_id", id, "name", w.GetName(), "image", w.GetImage())
-	}
-	for id := range a.statuses {
-		if _, ok := desired[id]; !ok {
-			delete(a.statuses, id)
-			a.cfg.Logger.Info("workload unassigned", "workload_id", id)
-		}
-	}
-}
-
-// snapshot returns the current status table ordered by workload ID.
-func (a *Agent) snapshot() []*dockfleetv1.WorkloadStatus {
-	out := make([]*dockfleetv1.WorkloadStatus, 0, len(a.statuses))
-	for _, st := range a.statuses {
-		out = append(out, st)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].GetWorkloadId() < out[j].GetWorkloadId() })
-	return out
 }

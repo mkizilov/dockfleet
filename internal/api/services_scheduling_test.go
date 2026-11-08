@@ -162,6 +162,32 @@ func testServiceStatusShowsAssignments(t *testing.T, e *serviceEnv) {
 	}
 }
 
+func testServiceStatusShowsAcknowledgments(t *testing.T, e *serviceEnv) {
+	e.addNode("n1", 4000, 8<<30)
+	e.create(webService(2, 500))
+	e.schedule()
+
+	st := e.get("web").Status
+	if st.ScheduledReplicas != 2 || st.RunningReplicas != 0 || len(st.Replicas) != 2 || st.Replicas[0].Generation != 1 || st.Replicas[0].Acknowledged {
+		t.Fatalf("status before any report = %+v", st)
+	}
+
+	// The agent receives the assignment and starts the container.
+	obs := store.Observation{
+		WorkloadID: st.Replicas[0].WorkloadID, State: store.WorkloadRunning, Message: "running",
+		ContainerID: "c1", AckedGeneration: 1, ObservedAt: e.clock,
+	}
+	if err := e.st.RecordObservations(context.Background(), "n1", []store.Observation{obs}); err != nil {
+		t.Fatal(err)
+	}
+	st = e.get("web").Status
+	first, second := st.Replicas[0], st.Replicas[1]
+	if st.RunningReplicas != 1 || !first.Acknowledged || first.ContainerID != "c1" || first.Message != "running" || first.Phase != store.WorkloadRunning ||
+		second.Acknowledged || second.Phase != store.WorkloadScheduled || second.ContainerID != "" {
+		t.Fatalf("status after one agent report = %+v", st)
+	}
+}
+
 func testServiceStatusExplainsWhyNot(t *testing.T, e *serviceEnv) {
 	e.addNode("n1", 1000, 4<<30)
 	e.create(webService(3, 600))

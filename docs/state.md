@@ -23,7 +23,8 @@ A `store.Workload` carries both, in separate places: its own fields are intent, 
 - Placement counts the capacity (and fixed host ports) of workloads that are *desired* to run, regardless of what they currently do. A failed container still occupies its slot until someone asks for it to be stopped.
 - A scheduling decision is a workload: the scheduler writes intent (which node), never an observation. Why a replica has *no* node yet is the scheduler's own output (`unschedulable_replicas`), kept apart from both.
 - An observation names the node that reported it (`node_id`). If a workload is later moved, a stale observation is recognizable by that.
-- An agent is only told about workloads whose desired state is `running`.
+- An agent is told about every workload placed on it, each with its desired state: `running` is an instruction to create and start the container, `stopped` one to stop and remove it. A workload leaves the list only when the manager deletes it, after the node reported that the container is gone ([reconciliation.md](reconciliation.md)).
+- Every change of a workload's desired state increases its `generation`, and the agent's observation carries the highest generation it has received (`acknowledged_generation`), so an instruction that was received can be told from one still on its way.
 
 ## Schema
 
@@ -38,6 +39,7 @@ Migrations are embedded in the binary (`internal/store/migrations/NNN_descriptio
 | 006 | `events` |
 | 007 | `leases` |
 | 008 | `ports` (jsonb) on `workloads`, so the scheduler can keep two workloads from claiming one host port on a node; `unschedulable_replicas` |
+| 009 | `generation` and `runtime` (jsonb: command, environment, restart policy) on `workloads`; `acknowledged_generation` on `workload_observations` |
 
 Tables and the indexes that serve the queries:
 
@@ -45,7 +47,7 @@ Tables and the indexes that serve the queries:
 - `enrollments (node_id)`: permission to join; `revoked_at` set on revocation.
 - `services (id)`: `name` (unique among live services through a partial index, so a deleted service's name can be reused), `replicas` (desired count), `current_revision`, `version` (optimistic lock), `deleted_at`.
 - `service_revisions (service_id, revision)`: immutable `spec` (jsonb: image, command, env, CPU, memory, node selector), its `spec_hash`, message, author. `services.current_revision` must exist (deferred foreign key, so a service and its first revision are inserted in one transaction).
-- `workloads (id)`: placement and intent. `name` is unique; `(service_id, service_revision, replica_index)` is unique and is the index behind "replicas of a service"; `node_id` has an index for "workloads of a node". A workload either belongs to no service or has all three service columns set (check constraint, foreign key to the revision).
+- `workloads (id)`: placement and intent. `name` is unique; `(service_id, service_revision, replica_index)` is unique and is the index behind "replicas of a service"; `node_id` has an index for "workloads of a node". A workload either belongs to no service or has all three service columns set (check constraint, foreign key to the revision). `generation` counts changes of `desired_state`; `runtime` holds how to start the container, copied from the service revision when the workload is placed. A workload is one container's lifetime: it runs, is stopped, and is deleted once its node confirmed the container is gone; deleting it frees the replica slot for a new workload with a new ID.
 - `workload_observations (workload_id)`: one row per workload at most, deleted with it. Index on `node_id`.
 - `unschedulable_replicas (service_id, revision, replica_index)`: why the scheduler has not placed a replica of a service revision: `code`, `message`, `nodes` (jsonb: one reason per node) and `since` (when this explanation first applied). A row exists only while the replica waits; the scheduler replaces the whole set on every pass and leaves unchanged rows alone. Foreign key to `service_revisions`.
 - `events (id)`: append-only audit trail; indexes on `(resource_type, resource_id, id DESC)` and `at`.
@@ -71,7 +73,7 @@ Because all managers must understand the schema they share, upgrade managers bef
 | --- | --- |
 | `NodeRepository` | nodes (observed) |
 | `EnrollmentRepository` | enrollments (desired) |
-| `WorkloadRepository` | workload placements (desired) and `RecordObservations` (observed) |
+| `WorkloadRepository` | workload placements (desired), `DeleteWorkload` (only for workloads meant to be stopped) and `RecordObservations` (observed) |
 | `ServiceRepository` | services, replica counts, deployment revisions (desired) |
 | `SchedulingRepository` | the scheduler's explanations for replicas without a node |
 | `EventRepository` | audit events |
@@ -91,7 +93,7 @@ The in-memory store gives the same guarantees (a transaction works on a copy and
 
 A service holds the desired replica count and a pointer to its current revision. Revisions are immutable snapshots of the spec; numbers start at 1 and only grow. `DeployService` with a spec identical to the current revision's is a no-op (`ErrUnchanged`). A rollback is a new revision carrying an old spec, so the history stays linear and every revision is a faithful record of what was once desired. Replica workloads record which revision they belong to, which is what a future reconciler needs to roll out a change one replica at a time. Deleting a service marks it deleted and sets the desired replicas to zero; revisions, workloads and events are kept.
 
-Nothing yet removes, replaces or restarts the workloads of a service (no reconciler). The scheduler ([scheduler.md](scheduler.md)) only assigns replicas that have no workload yet, one workload per slot: the unique `(service_id, service_revision, replica_index)` makes a second assignment impossible, even from two managers. Services are managed through the REST API described in [api.md](api.md), which stores a spec with image, command, environment, CPU and memory limits, ports, a health check, a restart policy and a node selector. Those newer spec fields are omitted from the stored JSON when empty, so revisions stored before they existed keep their encoding and hash. `ListDefinitions` reads each service with its current revision in one query.
+The scheduler ([scheduler.md](scheduler.md)) assigns replicas that have no workload yet, one workload per slot: the unique `(service_id, service_revision, replica_index)` makes a second assignment impossible, even from two managers. The reconciler ([reconciliation.md](reconciliation.md)) retires the workloads that should go (scaled down, deleted service, older revision once its successor runs) and deletes them when their nodes confirm. Services are managed through the REST API described in [api.md](api.md), which stores a spec with image, command, environment, CPU and memory limits, ports, a health check, a restart policy and a node selector. Those newer spec fields are omitted from the stored JSON when empty, so revisions stored before they existed keep their encoding and hash. `ListDefinitions` reads each service with its current revision in one query.
 
 ## Several managers on one database
 
@@ -109,12 +111,13 @@ What is *not* done yet: no leader election is running (the lease primitive exist
 
 ## Administrative events
 
-`events` is an append-only audit trail written in the same transaction as the change it describes. Each event has the time, the manager instance, an actor (`admin` for the shared admin token, `node:<id>` for agents), an action, a resource and free-form details. Recorded today: `enrollment.created`, `enrollment.revoked`, `workload.created`, `node.registered`, `node.deregistered`, `node.session_ended`, and, by the scheduler (actor `scheduler`), `replica.scheduled` (resource: the workload) and `replica.unschedulable` (resource: the service; only when the explanation is new or changed). Requests that fail or change nothing record nothing. `GET /v1/events` lists them newest first (`resource_type`, `resource_id`, `before` for paging, `limit`). Service changes add `service.created`, `service.deployed`, `service.scaled` and `service.deleted`.
+`events` is an append-only audit trail written in the same transaction as the change it describes. Each event has the time, the manager instance, an actor (`admin` for the shared admin token, `node:<id>` for agents), an action, a resource and free-form details. Recorded today: `enrollment.created`, `enrollment.revoked`, `workload.created`, `node.registered`, `node.deregistered`, `node.session_ended`; by the scheduler (actor `scheduler`), `replica.scheduled` (resource: the workload) and `replica.unschedulable` (resource: the service; only when the explanation is new or changed), and by the reconciler (actor `reconciler`), `replica.stopped` and `replica.removed` (resource: the workload; the details give the reason). Requests that fail or change nothing record nothing. `GET /v1/events` lists them newest first (`resource_type`, `resource_id`, `before` for paging, `limit`). Service changes add `service.created`, `service.deployed`, `service.scaled` and `service.deleted`.
 
 ## Tests
 
 - `internal/store`: `runStoreConformance` runs against `Memory` (always) and `Postgres` (tag `integration`): nodes, enrollments, workloads, observations, services, revisions, replicas, deletion, events, leases, workload ports, unschedulable records, transactions and rollbacks (including panics). Plus migration-file checks that need no database.
 - `internal/placement`: the scheduling-pass suite runs against `Memory` (always) and `Postgres` (tag `integration`); on PostgreSQL also two managers scheduling at once and a restart.
+- `internal/reconcile`: the reconciliation suite (the whole control loop with simulated agents) runs against `Memory` and `Postgres`; on PostgreSQL also two managers running it at once.
 - Postgres-only (`postgres_integration_test.go`): migration idempotency, checksums, out-of-order and ahead-of-binary refusals; **upgrading** a database created by the previous schema without losing data; **restart** (close the store, open a new one on the same database, everything is still there); two managers on one database (simultaneous migration, one service per name, one winner for optimistic updates, consecutive revisions under concurrent deploys, the placement lock preventing overfilling a node, one lease holder; the same for scheduling passes in `internal/placement`); schema constraints; index use.
 
 Run the database tests against the Compose database:

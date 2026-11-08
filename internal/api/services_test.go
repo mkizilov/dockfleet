@@ -144,6 +144,7 @@ var serviceTests = []serviceTest{
 	{"request limits and secrets", testServiceRequestLimits},
 	{"defining a service schedules nothing", testServiceDoesNotSchedule},
 	{"status shows the scheduler's assignments", testServiceStatusShowsAssignments},
+	{"status shows acknowledgments and running replicas", testServiceStatusShowsAcknowledgments},
 	{"status explains an unschedulable replica", testServiceStatusExplainsWhyNot},
 	{"status names the reason for every node", testServiceStatusNamesEveryReason},
 	{"status across revisions, scaling and deletion", testServiceStatusAcrossRevisionsScalingAndDeletion},

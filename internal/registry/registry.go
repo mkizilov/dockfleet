@@ -51,6 +51,16 @@ type StatusReport struct {
 	WorkloadID string
 	State      string
 	Message    string
+
+	// ContainerID is empty when the node has no container for the workload.
+	ContainerID  string
+	ExitCode     *int
+	OOMKilled    bool
+	RestartCount int
+
+	// AckedGeneration is the highest generation of the workload's assignment
+	// the agent has received.
+	AckedGeneration int64
 }
 
 type Registry struct {
@@ -86,19 +96,6 @@ func (r *Registry) event(at time.Time, nodeID, action string, details map[string
 		At: at, InstanceID: r.instanceID, Actor: "node:" + nodeID, Action: action,
 		ResourceType: "node", ResourceID: nodeID, Details: details,
 	}
-}
-
-// assigned keeps the workloads the node should be running: desired state is
-// running. A workload meant to be stopped is, as far as the protocol goes, no
-// longer assigned.
-func assigned(workloads []store.Workload) []store.Workload {
-	out := make([]store.Workload, 0, len(workloads))
-	for _, w := range workloads {
-		if w.DesiredState != store.DesiredStopped {
-			out = append(out, w)
-		}
-	}
-	return out
 }
 
 // checkEnrolled returns ErrNotEnrolled unless an active enrollment exists.
@@ -155,14 +152,18 @@ func (r *Registry) Register(ctx context.Context, n store.Node) (Session, []store
 	if replaced {
 		r.logger.InfoContext(ctx, "node session superseded", "node_id", n.ID, "old_session", prev.ID, "new_session", s.ID)
 	}
-	return s, assigned(workloads), nil
+	return s, workloads, nil
 }
 
 // Heartbeat refreshes the node's liveness, stores status reports as
-// observations and returns the workloads assigned to the node. Reports for
-// workloads that are not placed on the node are ignored, and so are reports
-// that repeat the stored observation. Observed state is the only thing a
-// heartbeat writes about workloads: it never touches desired state.
+// observations and returns the workloads assigned to the node: every workload
+// placed on it, each with the desired state its container must be brought to
+// (running ones created and started, stopped ones stopped and removed). A
+// workload only leaves the list when the manager deletes it, after the node
+// confirmed the container is gone. Reports for workloads that are not placed
+// on the node are ignored, and so are reports that repeat the stored
+// observation. Observed state is the only thing a heartbeat writes about
+// workloads: it never touches desired state.
 func (r *Registry) Heartbeat(ctx context.Context, nodeID, sessionID string, reports []StatusReport) ([]store.Workload, error) {
 	if err := r.check(nodeID, sessionID); err != nil {
 		return nil, err
@@ -199,7 +200,17 @@ func (r *Registry) Heartbeat(ctx context.Context, nodeID, sessionID string, repo
 			r.logger.DebugContext(ctx, "ignoring status for a workload not placed on the node", "node_id", nodeID, "workload_id", rep.WorkloadID)
 			continue
 		}
-		obs := store.Observation{WorkloadID: w.ID, NodeID: nodeID, State: rep.State, Message: rep.Message, ObservedAt: now}
+		// An agent cannot have seen a generation that does not exist yet, and
+		// an acknowledgment never goes back.
+		acked := min(max(rep.AckedGeneration, 0), w.Generation)
+		if w.Observed != nil {
+			acked = max(acked, w.Observed.AckedGeneration)
+		}
+		obs := store.Observation{
+			WorkloadID: w.ID, NodeID: nodeID, State: rep.State, Message: rep.Message,
+			ContainerID: rep.ContainerID, ExitCode: rep.ExitCode, OOMKilled: rep.OOMKilled, RestartCount: rep.RestartCount,
+			AckedGeneration: acked, ObservedAt: now,
+		}
 		if w.Observed != nil && obs.SameReport(*w.Observed) {
 			continue
 		}
@@ -209,7 +220,7 @@ func (r *Registry) Heartbeat(ctx context.Context, nodeID, sessionID string, repo
 	if err := r.store.RecordObservations(ctx, nodeID, changed); err != nil {
 		return nil, fmt.Errorf("record workload observations: %w", err)
 	}
-	return assigned(workloads), nil
+	return workloads, nil
 }
 
 // Deregister ends the session and marks the node unavailable immediately.

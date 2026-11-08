@@ -18,13 +18,18 @@ import (
 )
 
 const (
-	maxMessageBytes    = 1 << 20
+	maxMessageBytes = 1 << 20
+
+	// maxAssignmentBytes is what an agent accepts in one response: the
+	// assignments of a node, environments included.
+	maxAssignmentBytes = 32 << 20
 	maxLabels          = 32
 	maxLabelLength     = 128
 	maxNameLength      = 255
 	maxStatuses        = 1000
 	maxStatusMessage   = 512
 	maxWorkloadIDBytes = 64
+	maxContainerID     = 128
 	defaultHandlerWait = 10 * time.Second
 )
 
@@ -35,6 +40,12 @@ var phaseStates = map[dockfleetv1.WorkloadPhase]string{
 	dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_SUCCEEDED: store.WorkloadSucceeded,
 	dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_FAILED:    store.WorkloadFailed,
 	dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_STOPPED:   store.WorkloadStopped,
+}
+
+// desiredStates maps a workload's stored desired state to the instruction sent to its agent.
+var desiredStates = map[string]dockfleetv1.WorkloadDesiredState{
+	store.DesiredRunning: dockfleetv1.WorkloadDesiredState_WORKLOAD_DESIRED_STATE_RUNNING,
+	store.DesiredStopped: dockfleetv1.WorkloadDesiredState_WORKLOAD_DESIRED_STATE_STOPPED,
 }
 
 // Registry is the manager-side node registry the service delegates to;
@@ -240,8 +251,21 @@ func (s *NodeServer) Heartbeat(ctx context.Context, req *dockfleetv1.HeartbeatRe
 			return nil, s.invalid("workload status has an unspecified or unknown phase")
 		case len(st.GetMessage()) > maxStatusMessage:
 			return nil, s.invalid("workload status message is too long")
+		case len(st.GetContainerId()) > maxContainerID:
+			return nil, s.invalid("container_id must be at most 128 characters")
+		case st.GetAcknowledgedGeneration() < 0 || st.GetRestartCount() < 0:
+			return nil, s.invalid("acknowledged_generation and restart_count must not be negative")
 		}
-		reports = append(reports, registry.StatusReport{WorkloadID: st.GetWorkloadId(), State: state, Message: st.GetMessage()})
+		report := registry.StatusReport{
+			WorkloadID: st.GetWorkloadId(), State: state, Message: st.GetMessage(),
+			ContainerID: st.GetContainerId(), OOMKilled: st.GetOomKilled(), RestartCount: int(st.GetRestartCount()),
+			AckedGeneration: st.GetAcknowledgedGeneration(),
+		}
+		if st.ExitCode != nil {
+			exit := int(*st.ExitCode)
+			report.ExitCode = &exit
+		}
+		reports = append(reports, report)
 	}
 	workloads, err := s.registry.Heartbeat(ctx, req.GetNodeId(), req.GetSessionId(), reports)
 	if err != nil {
@@ -263,13 +287,26 @@ func (s *NodeServer) DeregisterNode(ctx context.Context, req *dockfleetv1.Deregi
 func toAssignments(workloads []store.Workload) []*dockfleetv1.WorkloadAssignment {
 	out := make([]*dockfleetv1.WorkloadAssignment, 0, len(workloads))
 	for _, w := range workloads {
-		out = append(out, &dockfleetv1.WorkloadAssignment{
-			WorkloadId:  w.ID,
-			Name:        w.Name,
-			Image:       w.Image,
-			CpuMillis:   w.CPUMillis,
-			MemoryBytes: w.MemoryBytes,
-		})
+		a := &dockfleetv1.WorkloadAssignment{
+			WorkloadId:   w.ID,
+			Name:         w.Name,
+			Image:        w.Image,
+			CpuMillis:    w.CPUMillis,
+			MemoryBytes:  w.MemoryBytes,
+			Generation:   w.Generation,
+			DesiredState: desiredStates[w.DesiredState],
+			Command:      w.Command,
+			Env:          w.Env,
+		}
+		for _, p := range w.Ports {
+			a.Ports = append(a.Ports, &dockfleetv1.PortMapping{
+				ContainerPort: uint32(p.ContainerPort), HostPort: uint32(p.HostPort), Protocol: p.Protocol,
+			})
+		}
+		if w.RestartPolicy != nil {
+			a.RestartPolicy = &dockfleetv1.RestartPolicy{Condition: w.RestartPolicy.Condition, MaxRetries: uint32(w.RestartPolicy.MaxRetries)}
+		}
+		out = append(out, a)
 	}
 	return out
 }

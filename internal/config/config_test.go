@@ -236,6 +236,25 @@ func TestLoadManagerSchedulerSettings(t *testing.T) {
 	}
 }
 
+func TestLoadManagerReconcileInterval(t *testing.T) {
+	c, err := LoadManager(getenv(managerEnv()))
+	if err != nil || c.ReconcileInterval != 5*time.Second {
+		t.Fatalf("default: %s, %v", c.ReconcileInterval, err)
+	}
+	vars := managerEnv()
+	vars["DOCKFLEET_RECONCILE_INTERVAL"] = "750ms"
+	if c, err = LoadManager(getenv(vars)); err != nil || c.ReconcileInterval != 750*time.Millisecond {
+		t.Fatalf("explicit: %s, %v", c.ReconcileInterval, err)
+	}
+	for _, bad := range []string{"0s", "-1s", "soon"} {
+		vars := managerEnv()
+		vars["DOCKFLEET_RECONCILE_INTERVAL"] = bad
+		if _, err := LoadManager(getenv(vars)); err == nil || !strings.Contains(err.Error(), "DOCKFLEET_RECONCILE_INTERVAL") {
+			t.Errorf("%q: error = %v, want one naming the setting", bad, err)
+		}
+	}
+}
+
 func TestLoadManagerInstanceID(t *testing.T) {
 	first, err := LoadManager(getenv(managerEnv()))
 	if err != nil {

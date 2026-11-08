@@ -131,6 +131,63 @@ func TestRegisterHeartbeatDeregister(t *testing.T) {
 	}
 }
 
+// An assignment carries everything the agent needs to act on it, and the
+// agent's acknowledgment, container and exit code come back as the observation.
+func TestAssignmentsCarryTheInstructionAndStatusesCarryTheAcknowledgment(t *testing.T) {
+	env := newEnv(t, nil)
+	c := env.client(t, serverToken, nil)
+	ctx := ctxWithTimeout(t)
+	session, err := c.Register(ctx, testNode())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	web1 := store.Workload{ID: "w1", Name: "web-r1-1-abc123", Image: "nginx:1.27", CPUMillis: 500, MemoryBytes: 128 << 20, NodeID: "node-1", CreatedAt: time.Now()}
+	web1.Command = []string{"nginx", "-g", "daemon off;"}
+	web1.Env = map[string]string{"MODE": "prod"}
+	web1.Ports = []store.ServicePort{{ContainerPort: 80, Protocol: "tcp", HostPort: 18080}, {ContainerPort: 53, Protocol: "udp"}}
+	web1.RestartPolicy = &store.RestartPolicy{Condition: store.RestartOnFailure, MaxRetries: 3}
+	_, err = env.store.CreateWorkload(ctx, web1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = env.store.CreateWorkload(ctx, store.Workload{ID: "w2", Name: "z-old", Image: "nginx:1.26", CPUMillis: 100, MemoryBytes: 1 << 20, NodeID: "node-1", CreatedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.store.SetWorkloadDesiredState(ctx, "w2", store.DesiredStopped, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	exit := int32(137)
+	killed := &dockfleetv1.WorkloadStatus{WorkloadId: "w1", Phase: dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_FAILED, Message: "killed"}
+	killed.AcknowledgedGeneration, killed.ContainerId, killed.ExitCode, killed.OomKilled, killed.RestartCount = 1, "c0ffee", &exit, true, 2
+	assigned, err := c.Heartbeat(ctx, "node-1", session.ID, []*dockfleetv1.WorkloadStatus{killed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(assigned) != 2 {
+		t.Fatalf("assignments = %v", assigned)
+	}
+	web, old := assigned[0], assigned[1]
+	if web.GetWorkloadId() != "w1" || web.GetGeneration() != 1 || web.GetDesiredState() != dockfleetv1.WorkloadDesiredState_WORKLOAD_DESIRED_STATE_RUNNING ||
+		web.GetName() != "web-r1-1-abc123" || len(web.GetCommand()) != 3 || web.GetEnv()["MODE"] != "prod" ||
+		len(web.GetPorts()) != 2 || web.GetPorts()[0].GetContainerPort() != 80 || web.GetPorts()[0].GetHostPort() != 18080 || web.GetPorts()[0].GetProtocol() != "tcp" ||
+		web.GetPorts()[1].GetProtocol() != "udp" ||
+		web.GetRestartPolicy().GetCondition() != "on-failure" || web.GetRestartPolicy().GetMaxRetries() != 3 {
+		t.Fatalf("running assignment = %v", web)
+	}
+	if old.GetWorkloadId() != "w2" || old.GetGeneration() != 2 || old.GetDesiredState() != dockfleetv1.WorkloadDesiredState_WORKLOAD_DESIRED_STATE_STOPPED || old.GetRestartPolicy() != nil {
+		t.Fatalf("stopped assignment = %v; it stays in the set as an instruction to stop", old)
+	}
+
+	w, _ := env.store.GetWorkload(ctx, "w1")
+	o := w.Observed
+	if o == nil || o.State != store.WorkloadFailed || o.AckedGeneration != 1 || o.ContainerID != "c0ffee" || o.ExitCode == nil || *o.ExitCode != 137 || !o.OOMKilled || o.RestartCount != 2 {
+		t.Fatalf("observation = %+v", o)
+	}
+}
+
 func TestSupersededSession(t *testing.T) {
 	env := newEnv(t, nil)
 	first := env.client(t, serverToken, nil)
@@ -211,6 +268,9 @@ func TestHeartbeatValidation(t *testing.T) {
 		"empty id":          {{Phase: pending}},
 		"long id":           {{WorkloadId: strings.Repeat("x", 65), Phase: pending}},
 		"long message":      {{WorkloadId: "w1", Phase: pending, Message: strings.Repeat("m", 513)}},
+		"long container id": {{WorkloadId: "w1", Phase: pending, ContainerId: strings.Repeat("c", 129)}},
+		"negative ack":      {{WorkloadId: "w1", Phase: pending, AcknowledgedGeneration: -1}},
+		"negative restarts": {{WorkloadId: "w1", Phase: pending, RestartCount: -1}},
 		"too many":          tooMany,
 	}
 	for name, statuses := range tests {

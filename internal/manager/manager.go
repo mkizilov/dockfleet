@@ -19,6 +19,7 @@ import (
 	"github.com/dockfleet/dockfleet/internal/pki"
 	"github.com/dockfleet/dockfleet/internal/placement"
 	"github.com/dockfleet/dockfleet/internal/protocol"
+	"github.com/dockfleet/dockfleet/internal/reconcile"
 	"github.com/dockfleet/dockfleet/internal/registry"
 	"github.com/dockfleet/dockfleet/internal/scheduler"
 	"github.com/dockfleet/dockfleet/internal/store"
@@ -35,13 +36,14 @@ const (
 
 // Manager is the control plane: the admin HTTP API plus the agent-facing gRPC service.
 type Manager struct {
-	cfg       config.Manager
-	store     store.Store
-	registry  *registry.Registry
-	scheduler *placement.Scheduler
-	logger    *slog.Logger
-	apiTLS    *tls.Config
-	grpcTLS   *tls.Config
+	cfg        config.Manager
+	store      store.Store
+	registry   *registry.Registry
+	scheduler  *placement.Scheduler
+	reconciler *reconcile.Reconciler
+	logger     *slog.Logger
+	apiTLS     *tls.Config
+	grpcTLS    *tls.Config
 }
 
 // overcommit is the configured factors as the scheduler takes them.
@@ -62,6 +64,9 @@ func New(cfg config.Manager, st store.Store, logger *slog.Logger) (*Manager, err
 		scheduler: placement.New(placement.Config{
 			Store: st, Logger: logger, NodeTTL: cfg.NodeTTL, Overcommit: overcommit(cfg),
 			Interval: cfg.SchedulerInterval, InstanceID: cfg.InstanceID,
+		}),
+		reconciler: reconcile.New(reconcile.Config{
+			Store: st, Logger: logger, Interval: cfg.ReconcileInterval, InstanceID: cfg.InstanceID,
 		}),
 	}
 	if cfg.TLSCertFile != "" {
@@ -157,6 +162,13 @@ func (m *Manager) Serve(ctx context.Context, apiLn, grpcLn net.Listener) error {
 		go func() {
 			defer wg.Done()
 			m.scheduler.Run(watchCtx)
+		}()
+	}
+	if m.cfg.ReconcileInterval > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			m.reconciler.Run(watchCtx)
 		}()
 	}
 	if m.cfg.TLSCertFile != "" {

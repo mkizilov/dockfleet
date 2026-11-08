@@ -1,8 +1,8 @@
 # DockFleet
 
-DockFleet is a distributed container orchestration system written in Go. A central **manager** keeps cluster state in PostgreSQL (desired and observed state kept apart) and schedules workloads onto nodes by their free CPU and memory; **agents** on worker nodes register with the manager, heartbeat, receive their assigned workloads and report status.
+DockFleet is a distributed container orchestration system written in Go. A central **manager** keeps cluster state in PostgreSQL (desired and observed state kept apart) and schedules workloads onto nodes by their free CPU and memory; **agents** on worker nodes register with the manager, heartbeat, receive their assigned workloads, run them as Docker containers and report status.
 
-> **Status: early.** The manager-agent gRPC protocol (versioned registration, heartbeats, assignments, status reports) works end to end over mutual TLS with explicit node enrollment, and both processes shut down gracefully. The manager's scheduler assigns service replicas to nodes and records why any cannot be placed, but **no containers are created, started or stopped yet**: agents acknowledge assignments as `pending`. See [Limitations](#limitations).
+> **Status: early.** The manager-agent gRPC protocol (versioned registration, heartbeats, assignments, status reports) works end to end over mutual TLS with explicit node enrollment, and both processes shut down gracefully. A service definition now becomes running containers: the scheduler assigns its replicas to nodes, the reconciler retires the ones that should go (scale down, deletion, rollouts), and agents create, start, stop and remove the containers they are told about, restarting them per policy and reporting back. The whole loop is tested against in-memory Docker engines; the tests against a real Docker daemon exist but need one ([docs/docker.md](docs/docker.md#tests)). See [docs/reconciliation.md](docs/reconciliation.md) and [Limitations](#limitations).
 
 ## Layout
 
@@ -14,7 +14,8 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 | `internal/api`       | Administrative HTTP API (services, nodes, workloads, enrollments, events, health) |
 | `internal/scheduler` | Placement decisions and their explanations (pure functions, no I/O) ([docs/scheduler.md](docs/scheduler.md)) |
 | `internal/placement` | Carries decisions out: reads the cluster, runs the scheduler, saves assignments and explanations |
-| `internal/agent`     | Node logic: register, heartbeat, retry, re-register                     |
+| `internal/reconcile` | Compares services with what agents report; stops replicas that should go, deletes them once their node confirms ([docs/reconciliation.md](docs/reconciliation.md)) |
+| `internal/agent`     | Node logic: register, heartbeat, retry, re-register; the runner that keeps the node's containers in line with its assignments |
 | `internal/store`     | Persistence: repository interfaces, transactions, versioned migrations; PostgreSQL and in-memory implementations ([docs/state.md](docs/state.md)) |
 | `internal/protocol`  | gRPC service, client, versioning, errors, bearer-token auth, TLS helpers |
 | `internal/registry`  | Manager-side node registry: sessions, heartbeats, status reports        |
@@ -22,13 +23,14 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 | `internal/netutil`   | Loopback checks behind the plaintext-only-on-loopback rule              |
 | `internal/integration` | Tests running simulated agents against a manager over gRPC           |
 | `internal/docker`    | Agent-only Docker Engine adapter: managed containers, hardening policy (see [docs/docker.md](docs/docker.md)) |
+| `internal/dockerfake` | In-memory `docker.Runtime` used by tests                               |
 | `internal/manager`   | Wires the API, gRPC server and store; owns graceful shutdown            |
 | `internal/config`    | Environment-based configuration with secure-default validation          |
 | `internal/logging`   | Structured logging (`log/slog`, JSON or text)                           |
 | `proto/`             | Protobuf definitions (`buf` module)                                     |
-| `deploy/`            | Docker Compose file for development dependencies                        |
+| `deploy/`            | Docker Compose files: development PostgreSQL, and a disposable Docker daemon for the Docker tests |
 | `config/dev.env`     | Development-only configuration                                          |
-| `docs/`              | [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), [Mutual TLS and enrollment](docs/mtls.md), [Docker adapter](docs/docker.md), [Control-plane state](docs/state.md), [Services API](docs/api.md), [Scheduler](docs/scheduler.md) |
+| `docs/`              | [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), [Mutual TLS and enrollment](docs/mtls.md), [Docker adapter](docs/docker.md), [Control-plane state](docs/state.md), [Services API](docs/api.md), [Scheduler](docs/scheduler.md), [Reconciliation](docs/reconciliation.md) |
 
 ## Prerequisites
 
@@ -65,8 +67,9 @@ curl -s -X POST -H 'Authorization: Bearer dev-api-token-0123456789' \
   -d '{"name":"web","image":"nginx:1.27","cpu_millis":500,"memory_bytes":134217728}' \
   http://127.0.0.1:21280/v1/workloads
 
-# Describe a service (desired state; nothing is started). Within a few seconds the scheduler
-# assigns its replicas to nodes, and `status` shows where each went or why one could not
+# Describe a service (desired state). Within a few seconds the scheduler assigns its replicas
+# to nodes, the agents start the containers, and `status` shows where each replica is, whether
+# its node acknowledged the instruction, what it reports, or why a replica could not be placed
 curl -s -X POST -H 'Authorization: Bearer dev-api-token-0123456789' \
   -d '{"name":"site","replicas":3,"spec":{"image":"nginx:1.27","cpu_millis":500,"memory_bytes":134217728,"ports":[{"container_port":80}]}}' \
   http://127.0.0.1:21280/v1/services
@@ -142,6 +145,7 @@ All settings are environment variables. The manager and agent refuse to start on
 | `DOCKFLEET_HEARTBEAT_INTERVAL`   | manager | `10s`                        | Sent to agents on registration                             |
 | `DOCKFLEET_NODE_TTL`             | manager | `30s`                        | Node is `not_ready` after this long without a heartbeat; at least 2x the interval |
 | `DOCKFLEET_SCHEDULER_INTERVAL`   | manager | `5s`                         | Time between scheduling passes that assign waiting replicas to nodes |
+| `DOCKFLEET_RECONCILE_INTERVAL`   | manager | `5s`                         | Time between reconciliation passes that stop replicas that should go (scale down, deletion, rollout) and delete them once their node confirms; see [docs/reconciliation.md](docs/reconciliation.md) |
 | `DOCKFLEET_SCHEDULER_CPU_OVERCOMMIT`, `DOCKFLEET_SCHEDULER_MEMORY_OVERCOMMIT` | manager | `1` | How many times a node's CPU or memory may be promised to workloads, from `1` (never more than the node has) to `8`. Raising it is a deliberate choice; see [docs/scheduler.md](docs/scheduler.md) |
 | `DOCKFLEET_REQUEST_TIMEOUT`      | manager | `10s`                        | Deadline for each gRPC call                                |
 | `DOCKFLEET_SHUTDOWN_TIMEOUT`     | manager | `15s`                        | Drain budget before connections are forced closed          |
@@ -163,19 +167,19 @@ All settings are environment variables. The manager and agent refuse to start on
 ```sh
 make test               # unit tests, -race, no external services
 make cover              # per-package coverage
-make test-integration   # PostgreSQL store, API and scheduling tests; needs `make compose-up`
-make test-docker        # Docker Engine tests; needs DOCKFLEET_TEST_DOCKER_HOST
+make test-integration   # PostgreSQL store, API, scheduling and reconciliation tests; needs `make compose-up`
+make test-docker        # Docker Engine tests: the adapter and a service deployment; needs DOCKFLEET_TEST_DOCKER_HOST (`make docker-test-up` starts a disposable daemon on 127.0.0.1:21297)
 ```
 
-Unit tests need no Docker, database or network. `internal/scheduler` has table-driven tests for resource exhaustion, offline nodes, deterministic placement (shuffled inputs give identical decisions), multiple replicas and conflicting constraints, all without a store or a clock; `internal/placement` runs the scheduling passes against the in-memory store (and PostgreSQL under the `integration` tag, including two managers scheduling at once). `internal/integration` runs real agent loops against a real manager over gRPC on an in-memory transport (registration, heartbeats, assignments and status reports, a scheduled replica reaching its agent, manager restart and reconnection, long outages, graceful deregistration, superseded sessions, incompatible protocol versions, bad credentials) and over real TLS handshakes: trusted nodes, untrusted client and server certificates, wrong server names, wrong node identity, expired and not-yet-valid certificates, certificates expiring on an open connection, missing client certificates, unenrolled and revoked nodes, certificate renewal, and the absence of any plaintext fallback. Other network-style tests use `bufconn`, fake HTTP round-trippers, or loopback ports 21290-21295 (`internal/manager`). PostgreSQL tests are behind the `integration` build tag and read `DOCKFLEET_TEST_DATABASE_URL`: they create and drop a throwaway database per test on that server, so no data is shared or touched (migrations, upgrade from the previous schema, restart persistence, two managers on one database, constraints and index use; see [docs/state.md](docs/state.md)).
+Unit tests need no Docker, database or network. `internal/scheduler` has table-driven tests for resource exhaustion, offline nodes, deterministic placement (shuffled inputs give identical decisions), multiple replicas and conflicting constraints, all without a store or a clock; `internal/placement` runs the scheduling passes against the in-memory store (and PostgreSQL under the `integration` tag, including two managers scheduling at once). `internal/reconcile` tests the reconciliation plan as a table and the whole control loop (deploy, repeated passes, scale down and up, rolling update, deletion, handover of fixed host ports) against simulated agents; `internal/agent` tests the runner against an in-memory Docker engine (creation, adoption after a restart, stopping and removal, bystander containers, orphans, image pulls, backoff, restart policies). `internal/integration` runs real agent loops against a real manager over gRPC on an in-memory transport (registration, heartbeats, assignments and status reports, a service deployed end to end with exact counts of created and removed containers, manager restart and reconnection, an agent restarting beside a crashed container, a removal waiting for an absent node, long outages, graceful deregistration, superseded sessions, incompatible protocol versions, bad credentials) and over real TLS handshakes: trusted nodes, untrusted client and server certificates, wrong server names, wrong node identity, expired and not-yet-valid certificates, certificates expiring on an open connection, missing client certificates, unenrolled and revoked nodes, certificate renewal, and the absence of any plaintext fallback. The same deployment flow against a real Docker daemon is behind the `dockerintegration` tag. Other network-style tests use `bufconn`, fake HTTP round-trippers, or loopback ports 21290-21295 (`internal/manager`). PostgreSQL tests are behind the `integration` build tag and read `DOCKFLEET_TEST_DATABASE_URL`: they create and drop a throwaway database per test on that server, so no data is shared or touched (migrations, upgrade from the previous schema, restart persistence, two managers on one database, constraints and index use; see [docs/state.md](docs/state.md)).
 
 Generated protobuf code is not committed, so run `make generate` after a fresh clone and `make proto` after editing `proto/`.
 
 ## Limitations
 
-- The Docker adapter (create, start, stop, remove, inspect, logs, stats) is implemented and tested, but the agent does not use it to run assigned workloads yet, so agents still report them `pending` and nothing reconciles failures. Workload assignments carry no ports, mounts or environment yet.
+- Agents create, start, stop and remove containers, restart them per policy and report back, but they do not run health checks (the field is stored), publish ports only on loopback, and offer no mounts or networks beyond the container policy's defaults. Stopping a workload removes its container and its logs. See [docs/reconciliation.md](docs/reconciliation.md#limitations).
 - Sessions are held in manager memory: an agent talks to one manager at a time and registers again if that manager forgets it. Two agents configured with the same node ID will keep superseding each other.
-- The database is ready for several managers (placement lock, optimistic versions, leases, migration lock), but no leader election runs yet; scheduling passes on several managers queue on the placement lock instead. Service definitions have a REST API ([docs/api.md](docs/api.md)); the scheduler assigns their replicas to nodes ([docs/scheduler.md](docs/scheduler.md)), but nothing removes, moves or restarts workloads: scaling down or deploying a new revision leaves the earlier workloads in place, and a workload on a dead node stays there.
+- The database is ready for several managers (placement lock, optimistic versions, leases, migration lock), but no leader election runs yet; scheduling and reconciliation passes on several managers queue on the placement lock instead. Service definitions have a REST API ([docs/api.md](docs/api.md)); the scheduler assigns their replicas ([docs/scheduler.md](docs/scheduler.md)), the reconciler retires the ones that should go, and a rollout replaces replicas one by one. A workload on a node that never returns stays assigned to it: there is no failover yet.
 - Scheduling reserves each workload's declared CPU and memory limits (it does not measure usage), has no priorities, preemption or affinities, and checks only fixed host-port conflicts.
 - Node capacity is declared by the agent, not measured.
 - Registered nodes are never deleted; dead nodes stay listed as `not_ready`.

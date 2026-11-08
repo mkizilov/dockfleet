@@ -141,9 +141,22 @@ type Workload struct {
 	ReplicaIndex    int    `json:"replica_index,omitempty"`
 	// Ports are the ports the workload publishes. The scheduler keeps two
 	// workloads from claiming the same fixed host port on one node.
-	Ports     []ServicePort `json:"ports,omitempty"`
-	CreatedAt time.Time     `json:"created_at"`
-	UpdatedAt time.Time     `json:"updated_at"`
+	Ports []ServicePort `json:"ports,omitempty"`
+	// Command, Env and RestartPolicy are what the agent starts the container
+	// with. They are copied from the service revision when the workload is
+	// placed, so a workload never changes underneath its container. Env is not
+	// part of the JSON form: values can be secrets, and the service definition
+	// that holds them is where an administrator reads them.
+	Command       []string          `json:"command,omitempty"`
+	Env           map[string]string `json:"-"`
+	RestartPolicy *RestartPolicy    `json:"restart_policy,omitempty"`
+	// Generation starts at 1 and increases every time the desired state
+	// changes. The agent acknowledges the generation it has seen
+	// (Observation.AckedGeneration), which tells an instruction that was
+	// received from one that is still on its way.
+	Generation int64     `json:"generation"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 
 	// Observed is the agent's latest report, or nil until it has made one. It
 	// is read-only here: CreateWorkload ignores it, and only RecordObservations
@@ -167,6 +180,16 @@ func (w Workload) prepareForCreate() (Workload, error) {
 	}
 	w.Observed = nil
 	w.Ports = append([]ServicePort(nil), w.Ports...)
+	w.Command = append([]string(nil), w.Command...)
+	if len(w.Env) == 0 {
+		w.Env = nil
+	} else {
+		w.Env = cloneLabels(w.Env)
+	}
+	w.RestartPolicy = clonePtr(w.RestartPolicy)
+	if w.Generation == 0 {
+		w.Generation = 1
+	}
 	w.CreatedAt = w.CreatedAt.UTC()
 	if w.UpdatedAt.IsZero() {
 		w.UpdatedAt = w.CreatedAt
@@ -179,6 +202,8 @@ func (w Workload) prepareForCreate() (Workload, error) {
 		return w, fmt.Errorf("%w: cpu_millis and memory_bytes must be positive", ErrInvalid)
 	case !ValidDesiredState(w.DesiredState):
 		return w, fmt.Errorf("%w: desired state %q must be running or stopped", ErrInvalid, w.DesiredState)
+	case w.Generation < 1:
+		return w, fmt.Errorf("%w: generation must be at least 1", ErrInvalid)
 	case w.ServiceRevision < 0 || w.ReplicaIndex < 0:
 		return w, fmt.Errorf("%w: service revision and replica index must not be negative", ErrInvalid)
 	case (w.ServiceID == "") != (w.ServiceRevision == 0) || (w.ServiceID == "") != (w.ReplicaIndex == 0):
@@ -201,6 +226,9 @@ type Observation struct {
 	StartedAt    *time.Time `json:"started_at,omitempty"`
 	FinishedAt   *time.Time `json:"finished_at,omitempty"`
 	ObservedAt   time.Time  `json:"observed_at"` // when the manager received the report
+	// AckedGeneration is the highest Workload.Generation the agent says it has
+	// received. It is 0 until the agent has acknowledged anything.
+	AckedGeneration int64 `json:"acknowledged_generation"`
 }
 
 // SameReport reports whether o says the same thing as the stored observation,
@@ -208,7 +236,7 @@ type Observation struct {
 // change nothing.
 func (o Observation) SameReport(p Observation) bool {
 	return o.State == p.State && o.Message == p.Message && o.ContainerID == p.ContainerID &&
-		o.OOMKilled == p.OOMKilled && o.RestartCount == p.RestartCount &&
+		o.OOMKilled == p.OOMKilled && o.RestartCount == p.RestartCount && o.AckedGeneration == p.AckedGeneration &&
 		equalPtr(o.ExitCode, p.ExitCode) && equalTimePtr(o.StartedAt, p.StartedAt) && equalTimePtr(o.FinishedAt, p.FinishedAt)
 }
 
@@ -477,9 +505,15 @@ type WorkloadRepository interface {
 	// ListWorkloadsForService returns a service's replicas ordered by
 	// revision and replica index.
 	ListWorkloadsForService(ctx context.Context, serviceID string) ([]Workload, error)
-	// SetWorkloadDesiredState changes the desired state. It never touches the
-	// observation. Setting the current value changes nothing (ErrUnchanged).
+	// SetWorkloadDesiredState changes the desired state and increases the
+	// workload's generation. It never touches the observation. Setting the
+	// current value changes nothing (ErrUnchanged, same generation).
 	SetWorkloadDesiredState(ctx context.Context, id, desired string, at time.Time) (Workload, error)
+	// DeleteWorkload removes a workload, and its observation, once it is meant
+	// to be stopped. It returns ErrNotFound for an unknown workload and
+	// ErrInvalid for one that is still meant to run: a running workload is
+	// first stopped, so its node can stop the container before the record goes.
+	DeleteWorkload(ctx context.Context, id string) error
 	// RecordObservations stores agent reports, all or none. Reports for
 	// workloads that do not exist or are placed on another node are ignored,
 	// and so is a report older than the stored one (a late arrival). An

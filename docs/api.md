@@ -2,7 +2,7 @@
 
 The manager's HTTP API (`internal/api`) is how administrators describe what should run. This document covers **service definitions**. Nodes, workloads, enrollments and events are listed in the [README](../README.md#administrative-api).
 
-A service definition is **desired state**: it says what an administrator wants, and it is stored (PostgreSQL, or memory for development) as such. Defining, changing or deleting a service through this API does **not** place, schedule, start or stop anything: the handlers only record intent (and read the scheduler's results back, see [Scheduling status](#scheduling-status)). The scheduler ([scheduler.md](scheduler.md)) runs separately in the manager, assigns waiting replicas to nodes and records why any has no node. Nothing turns assignments into containers yet. See [state.md](state.md).
+A service definition is **desired state**: it says what an administrator wants, and it is stored (PostgreSQL, or memory for development) as such. Defining, changing or deleting a service through this API does **not** place, schedule, start or stop anything itself: the handlers only record intent (and read the results back, see [Scheduling status](#scheduling-status)). Separate loops in the manager act on it: the scheduler ([scheduler.md](scheduler.md)) assigns waiting replicas to nodes and records why any has no node, and the reconciler ([reconciliation.md](reconciliation.md)) stops the replicas that should go; the agents create, start, stop and remove the containers. So a service shows `status` of an empty set for up to `DOCKFLEET_SCHEDULER_INTERVAL` after it is created, and its replicas run a few seconds later. See [state.md](state.md).
 
 ## Access
 
@@ -133,11 +133,13 @@ Every service view (`GET /v1/services`, `GET /v1/services/{name}` and the respon
   "desired_replicas": 3,
   "scheduled_replicas": 2,
   "unschedulable_replicas": 1,
+  "running_replicas": 1,
   "replicas": [
     {"revision": 2, "index": 1, "workload_id": "9c1e...", "workload_name": "web-r2-1-3f9a2c",
-     "node_id": "worker-1", "desired_state": "running", "phase": "scheduled"},
+     "node_id": "worker-1", "desired_state": "running", "generation": 1, "acknowledged": false, "phase": "scheduled"},
     {"revision": 2, "index": 2, "workload_id": "b07d...", "workload_name": "web-r2-2-81c0de",
-     "node_id": "worker-2", "desired_state": "running", "phase": "running"}
+     "node_id": "worker-2", "desired_state": "running", "generation": 1, "acknowledged": true, "phase": "running",
+     "message": "running", "container_id": "4be1..."}
   ],
   "unschedulable": [
     {"service_id": "5f0c...", "revision": 2, "replica_index": 3,
@@ -153,7 +155,8 @@ Every service view (`GET /v1/services`, `GET /v1/services/{name}` and the respon
 ```
 
 - `scheduled_replicas` counts the wanted replicas of the current revision (index up to `replicas`) that have a workload meant to run; `unschedulable_replicas` those that have none because no node qualifies.
-- `replicas` lists the service's workloads, by revision and index, including those of older revisions: they still hold their node's resources until something removes them. `phase` is what the node's agent last reported, or `scheduled` before it has reported anything. The decision (`node_id`, `desired_state`) and the observation (`phase`) are separate facts.
+- `running_replicas` counts the wanted replicas of the current revision whose agent reports the container running.
+- `replicas` lists the service's workloads, by revision and index, including those of older revisions: they stay until the reconciler has replaced them (a replica of an older revision is stopped once the same replica of the current one runs) and their node has confirmed that the container is gone. `phase` is what the node's agent last reported, or `scheduled` before it has reported anything; `message` and `container_id` are the agent's words and the container it reported. The decision (`node_id`, `desired_state`, `generation`) and the observation (`phase`, `acknowledged`) are separate facts: `generation` counts the instructions given for the workload, and `acknowledged` says its node has received the latest. See [reconciliation.md](reconciliation.md).
 - `unschedulable` explains each waiting replica: a `code` (`no_nodes`, `no_available_nodes`, `selector_unsatisfied`, `host_port_conflict`, `insufficient_resources`, `exceeds_capacity`), a `message`, one reason per node, and `since`, when this explanation first applied (it does not move while nothing changes). The codes are described in [scheduler.md](scheduler.md#why-a-replica-cannot-be-placed). Scheduling runs every `DOCKFLEET_SCHEDULER_INTERVAL`, so a new or changed service shows an empty status for up to that long.
 
 The assignments themselves are ordinary workloads: `GET /v1/workloads` lists them with `node_id`, `desired_state`, `service_id`, `service_revision`, `replica_index` and `ports`, and each carries the agent's `observed` report beside the decision. The scheduler's audit events, with the actor `scheduler`, are in `GET /v1/events`: `replica.scheduled` (resource: the workload; details: service, revision, replica, node) and `replica.unschedulable` (resource: the service), the latter only when an explanation is new or changed.
@@ -171,7 +174,7 @@ Each successful change is recorded in `GET /v1/events` in the same transaction a
 
 ## Not yet
 
-No pagination of the service list, no partial (`PATCH`) updates, no secret values, no image allow-list, no per-user authentication (one shared admin token), and nothing that removes or moves replicas once placed (scaling down or deploying a new revision leaves the earlier workloads in place; see [scheduler.md](scheduler.md#placement-passes)).
+No pagination of the service list, no partial (`PATCH`) updates, no secret values, no image allow-list, no per-user authentication (one shared admin token), and no failover: a replica on a node that never returns stays assigned to it (see [reconciliation.md](reconciliation.md#limitations)).
 
 ## Tests
 

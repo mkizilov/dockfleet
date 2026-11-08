@@ -93,6 +93,8 @@ func Dial(cfg ClientConfig) (*Client, error) {
 		)
 	}
 	opts = append(opts,
+		// A node's assignments carry environments, so they can be larger than gRPC's 4 MiB default.
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxAssignmentBytes)),
 		grpc.WithConnectParams(grpc.ConnectParams{
 			Backoff:           backoff.Config{BaseDelay: 500 * time.Millisecond, Multiplier: 1.6, Jitter: 0.2, MaxDelay: 10 * time.Second},
 			MinConnectTimeout: 5 * time.Second,

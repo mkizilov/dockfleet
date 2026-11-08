@@ -15,24 +15,25 @@ import (
 // ---- workloads (desired) joined with observations (observed) ----
 
 const workloadSelect = `SELECT w.id, w.name, w.image, w.cpu_millis, w.memory_bytes, w.node_id, w.desired_state,
-	w.service_id, w.service_revision, w.replica_index, w.ports, w.created_at, w.updated_at,
+	w.service_id, w.service_revision, w.replica_index, w.ports, w.runtime, w.generation, w.created_at, w.updated_at,
 	o.workload_id, o.node_id, o.state, o.message, o.container_id, o.exit_code, o.oom_killed, o.restart_count,
-	o.started_at, o.finished_at, o.observed_at
+	o.started_at, o.finished_at, o.observed_at, o.acknowledged_generation
 	FROM workloads w LEFT JOIN workload_observations o ON o.workload_id = w.id`
 
 func scanWorkload(row pgx.Row) (Workload, error) {
 	var w Workload
-	var ports []byte
+	var ports, runtime []byte
 	var (
 		serviceID, obsWorkload, obsNode, obsState, obsMessage, obsContainer *string
 		revision, replica, obsExit, obsRestarts                             *int
 		obsOOM                                                              *bool
 		obsStarted, obsFinished, obsAt                                      *time.Time
+		obsAcked                                                            *int64
 	)
 	err := row.Scan(&w.ID, &w.Name, &w.Image, &w.CPUMillis, &w.MemoryBytes, &w.NodeID, &w.DesiredState,
-		&serviceID, &revision, &replica, &ports, &w.CreatedAt, &w.UpdatedAt,
+		&serviceID, &revision, &replica, &ports, &runtime, &w.Generation, &w.CreatedAt, &w.UpdatedAt,
 		&obsWorkload, &obsNode, &obsState, &obsMessage, &obsContainer, &obsExit, &obsOOM, &obsRestarts,
-		&obsStarted, &obsFinished, &obsAt)
+		&obsStarted, &obsFinished, &obsAt, &obsAcked)
 	if err != nil {
 		return Workload{}, mapError(err)
 	}
@@ -45,6 +46,11 @@ func scanWorkload(row pgx.Row) (Workload, error) {
 	if len(w.Ports) == 0 {
 		w.Ports = nil
 	}
+	var rt workloadRuntime
+	if err := json.Unmarshal(runtime, &rt); err != nil {
+		return Workload{}, fmt.Errorf("decode runtime settings of workload %s: %w", w.ID, err)
+	}
+	w.Command, w.Env, w.RestartPolicy = rt.Command, rt.Env, rt.RestartPolicy
 	w.CreatedAt, w.UpdatedAt = w.CreatedAt.UTC(), w.UpdatedAt.UTC()
 	if obsWorkload != nil {
 		w.Observed = &Observation{
@@ -59,9 +65,19 @@ func scanWorkload(row pgx.Row) (Workload, error) {
 			StartedAt:    utcPtr(obsStarted),
 			FinishedAt:   utcPtr(obsFinished),
 			ObservedAt:   obsAt.UTC(),
+
+			AckedGeneration: *obsAcked,
 		}
 	}
 	return w, nil
+}
+
+// workloadRuntime is how a workload's container is started: the part of the
+// service revision a workload copies, kept in one jsonb column.
+type workloadRuntime struct {
+	Command       []string          `json:"command,omitempty"`
+	Env           map[string]string `json:"env,omitempty"`
+	RestartPolicy *RestartPolicy    `json:"restart_policy,omitempty"`
 }
 
 func (q *queries) queryWorkloads(ctx context.Context, suffix string, args ...any) ([]Workload, error) {
@@ -94,12 +110,16 @@ func (q *queries) CreateWorkload(ctx context.Context, w Workload) (Workload, err
 	if err != nil {
 		return Workload{}, err
 	}
+	runtimeJSON, err := marshalJSON(workloadRuntime{Command: w.Command, Env: w.Env, RestartPolicy: w.RestartPolicy})
+	if err != nil {
+		return Workload{}, err
+	}
 	_, err = q.db.Exec(ctx,
 		`INSERT INTO workloads (id, name, image, cpu_millis, memory_bytes, node_id, desired_state,
-		                        service_id, service_revision, replica_index, ports, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+		                        service_id, service_revision, replica_index, ports, runtime, generation, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
 		w.ID, w.Name, w.Image, w.CPUMillis, w.MemoryBytes, w.NodeID, w.DesiredState,
-		nilIfZero(w.ServiceID), nilIfZero(w.ServiceRevision), nilIfZero(w.ReplicaIndex), portsJSON, w.CreatedAt, w.UpdatedAt)
+		nilIfZero(w.ServiceID), nilIfZero(w.ServiceRevision), nilIfZero(w.ReplicaIndex), portsJSON, runtimeJSON, w.Generation, w.CreatedAt, w.UpdatedAt)
 	if err != nil {
 		return Workload{}, mapError(err)
 	}
@@ -126,7 +146,7 @@ func (q *queries) SetWorkloadDesiredState(ctx context.Context, id, desired strin
 	if !ValidDesiredState(desired) {
 		return Workload{}, fmt.Errorf("%w: desired state %q must be running or stopped", ErrInvalid, desired)
 	}
-	tag, err := q.db.Exec(ctx, `UPDATE workloads SET desired_state = $2, updated_at = $3 WHERE id = $1 AND desired_state <> $2`, id, desired, at.UTC())
+	tag, err := q.db.Exec(ctx, `UPDATE workloads SET desired_state = $2, generation = generation + 1, updated_at = $3 WHERE id = $1 AND desired_state <> $2`, id, desired, at.UTC())
 	if err != nil {
 		return Workload{}, mapError(err)
 	}
@@ -138,6 +158,21 @@ func (q *queries) SetWorkloadDesiredState(ctx context.Context, id, desired strin
 		return w, ErrUnchanged
 	}
 	return w, nil
+}
+
+func (q *queries) DeleteWorkload(ctx context.Context, id string) error {
+	tag, err := q.db.Exec(ctx, `DELETE FROM workloads WHERE id = $1 AND desired_state = $2`, id, DesiredStopped)
+	if err != nil {
+		return mapError(err)
+	}
+	if tag.RowsAffected() > 0 {
+		return nil
+	}
+	// Nothing was deleted: either there is no such workload or it is still meant to run.
+	if _, err := q.GetWorkload(ctx, id); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: workload %s is still meant to run; stop it first", ErrInvalid, id)
 }
 
 func (q *queries) RecordObservations(ctx context.Context, nodeID string, obs []Observation) error {
@@ -159,9 +194,9 @@ func (q *queries) RecordObservations(ctx context.Context, nodeID string, obs []O
 			_, err := q.db.Exec(ctx,
 				`INSERT INTO workload_observations
 				     (workload_id, node_id, state, message, container_id, exit_code, oom_killed, restart_count,
-				      started_at, finished_at, observed_at)
+				      started_at, finished_at, observed_at, acknowledged_generation)
 				 SELECT w.id, w.node_id, $3::text, $4::text, $5::text, $6::integer, $7::boolean, $8::integer,
-				        $9::timestamptz, $10::timestamptz, $11::timestamptz
+				        $9::timestamptz, $10::timestamptz, $11::timestamptz, $12::bigint
 				 FROM workloads w
 				 WHERE w.id = $1 AND w.node_id = $2
 				 ON CONFLICT (workload_id) DO UPDATE SET
@@ -174,10 +209,11 @@ func (q *queries) RecordObservations(ctx context.Context, nodeID string, obs []O
 				     restart_count = EXCLUDED.restart_count,
 				     started_at = EXCLUDED.started_at,
 				     finished_at = EXCLUDED.finished_at,
-				     observed_at = EXCLUDED.observed_at
+				     observed_at = EXCLUDED.observed_at,
+				     acknowledged_generation = EXCLUDED.acknowledged_generation
 				 WHERE workload_observations.observed_at <= EXCLUDED.observed_at`,
 				o.WorkloadID, nodeID, o.State, o.Message, o.ContainerID, o.ExitCode, o.OOMKilled, o.RestartCount,
-				utcPtr(o.StartedAt), utcPtr(o.FinishedAt), o.ObservedAt.UTC())
+				utcPtr(o.StartedAt), utcPtr(o.FinishedAt), o.ObservedAt.UTC(), o.AckedGeneration)
 			if err != nil {
 				return mapError(err)
 			}

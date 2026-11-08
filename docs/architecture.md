@@ -14,6 +14,7 @@ This document describes what exists today and where the planned orchestration wo
    |   internal/api ---+                                |
    |                   v                                |
    |   internal/placement --> internal/scheduler (pure) |
+   |   internal/reconcile (retires, deletes)            |
    |        |                                           |
    |        v                                           |
    |   internal/store  <--  internal/registry           |
@@ -25,7 +26,8 @@ This document describes what exists today and where the planned orchestration wo
                                       |
                   +-------------------+-------------------+
                   | agent (one per worker node)           |
-                  |   internal/agent --> internal/docker  |
+                  |   internal/agent runner               |
+                  |        --> internal/docker            |
                   +---------------------------------------+
                                       |
                               Docker Engine (local)
@@ -43,36 +45,38 @@ Agents dial the manager; the manager never connects to agents. This keeps nodes 
 - **`internal/api`**: Go 1.22 `ServeMux` handlers. Request bodies are capped at 1 MiB and decoded strictly (unknown fields rejected). Bearer tokens are compared in constant time. Workload creation reads the cluster, asks the scheduler for a node, saves the workload and records its audit event in one transaction under a cluster-wide placement lock, so no manager sharing the database can overcommit a node; a refusal is a `409` that carries the scheduler's reason for the request and for every node. Administrative changes record events in the same transaction (`GET /v1/events`). Service definitions (`/v1/services`) are validated against an explicit allow-list of fields (unsafe Docker options get a specific refusal), normalized so equivalent definitions are not changes, and stored as revisions with optimistic `If-Match` locking; the handlers never write workloads or schedule, and only read them to show a service's `status` (where its replicas were assigned, and why any has no node). Nodes show their allocatable and allocated resources. See [api.md](api.md).
 - **`internal/scheduler`**: the decision, as pure functions of a snapshot (nodes, existing assignments, replicas to place, overcommit). No I/O, no clock, no Docker (a test pins its imports). Deterministic placement that never oversubscribes unless configured, with a reason for every replica it cannot place and for every node it rules out. See [scheduler.md](scheduler.md).
 - **`internal/placement`**: carries decisions out against the store. Each pass runs in one transaction under the placement lock: it reads nodes, enrollments, workloads and service definitions, asks the scheduler where every waiting replica goes, saves the assignments as workloads, replaces the stored explanations for replicas without a node, and records audit events. The manager runs it every `DOCKFLEET_SCHEDULER_INTERVAL`. Running the containers stays with the agents.
+- **`internal/reconcile`**: compares service definitions with what agents report and moves workloads one way: running, stopped, deleted. `Plan` is a pure function (scaled-down and deleted services, rollouts that replace a replica only once its successor runs, fixed-host-port handover, deletion once a node confirms the container is gone); `Reconciler.RunOnce` applies it in one transaction under the placement lock with audit events; the manager runs it every `DOCKFLEET_RECONCILE_INTERVAL`. See [reconciliation.md](reconciliation.md).
 - **`internal/store`**: small repository interfaces (nodes, enrollments, workloads and their observations, services and revisions, scheduling explanations, events, leases) combined in `Store`, with `InTx` for transactions. PostgreSQL (`pgx` pool, embedded checksummed migrations guarded by an advisory lock) and in-memory implementations pass one shared conformance suite. Desired and observed state are separate tables with separate writers. See [state.md](state.md).
 - **`internal/protocol`**: `NodeService` (`RegisterNode`, `Heartbeat`, `DeregisterNode`) from `proto/dockfleet/v1/fleet.proto`; protocol version rules; `ProtocolError` details surfaced as `protocol.Error`; a unary interceptor enforcing the agent token and another applying a per-call deadline; a client that attaches the token, refuses plaintext to non-loopback addresses and reconnects with backoff. Optional TLS 1.3. Details in [protocol.md](protocol.md).
-- **`internal/registry`**: the manager-side node registry. `Register` persists the node and starts a session (replacing an older one); `Heartbeat` validates the session, refreshes liveness, applies status reports (writing only changes, ignoring workloads not assigned to the reporting node) and returns the node's complete assignment set; `Deregister` ends the session and backdates the heartbeat. `Register` and every `Heartbeat` also require an active enrollment in the store, so revocation ends a session at its next heartbeat. Sessions are in memory; everything else is in the store.
+- **`internal/registry`**: the manager-side node registry. `Register` persists the node and starts a session (replacing an older one); `Heartbeat` validates the session, refreshes liveness, applies status reports (writing only changes, keeping the highest acknowledged generation, ignoring workloads not assigned to the reporting node) and returns the node's complete assignment set, running and stopped workloads alike; `Deregister` ends the session and backdates the heartbeat. `Register` and every `Heartbeat` also require an active enrollment in the store, so revocation ends a session at its next heartbeat. Sessions are in memory; everything else is in the store.
 - **`internal/netutil`**: `IsLoopbackAddr` and `RequireLoopback`, shared by config validation, the manager and the client.
 - **`internal/pki`**: development CA, manager and node certificates (node identity is the URI SAN `spiffe://dockfleet/node/<id>`), CSR signing, validity checks, expiry reporting, and TLS 1.3 configurations whose certificate files and CA bundles are re-read when they change (a failed reload keeps the previous version). See [mtls.md](mtls.md).
 - **`cmd/pki`** (`dockfleet-pki`): the CLI over `internal/pki`; writes keys owner-only into a git-ignored directory and never prints them.
-- **`internal/agent`**: the connection loop. It registers with exponential backoff (1s to 30s), heartbeats at the interval the manager returns with a deadline on every call, mirrors assignments into status reports, registers again when the manager reports `NOT_REGISTERED` or `SESSION_SUPERSEDED`, retries transient failures forever, exits with an error on permanent ones (incompatible version, invalid registration, rejected credentials), and deregisters on clean shutdown.
+- **`internal/agent`**: the connection loop and the runner. The loop registers with exponential backoff (1s to 30s), heartbeats at the interval the manager returns with a deadline on every call, hands every assignment set to the runner and sends the runner's statuses, registers again when the manager reports `NOT_REGISTERED` or `SESSION_SUPERSEDED`, retries transient failures forever, exits with an error on permanent ones (incompatible version, invalid registration, rejected credentials), and deregisters on clean shutdown. The runner works beside it: from a fresh listing of the node's managed containers it creates (pulling images), starts, restarts per policy, stops and removes containers until they match the assignments, never touches a container DockFleet does not manage, and reports phase, container, exit code and the acknowledged generation. Containers outlive the agent process.
 - **`internal/integration`**: tests only; real agent loops against a real manager over an in-memory gRPC transport.
 - **`internal/docker`**: the agent-only Docker Engine adapter built on the Docker Go SDK (confined to `sdk.go`). It lists, creates, starts, stops, removes, inspects, logs and samples DockFleet's containers, identified by stable `io.dockfleet.*` labels and addressed by workload ID, never touching unrelated containers; creation passes a policy that rejects privileged mode, Docker socket and system-path mounts, added capabilities, host namespaces and public ports by default. The manager never imports it (enforced by a test). See [docker.md](docker.md).
+- **`internal/dockerfake`**: an in-memory `docker.Runtime` for tests, with the adapter's ownership, conflict and policy behavior.
 - **`internal/config`, `internal/logging`**: environment configuration with validation; `log/slog` JSON or text.
 
 ### Not implemented
 
-Driving the Docker adapter from assignments (the agent does not start workload containers yet and reports them as `pending`), reconciliation of desired versus actual state, removing replicas (scaling down, retiring an old revision's workloads) and moving workloads off a dead node, node removal, per-node identity, running leader election (the lease primitive exists; scheduling passes serialize on the placement lock instead), metrics. The scheduler places replicas that have no workload; it never removes or moves one. Agent sessions live in one process's memory, so an agent talks to one manager at a time.
+Moving workloads off a node that is gone for good (a stopped workload on an unreachable node keeps its slot), health checks (accepted and stored, not run), node removal, per-node identity, running leader election (the lease primitive exists; scheduling passes serialize on the placement lock instead), metrics. The scheduler places replicas that have no workload; the reconciler retires and removes them; neither moves one. Agent sessions live in one process's memory, so an agent talks to one manager at a time.
 
 ## Data model
 
 | Table | Key | Kind | Notes |
 | ----- | --- | ---- | ----- |
 | `nodes` | `id` | observed | Declared CPU (millicores) and memory, labels (`jsonb`), heartbeat time |
-| `workload_observations` | `workload_id` | observed | An agent's latest report: phase, message, container ID, exit code, OOM kill, restart count, start/finish times |
+| `workload_observations` | `workload_id` | observed | An agent's latest report: phase, message, container ID, exit code, OOM kill, restart count, start/finish times, acknowledged generation |
 | `enrollments` | `node_id` | desired | Administrator's permission for a node ID to join; `revoked_at` set on revocation |
 | `services` | `id` | desired | Name (unique among live services), desired `replicas`, `current_revision`, optimistic-lock `version`, `deleted_at` |
 | `service_revisions` | `(service_id, revision)` | desired | Immutable spec snapshots (deployment history) |
-| `workloads` | `id` | desired | Placement (`node_id`), unique `name`, resources, published `ports`, `desired_state`, optional service/revision/replica slot (unique) |
+| `workloads` | `id` | desired | One container's lifetime: placement (`node_id`), unique `name`, resources, published `ports`, how to run it (`runtime`), `desired_state` and its `generation`, optional service/revision/replica slot (unique) |
 | `unschedulable_replicas` | `(service_id, revision, replica_index)` | scheduler output | Why a replica has no node yet: code, message and one reason per node; removed when it is placed or no longer wanted |
 | `events` | `id` | audit | Append-only administrative events |
 | `leases` | `name` | coordination | Named leases with fencing tokens for multi-manager duties |
 
-Migrations (001-008) live in `internal/store/migrations`, are recorded with their checksums in `schema_migrations` and are never edited after release. A workload has no observation until its agent reports (`Workload.Phase()` is then `scheduled`); reports set the phase (`pending`, `running`, `succeeded`, `failed`, `stopped`) in `workload_observations` and never touch `workloads`. Details, multi-manager design and the restart guarantee are in [state.md](state.md).
+Migrations (001-009) live in `internal/store/migrations`, are recorded with their checksums in `schema_migrations` and are never edited after release. A workload has no observation until its agent reports (`Workload.Phase()` is then `scheduled`); reports set the phase (`pending`, `running`, `succeeded`, `failed`, `stopped`) in `workload_observations` and never touch `workloads`. Details, multi-manager design and the restart guarantee are in [state.md](state.md).
 
 ## Node liveness
 
@@ -109,12 +113,14 @@ Known gaps: the admin API uses one shared bearer token, there is no CRL/OCSP (re
 - **Standard library first**: `log/slog`, `net/http` routing, `crypto/*`. The only third-party modules are gRPC, protobuf and `pgx`.
 - **Generated code is not committed.** `buf generate` output goes to `internal/protocol/dockfleet/` and is git-ignored; CI and `make proto` regenerate it from pinned tool versions. This avoids drift at the cost of a required step after cloning.
 - **In-memory store** exists for fast tests and database-free development; it is not a production option and logs a warning.
-- **Placement is recorded, not executed**, so the admin API and scheduler can be built and tested before the runtime exists.
+- **Placement is recorded; execution is the agent's.** The manager decides and writes intent, so the admin API, scheduler and reconciler are tested without a runtime, and an agent that is away does not block them.
+- **Instructions are states, not commands.** The manager sends each agent the complete set of its workloads with their desired state, and each agent reports the complete set it knows. Neither side depends on a message arriving once, in order, or at all, which is what makes retries and restarts safe.
+- **A workload is one container's lifetime** (running, stopped, deleted), so its random ID names at most one container ever.
 - **Deciding is separate from saving, and saving from running.** `internal/scheduler` answers "where?" from a snapshot and nothing else; `internal/placement` saves the answer as desired state; the agent and `internal/docker` are the only code that touches containers. Each can be tested without the others.
 
 ## Extension points for the next stages
 
 - Assignment delivery and status reporting already ride on `Heartbeat`; if latency matters, add a server-streaming `Watch` RPC next to it and bump the protocol minor version.
-- Have the agent depend on `docker.Runtime` and drive it from assignments (pull, create, start, stop, remove, report real phases and usage); the adapter and its fakes already exist.
-- Add a reconciler in the agent that drives actual state toward the manager's desired state.
+- Metrics and usage reporting: the adapter can already sample `Stats`; the runner does not report it yet.
+- Failover: move workloads off a node that has not returned for a configured time (the unique slot per workload and the stop-then-delete lifecycle already allow it).
 - Per-user admin authentication (the admin API still uses one shared token), certificate revocation lists, and integration with an external CA.

@@ -161,6 +161,7 @@ var placementTests = []placementTest{
 	{"deleted services are not scheduled", eachStore(testDeletedServices)},
 	{"spreading many replicas", eachStore(testSpreadsEvenly)},
 	{"workload names", eachStore(testWorkloadNames)},
+	{"workloads carry how to run the container", eachStore(testWorkloadsCarryHowToRun)},
 	{"overcommit is off unless configured", testOvercommit},
 	{"the same input gives the same placement", testDeterminism},
 	{"a failed pass saves nothing", testFailedPassIsRolledBack},
@@ -665,6 +666,23 @@ func testWorkloadNames(t *testing.T, e *env) {
 	}
 	if len(all) != 6 {
 		t.Fatalf("workloads = %d", len(all))
+	}
+}
+
+func testWorkloadsCarryHowToRun(t *testing.T, e *env) {
+	e.node("n1", 4000, 8*gib)
+	s := spec(500)
+	s.Command = []string{"sleep", "300"}
+	s.Env = map[string]string{"MODE": "prod"}
+	s.RestartPolicy = &store.RestartPolicy{Condition: store.RestartAlways}
+	svc := e.service("web", 1, s)
+	e.run()
+
+	ws, err := e.st.ListWorkloadsForService(e.ctx(), svc.ID)
+	e.must(err)
+	if len(ws) != 1 || !reflect.DeepEqual(ws[0].Command, s.Command) || !reflect.DeepEqual(ws[0].Env, s.Env) ||
+		ws[0].RestartPolicy == nil || ws[0].RestartPolicy.Condition != store.RestartAlways || ws[0].Generation != 1 {
+		t.Fatalf("workloads = %+v; they must carry the revision's command, environment and restart policy", ws)
 	}
 }
 

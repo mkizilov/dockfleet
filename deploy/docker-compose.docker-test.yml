@@ -1,0 +1,35 @@
+name: dockfleet-docker-test
+
+# A disposable Docker daemon for `make test-docker`, so that the Docker tests
+# run against a daemon of their own and never against the host's. Start it with
+# `make docker-test-up`, point the tests at it with
+#
+#   export DOCKFLEET_TEST_DOCKER_HOST=tcp://127.0.0.1:21297
+#
+# and delete it, with everything it pulled and ran, with `make docker-test-down`.
+#
+# The daemon's API is published on loopback only: the Docker Engine API has no
+# authentication and is equivalent to root on the daemon's machine. Docker in
+# Docker has to run privileged; that applies to this test daemon alone. The
+# containers DockFleet creates inside it are never privileged (the container
+# policy refuses it), and nothing here is used by the manager or an agent in
+# operation.
+services:
+  daemon:
+    image: docker:27.5.1-dind
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    command: ["dockerd", "--host=tcp://0.0.0.0:2375", "--storage-driver=overlay2"]
+    ports:
+      - "127.0.0.1:${DOCKFLEET_TEST_DOCKER_PORT:-21297}:2375"
+    volumes:
+      - daemon-data:/var/lib/docker
+    healthcheck:
+      test: ["CMD", "docker", "-H", "tcp://127.0.0.1:2375", "info"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  daemon-data:

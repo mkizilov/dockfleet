@@ -49,6 +49,10 @@ type Manager struct {
 	// SchedulerInterval is the time between scheduling passes; zero (only
 	// possible outside this loader) turns the scheduler off.
 	SchedulerInterval time.Duration
+	// ReconcileInterval is the time between passes that compare services with
+	// what agents report and stop or remove the workloads that should go; zero
+	// (only possible outside this loader) turns the reconciler off.
+	ReconcileInterval time.Duration
 	// CPUOvercommit and MemoryOvercommit are how many times a node's capacity may
 	// be promised to workloads. 1 means never more than the node has.
 	CPUOvercommit    float64
@@ -121,6 +125,7 @@ func LoadManager(get Getenv) (Manager, error) {
 	c.RequestTimeout = duration(get, "DOCKFLEET_REQUEST_TIMEOUT", 10*time.Second, &errs)
 	c.ShutdownTimeout = duration(get, "DOCKFLEET_SHUTDOWN_TIMEOUT", 15*time.Second, &errs)
 	c.SchedulerInterval = duration(get, "DOCKFLEET_SCHEDULER_INTERVAL", 5*time.Second, &errs)
+	c.ReconcileInterval = duration(get, "DOCKFLEET_RECONCILE_INTERVAL", 5*time.Second, &errs)
 	c.CPUOvercommit = overcommit(get, "DOCKFLEET_SCHEDULER_CPU_OVERCOMMIT", &errs)
 	c.MemoryOvercommit = overcommit(get, "DOCKFLEET_SCHEDULER_MEMORY_OVERCOMMIT", &errs)
 

@@ -299,6 +299,11 @@ func (m *Memory) RevokeEnrollment(_ context.Context, nodeID string, at time.Time
 // view returns the workload with its observation attached.
 func (m *Memory) view(w Workload) Workload {
 	w.Ports = append([]ServicePort(nil), w.Ports...)
+	w.Command = append([]string(nil), w.Command...)
+	if w.Env != nil {
+		w.Env = cloneLabels(w.Env)
+	}
+	w.RestartPolicy = clonePtr(w.RestartPolicy)
 	if o, ok := m.s.observations[w.ID]; ok {
 		c := cloneObservation(o)
 		w.Observed = &c
@@ -389,9 +394,25 @@ func (m *Memory) SetWorkloadDesiredState(_ context.Context, id, desired string, 
 		return m.view(w), ErrUnchanged
 	}
 	w.DesiredState = desired
+	w.Generation++
 	w.UpdatedAt = at.UTC()
 	m.s.workloads[id] = w
 	return m.view(w), nil
+}
+
+func (m *Memory) DeleteWorkload(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	w, ok := m.s.workloads[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if w.DesiredState != DesiredStopped {
+		return fmt.Errorf("%w: workload %s is still meant to run; stop it first", ErrInvalid, id)
+	}
+	delete(m.s.workloads, id)
+	delete(m.s.observations, id)
+	return nil
 }
 
 func (m *Memory) RecordObservations(_ context.Context, nodeID string, obs []Observation) error {

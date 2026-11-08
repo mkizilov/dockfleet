@@ -1,5 +1,5 @@
 // These tests use an in-memory bufconn transport, so no ports are used; the
-// agents are the real agent.Agent loop with a fake Docker client.
+// agents are the real agent.Agent loop on an in-memory Docker engine.
 package integration
 
 import (
@@ -22,8 +22,10 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 
 	"github.com/dockfleet/dockfleet/internal/agent"
-	"github.com/dockfleet/dockfleet/internal/protocol"
+	"github.com/dockfleet/dockfleet/internal/docker"
+	"github.com/dockfleet/dockfleet/internal/dockerfake"
 	"github.com/dockfleet/dockfleet/internal/placement"
+	"github.com/dockfleet/dockfleet/internal/protocol"
 	dockfleetv1 "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/v1"
 	"github.com/dockfleet/dockfleet/internal/registry"
 	"github.com/dockfleet/dockfleet/internal/scheduler"
@@ -198,11 +200,6 @@ func (m *manager) dial(mutate func(*protocol.ClientConfig)) *protocol.Client {
 	return c
 }
 
-type fakeDocker struct{}
-
-func (fakeDocker) Ping(context.Context) error { return nil }
-func (fakeDocker) Close() error               { return nil }
-
 func nodeInfo(id string) protocol.NodeInfo {
 	return protocol.NodeInfo{
 		ID:           id,
@@ -214,24 +211,42 @@ func nodeInfo(id string) protocol.NodeInfo {
 	}
 }
 
-// simAgent is a real agent.Agent loop running in the background.
+// simAgent is a real agent.Agent loop running in the background, on its own
+// in-memory Docker engine.
 type simAgent struct {
 	t      *testing.T
 	cancel context.CancelFunc
 	exited chan struct{}
 	result error
+	engine *dockerfake.Fake
 }
 
 func (m *manager) startAgent(id string, mutate func(*protocol.ClientConfig)) *simAgent {
 	m.t.Helper()
+	return m.startAgentOn(dockerfake.New(id), id, mutate)
+}
+
+// startAgentOn starts an agent for node id on an existing engine, which is how
+// a restarted agent finds the containers its predecessor left behind.
+func (m *manager) startAgentOn(engine *dockerfake.Fake, id string, mutate func(*protocol.ClientConfig)) *simAgent {
+	m.t.Helper()
+	s := m.runAgent(engine, id, mutate)
+	s.engine = engine
+	return s
+}
+
+// runAgent starts an agent for node id on any container runtime.
+func (m *manager) runAgent(rt docker.Runtime, id string, mutate func(*protocol.ClientConfig)) *simAgent {
+	m.t.Helper()
 	a := agent.New(agent.Config{
 		Node:       nodeInfo(id),
 		Manager:    m.dial(mutate),
-		Docker:     fakeDocker{},
+		Docker:     rt,
 		Logger:     discardLogger(),
 		RPCTimeout: time.Second,
 		RetryMin:   5 * time.Millisecond,
 		RetryMax:   20 * time.Millisecond,
+		Resync:     10 * time.Millisecond,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &simAgent{t: m.t, cancel: cancel, exited: make(chan struct{})}
@@ -336,17 +351,18 @@ func TestAssignedWorkloadsAreReportedBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, w := range []store.Workload{
-		{ID: "w-mine", Name: "mine", Image: "nginx:1", CPUMillis: 100, MemoryBytes: 1 << 20, NodeID: "sim-1", CreatedAt: now},
-		{ID: "w-theirs", Name: "theirs", Image: "nginx:1", CPUMillis: 100, MemoryBytes: 1 << 20, NodeID: "elsewhere", CreatedAt: now},
+		{ID: "w-mine", Name: "mine", Image: "nginx:1", CPUMillis: 100, MemoryBytes: 64 << 20, NodeID: "sim-1", CreatedAt: now},
+		{ID: "w-theirs", Name: "theirs", Image: "nginx:1", CPUMillis: 100, MemoryBytes: 64 << 20, NodeID: "elsewhere", CreatedAt: now},
 	} {
 		if _, err := m.store.CreateWorkload(ctx, w); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	waitFor(t, "the assigned workload to be reported", func() bool {
+	waitFor(t, "the assigned workload to be running and reported", func() bool {
 		w, err := m.store.GetWorkload(ctx, "w-mine")
-		return err == nil && w.Phase() == store.WorkloadPending && w.Observed != nil && w.Observed.Message != "" && w.Observed.NodeID == "sim-1"
+		return err == nil && w.Phase() == store.WorkloadRunning && w.Observed != nil && w.Observed.Message != "" && w.Observed.NodeID == "sim-1" &&
+			w.Observed.AckedGeneration == w.Generation && w.Observed.ContainerID != ""
 	})
 
 	// Let the agent heartbeat a few more times, then check it left the other node's workload alone.
@@ -360,7 +376,7 @@ func TestAssignedWorkloadsAreReportedBack(t *testing.T) {
 
 // The scheduler only decides and records. The node it names learns of the
 // assignment through the protocol, like any other workload, and an agent here
-// has no Docker at all (fakeDocker).
+// has no Docker at all, only an in-memory engine.
 func TestScheduledReplicasReachTheirAgents(t *testing.T) {
 	m := newManager(t, nil)
 	m.start()
@@ -373,7 +389,7 @@ func TestScheduledReplicasReachTheirAgents(t *testing.T) {
 	// nodes and the third has nowhere to go.
 	svc, err := m.store.CreateService(ctx, store.NewService{
 		ID: "svc-web", Name: "web", Replicas: 3, At: time.Now(),
-		Spec: store.ServiceSpec{Image: "nginx:1", CPUMillis: 1500, MemoryBytes: 1 << 20},
+		Spec: store.ServiceSpec{Image: "nginx:1", CPUMillis: 1500, MemoryBytes: 64 << 20},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -390,7 +406,7 @@ func TestScheduledReplicasReachTheirAgents(t *testing.T) {
 	waitFor(t, "both agents to report their replica", func() bool {
 		for _, w := range workloads {
 			got, err := m.store.GetWorkload(ctx, w.ID)
-			if err != nil || got.Observed == nil || got.Observed.NodeID != w.NodeID || got.Phase() != store.WorkloadPending {
+			if err != nil || got.Observed == nil || got.Observed.NodeID != w.NodeID || got.Phase() != store.WorkloadRunning {
 				return false
 			}
 		}

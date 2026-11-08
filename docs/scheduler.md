@@ -76,7 +76,7 @@ A replica slot is replica `i` (1 to `replicas`) of a service's current revision.
 
 If any step fails nothing is saved and the next pass starts over. A pass is idempotent: with nothing waiting it writes nothing. The manager runs one every `DOCKFLEET_SCHEDULER_INTERVAL` (default `5s`) until it shuts down.
 
-Deliberately not done by a pass: removing workloads (scaling down, retiring the replicas of an older revision), moving workloads off a node that died, and starting containers. A deployment of a new revision therefore places the new revision's replicas beside the old ones and needs room for both until something retires the old ones. Those belong to a reconciler.
+Deliberately not done by a pass: removing workloads (scaling down, retiring the replicas of an older revision), moving workloads off a node that died, and starting containers. A deployment of a new revision therefore places the new revision's replicas beside the old ones, and needs room for both until the reconciler ([reconciliation.md](reconciliation.md)) retires the old ones, one replica at a time, as the new ones come up. The scheduler treats a workload as freed the moment it is told to stop, even though its container takes a moment to go.
 
 Standalone workloads (`POST /v1/workloads`) use the same scheduler and the same rules, so what a service's replicas reserve counts against them and the other way round.
 

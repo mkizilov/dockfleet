@@ -13,7 +13,10 @@ option go_package = "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/
 //     a session_id plus the workloads currently assigned to the node.
 //  2. Heartbeat (every heartbeat_interval_ms): the agent proves liveness and
 //     reports the status of every workload it knows about. The manager answers
-//     with the complete set of workloads assigned to the node.
+//     with the complete set of workloads assigned to the node, each with the
+//     desired state its container must be brought to. Both sets are complete,
+//     so every instruction is idempotent: an agent that receives the same set
+//     twice, or after a restart, converges to the same containers.
 //  3. DeregisterNode: the agent announces a clean shutdown so the manager can
 //     mark the node unavailable immediately instead of waiting for a timeout.
 //
@@ -62,13 +65,55 @@ message NodeCapacity {
   int64 memory_bytes = 2;
 }
 
-// WorkloadAssignment is the desired state of one workload on the node.
+// WorkloadDesiredState is the instruction the agent carries out for a workload.
+enum WorkloadDesiredState {
+  // Treated as RUNNING, which is what managers before protocol 1.2 meant.
+  WORKLOAD_DESIRED_STATE_UNSPECIFIED = 0;
+  // Create the container if the node has none, pulling the image if needed,
+  // and keep it running according to the restart policy.
+  WORKLOAD_DESIRED_STATE_RUNNING = 1;
+  // Stop the container and remove it. The workload stays assigned, reported
+  // as STOPPED with no container, until the manager deletes it.
+  WORKLOAD_DESIRED_STATE_STOPPED = 2;
+}
+
+// PortMapping publishes one container port on the node.
+message PortMapping {
+  uint32 container_port = 1;
+  // 0 lets the node choose a free port.
+  uint32 host_port = 2;
+  // "tcp" or "udp"; empty means tcp.
+  string protocol = 3;
+}
+
+// RestartPolicy says when the agent starts a container that exited.
+message RestartPolicy {
+  // "no", "on-failure" or "always"; empty means "on-failure".
+  string condition = 1;
+  // How many times "on-failure" restarts the container.
+  uint32 max_retries = 2;
+}
+
+// WorkloadAssignment is the instruction for one workload on the node. The
+// workload_id identifies one container's lifetime: it is random, unique in the
+// fleet and never reused, and it is the only thing that names the container
+// on the node.
 message WorkloadAssignment {
   string workload_id = 1;
   string name = 2;
   string image = 3;
   int64 cpu_millis = 4;
   int64 memory_bytes = 5;
+  // Starts at 1 and increases every time desired_state changes. The agent
+  // acknowledges the generation it has seen in WorkloadStatus.
+  int64 generation = 6;
+  WorkloadDesiredState desired_state = 7;
+  // Replaces the image's default command; exec form.
+  repeated string command = 8;
+  map<string, string> env = 9;
+  repeated PortMapping ports = 10;
+  // Absent means the default, "on-failure" with 5 retries.
+  RestartPolicy restart_policy = 11;
 }
 
 enum WorkloadPhase {
@@ -86,6 +131,16 @@ message WorkloadStatus {
   string workload_id = 1;
   WorkloadPhase phase = 2;
   string message = 3;
+  // The highest generation of this workload's assignment the agent has
+  // received. 0 from an agent that does not acknowledge.
+  int64 acknowledged_generation = 4;
+  // Docker's ID for the workload's container; empty when the node has none.
+  string container_id = 5;
+  // The exit code of a container that exited.
+  optional int32 exit_code = 6;
+  bool oom_killed = 7;
+  // How many times the agent restarted the container since it started.
+  int32 restart_count = 8;
 }
 
 enum ProtocolErrorCode {
@@ -141,8 +196,9 @@ message HeartbeatRequest {
 }
 
 message HeartbeatResponse {
-  // The complete set of workloads assigned to the node right now. A workload
-  // missing from this list is no longer assigned.
+  // The complete set of workloads assigned to the node right now, running and
+  // stopped. A workload leaves the list only when the manager deleted it after
+  // the node confirmed that the container is gone.
   repeated WorkloadAssignment assignments = 1;
 }
 

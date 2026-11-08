@@ -13,6 +13,7 @@ PROTOC_GEN_GO_VERSION      := v1.35.2
 PROTOC_GEN_GO_GRPC_VERSION := v1.5.1
 
 COMPOSE := docker compose --env-file config/dev.env -f deploy/docker-compose.yml
+DOCKER_TEST_COMPOSE := docker compose -f deploy/docker-compose.docker-test.yml
 PKGS    := ./...
 
 # Development credentials live in PKI_DIR, which is git-ignored.
@@ -73,14 +74,23 @@ cover: ## Run unit tests and print per-package coverage
 	$(GO) test -count=1 -cover $(PKGS)
 
 .PHONY: test-integration
-test-integration: ## Run PostgreSQL integration tests: store, API and scheduling (needs `make compose-up`)
+test-integration: ## Run PostgreSQL integration tests: store, API, scheduling and reconciliation (needs `make compose-up`)
 	set -a; . config/dev.env; set +a; \
-	DOCKFLEET_TEST_DATABASE_URL="$$DOCKFLEET_DATABASE_URL" $(GO) test -race -count=1 -tags integration ./internal/store/... ./internal/api/... ./internal/placement/...
+	DOCKFLEET_TEST_DATABASE_URL="$$DOCKFLEET_DATABASE_URL" $(GO) test -race -count=1 -tags integration ./internal/store/... ./internal/api/... ./internal/placement/... ./internal/reconcile/...
 
 .PHONY: test-docker
-test-docker: ## Run the Docker Engine integration tests (set DOCKFLEET_TEST_DOCKER_HOST, e.g. unix:///var/run/docker.sock)
-	@test -n "$$DOCKFLEET_TEST_DOCKER_HOST" || { echo "set DOCKFLEET_TEST_DOCKER_HOST to the local Docker Engine, e.g. unix:///var/run/docker.sock"; exit 1; }
+test-docker: ## Run the Docker Engine tests: the adapter and a service deployment (set DOCKFLEET_TEST_DOCKER_HOST, e.g. tcp://127.0.0.1:21297 after `make docker-test-up`)
+	@test -n "$$DOCKFLEET_TEST_DOCKER_HOST" || { echo "set DOCKFLEET_TEST_DOCKER_HOST to a Docker Engine, e.g. tcp://127.0.0.1:21297 after 'make docker-test-up'"; exit 1; }
 	$(GO) test -race -count=1 -tags dockerintegration -run TestDockerEngine -v ./internal/docker/
+	$(GO) test -race -count=1 -tags dockerintegration -run TestServiceDeploymentAgainstDocker -v ./internal/integration/
+
+.PHONY: docker-test-up
+docker-test-up: ## Start a disposable Docker daemon on 127.0.0.1:21297 for `make test-docker` (keeps the tests off the host's Docker)
+	$(DOCKER_TEST_COMPOSE) up -d --wait
+
+.PHONY: docker-test-down
+docker-test-down: ## Stop the disposable Docker daemon and delete its images and containers
+	$(DOCKER_TEST_COMPOSE) down --volumes
 
 .PHONY: check-secrets
 check-secrets: ## Fail if a private key is tracked by git

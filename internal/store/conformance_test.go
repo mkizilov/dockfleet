@@ -26,6 +26,8 @@ func runStoreConformance(t *testing.T, newStore func(t *testing.T) Store) {
 		{"service revisions", testRevisions},
 		{"service definitions", testDefinitions},
 		{"workload ports", testWorkloadPorts},
+		{"workload lifecycle", testWorkloadLifecycle},
+		{"workload slots are freed by deletion", testWorkloadSlotsAreFreedByDeletion},
 		{"unschedulable replicas", testUnschedulable},
 		{"service workloads", testServiceWorkloads},
 		{"service deletion", testServiceDeletion},
