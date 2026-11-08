@@ -5,6 +5,9 @@
 _opam/
 .DS_Store
 
+# Local tooling state created by the development harness
+.cortexkit/
+
 # Development credentials: private keys must never be committed (`make dev-pki`)
 /.dev-pki/
 *.key
