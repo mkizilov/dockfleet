@@ -16,6 +16,15 @@ COMPOSE := docker compose --env-file config/dev.env -f deploy/docker-compose.yml
 DOCKER_TEST_COMPOSE := docker compose -f deploy/docker-compose.docker-test.yml
 ETCD_TEST_COMPOSE := docker compose -f deploy/docker-compose.etcd-test.yml
 GOVULNCHECK_VERSION := v1.1.4
+ACTIONLINT_VERSION := v1.7.12
+GITLEAKS_VERSION := v8.30.1
+SHELLCHECK_PY_VERSION := 0.11.0.1
+HADOLINT_PY_VERSION := 2.15.1.3
+CHECK_JSONSCHEMA_VERSION := 0.36.2
+VENV ?= .venv
+# Every test run is bounded, so that a test that hangs fails with a goroutine dump instead of waiting forever.
+TEST_TIMEOUT ?= 10m
+E2E_TIMEOUT ?= 20m
 RELEASE_PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
 PKGS    := ./...
 
@@ -51,11 +60,11 @@ tidy: ## Resolve dependencies and write go.sum (needs network)
 
 .PHONY: fmt
 fmt: ## Format Go sources
-	gofmt -w cmd internal deploy
+	gofmt -w cmd internal deploy scripts
 
 .PHONY: fmt-check
 fmt-check: ## Fail if any Go source is not gofmt-formatted
-	@out=$$(gofmt -l cmd internal deploy); if [ -n "$$out" ]; then echo "Unformatted files:"; echo "$$out"; exit 1; fi
+	@out=$$(gofmt -l cmd internal deploy scripts); if [ -n "$$out" ]; then echo "Unformatted files:"; echo "$$out"; exit 1; fi
 
 .PHONY: vet
 vet: ## Run go vet, also with the build tags of the PostgreSQL, etcd, Docker and end-to-end tests
@@ -71,22 +80,22 @@ build: ## Build manager and agent into bin/
 
 .PHONY: test
 test: ## Run unit tests with the race detector
-	$(GO) test -race -count=1 $(PKGS)
+	$(GO) test -race -count=1 -timeout $(TEST_TIMEOUT) $(PKGS)
 
 .PHONY: cover
 cover: ## Run unit tests and print per-package coverage
-	$(GO) test -count=1 -cover $(PKGS)
+	$(GO) test -count=1 -timeout $(TEST_TIMEOUT) -cover $(PKGS)
 
 .PHONY: test-integration
 test-integration: ## Run PostgreSQL integration tests: store, API, scheduling, reconciliation and the multi-manager cluster (needs `make compose-up`)
 	set -a; . config/dev.env; set +a; \
-	DOCKFLEET_TEST_DATABASE_URL="$$DOCKFLEET_DATABASE_URL" $(GO) test -race -count=1 -tags integration ./internal/store/... ./internal/api/... ./internal/placement/... ./internal/reconcile/... ./internal/integration/...
+	DOCKFLEET_TEST_DATABASE_URL="$$DOCKFLEET_DATABASE_URL" $(GO) test -race -count=1 -timeout $(TEST_TIMEOUT) -tags integration ./internal/store/... ./internal/api/... ./internal/placement/... ./internal/reconcile/... ./internal/integration/...
 
 .PHONY: test-docker
 test-docker: ## Run the Docker Engine tests: the adapter and a service deployment (set DOCKFLEET_TEST_DOCKER_HOST, e.g. tcp://127.0.0.1:21297 after `make docker-test-up`)
 	@test -n "$$DOCKFLEET_TEST_DOCKER_HOST" || { echo "set DOCKFLEET_TEST_DOCKER_HOST to a Docker Engine, e.g. tcp://127.0.0.1:21297 after 'make docker-test-up'"; exit 1; }
-	$(GO) test -race -count=1 -tags dockerintegration -run TestDockerEngine -v ./internal/docker/
-	$(GO) test -race -count=1 -tags dockerintegration -run TestServiceDeploymentAgainstDocker -v ./internal/integration/
+	$(GO) test -race -count=1 -timeout $(TEST_TIMEOUT) -tags dockerintegration -run TestDockerEngine -v ./internal/docker/
+	$(GO) test -race -count=1 -timeout $(TEST_TIMEOUT) -tags dockerintegration -run TestServiceDeploymentAgainstDocker -v ./internal/integration/
 
 .PHONY: docker-test-up
 docker-test-up: ## Start a disposable Docker daemon on 127.0.0.1:21297 for `make test-docker` (keeps the tests off the host's Docker)
@@ -98,12 +107,12 @@ docker-test-down: ## Stop the disposable Docker daemon and delete its images and
 
 .PHONY: test-e2e
 test-e2e: ## End-to-end tests: the real binaries over mutual TLS with PostgreSQL and etcd (uses DOCKFLEET_TEST_DATABASE_URL / DOCKFLEET_TEST_ETCD_ENDPOINTS, or starts the PostgreSQL and etcd under .tools/ or named by DOCKFLEET_E2E_POSTGRES_BIN / DOCKFLEET_E2E_ETCD_BIN)
-	$(GO) test -count=1 -tags e2e -timeout 20m -v ./internal/e2e/
+	$(GO) test -count=1 -tags e2e -timeout $(E2E_TIMEOUT) -v ./internal/e2e/
 
 .PHONY: test-etcd
 test-etcd: ## Run the etcd tests: the election client and the managers' election against a real etcd (set DOCKFLEET_TEST_ETCD_ENDPOINTS, e.g. http://127.0.0.1:21234 after `make etcd-test-up`)
 	@test -n "$$DOCKFLEET_TEST_ETCD_ENDPOINTS" || { echo "set DOCKFLEET_TEST_ETCD_ENDPOINTS to an etcd, e.g. http://127.0.0.1:21234 after 'make etcd-test-up'"; exit 1; }
-	$(GO) test -race -count=1 -tags etcdintegration -run RealEtcd -v ./internal/etcd/ ./internal/integration/
+	$(GO) test -race -count=1 -timeout $(TEST_TIMEOUT) -tags etcdintegration -run RealEtcd -v ./internal/etcd/ ./internal/integration/
 
 .PHONY: etcd-test-up
 etcd-test-up: ## Start a disposable single-member etcd on 127.0.0.1:21234 for `make test-etcd`
@@ -133,6 +142,29 @@ docker-build: ## Build the manager and agent images (needs a Docker daemon)
 vuln: ## Fail on known vulnerabilities in code the binaries call, except the accepted ones listed in scripts/vuln-check.sh (needs network)
 	GOBIN=$(TOOLS_BIN) $(GO) install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
 	scripts/vuln-check.sh ./...
+
+.PHONY: tools-lint
+tools-lint: ## Install the pinned file linters and secret scanner: actionlint and gitleaks into .tools/bin, shellcheck, hadolint and check-jsonschema into $(VENV)
+	GOBIN=$(TOOLS_BIN) $(GO) install github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION)
+	GOBIN=$(TOOLS_BIN) $(GO) install github.com/zricethezav/gitleaks/v8@$(GITLEAKS_VERSION)
+	python3 -m venv $(VENV)
+	$(VENV)/bin/pip install --disable-pip-version-check --no-cache-dir --quiet shellcheck-py==$(SHELLCHECK_PY_VERSION) hadolint-py==$(HADOLINT_PY_VERSION) check-jsonschema==$(CHECK_JSONSCHEMA_VERSION)
+
+.PHONY: lint-files
+lint-files: ## Lint the CI workflow, the shell scripts, the Dockerfile and the Compose files (needs `make tools-lint`)
+	actionlint -shellcheck=$(VENV)/bin/shellcheck .github/workflows/*.yml
+	$(VENV)/bin/shellcheck scripts/*.sh
+	$(VENV)/bin/hadolint Dockerfile
+	$(VENV)/bin/check-jsonschema --builtin-schema vendor.github-workflows .github/workflows/*.yml
+	$(VENV)/bin/check-jsonschema --builtin-schema vendor.compose-spec deploy/docker-compose*.yml deploy/examples/compose.manager.yml
+
+.PHONY: scan-secrets
+scan-secrets: ## Scan every committed revision for secrets with gitleaks (needs `make tools-lint`; the known false positives are in .gitleaksignore)
+	gitleaks git --redact --no-banner .
+
+.PHONY: notices
+notices: ## Regenerate THIRD_PARTY_NOTICES.md from the dependencies the released binaries link (needs the protobuf code: `make proto`)
+	$(GO) run ./scripts/notices -write
 
 .PHONY: check-secrets
 check-secrets: ## Fail if a private key is tracked by git

@@ -350,12 +350,12 @@ func TestSystemdUnitsKeepTheirSandbox(t *testing.T) {
 // dropped from it is a check nobody runs.
 func TestCIRunsEveryKindOfCheck(t *testing.T) {
 	ci := read(t, ".github/workflows/ci.yml")
-	for _, job := range []string{"lint", "unit", "cross-build", "integration", "etcd", "e2e", "docker", "images", "vulnerabilities"} {
+	for _, job := range []string{"lint", "files", "unit", "cross-build", "integration", "etcd", "e2e", "docker", "images", "vulnerabilities"} {
 		if !regexp.MustCompile(`(?m)^  ` + job + `:$`).MatchString(ci) {
 			t.Errorf("ci.yml has no %q job", job)
 		}
 	}
-	for _, step := range []string{"make check", "make test-e2e", "-tags integration", "make test-etcd", "make test-docker", "make docker-build", "make cross-build", "make tidy-check", "make vuln"} {
+	for _, step := range []string{"make check", "make test-e2e", "-tags integration", "make test-etcd", "make test-docker", "make docker-build", "make cross-build", "make tidy-check", "make vuln", "make tools-lint", "make lint-files", "make scan-secrets"} {
 		if !strings.Contains(ci, step) {
 			t.Errorf("ci.yml never runs %q", step)
 		}

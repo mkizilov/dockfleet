@@ -1,6 +1,6 @@
 # Verification status
 
-This is the one place that says what DockFleet does, how sure we are, and why. It was written against commit `a2bf862` plus the changes of the commit that added this file, and every "verified" below names a command that was run and passed in the environment described here. Anything not run is marked **unverified**, even where the code is written and the test exists. [ROADMAP.md](../ROADMAP.md) says what to do about the gaps, in order.
+This is the one place that says what DockFleet does, how sure we are, and why. It was written against commit `a2bf862`, refreshed for commit `3479d1b`, and refreshed again in the publication pass (the MIT license, the third-party notices, the file linters and the secret scan), and every "verified" below names a command that was run and passed in the environment described here. Anything not run is marked **unverified**, even where the code is written and the test exists. [ROADMAP.md](../ROADMAP.md) says what to do about the gaps, in order.
 
 ## Words used
 
@@ -22,7 +22,8 @@ A row can be implemented and still partial or unverified. "Verified against an i
 | PostgreSQL | 16.4, a relocatable build under `.tools/postgres`, loopback only, one server |
 | etcd | 3.5.35, one member, under `.tools/etcd`, loopback only |
 | Docker | **none**: no daemon was reachable and the host's was not used |
-| Network | available for module and tool downloads only |
+| File linters and secret scanner | `actionlint` 1.7.12, `shellcheck` 0.11.0, `hadolint` 2.15.1, `check-jsonschema` 0.36.2 (with the GitHub workflow and Compose schemas), `gitleaks` 8.30.1; pinned in the `Makefile`, installed by `make tools-lint` into `.tools/bin` and `.venv` |
+| Network | module, tool and package downloads work; nothing else was needed or used. Earlier statements that the registry or tools were unreachable no longer hold (the name-resolution restriction was lifted) |
 
 ## Checks that ran
 
@@ -30,17 +31,22 @@ All commands run from the repository root with `GOTOOLCHAIN=local GOFLAGS=-p=2` 
 
 | Command | What it covers | Result |
 | --- | --- | --- |
-| `make check` | `gofmt` (including `deploy/`), `go vet` for the default build and with every test tag (`integration`, `etcdintegration`, `dockerintegration`, `e2e`), the secret scan, and `go test -race ./...` | passes: in a counted run of the same suite (`go test -race -count=1 -v ./...`), 546 top-level tests, 849 subtests, 0 failed, 0 skipped, 27 packages |
+| `make check` | `gofmt` (including `deploy/`), `go vet` for the default build and with every test tag (`integration`, `etcdintegration`, `dockerintegration`, `e2e`), the secret scan, and `go test -race ./...` | passes: in a counted run of the same suite (`go test -race -count=1 -timeout 10m -v ./...`), 556 top-level tests, 849 subtests, 0 failed, 0 skipped, 28 packages |
 | `go test -race -tags integration ./internal/store/... ./internal/api/... ./internal/placement/... ./internal/reconcile/... ./internal/integration/...` against PostgreSQL 16.4 (`DOCKFLEET_TEST_DATABASE_URL`) | the store conformance suite on both stores, migrations, the API, scheduling and reconciliation on PostgreSQL, two managers on one database, multi-manager scenarios on PostgreSQL | passes: 140 top-level tests, 810 subtests, 0 failed, 0 skipped, 5 packages |
 | `make test-etcd` against etcd 3.5.35 (`DOCKFLEET_TEST_ETCD_ENDPOINTS`) | the election client's contract against a real etcd, and the multi-manager scenarios with a real etcd | passes: 5 top-level tests, 6 subtests passed, 1 skipped (it must move a clock, which a real etcd does not allow; it runs against the fake) |
 | `make test-e2e` | the real `dockfleet-manager` and `dockfleet-agent` binaries as processes over mutual TLS from `dockfleet-pki`, credentials as files, PostgreSQL and etcd started by the test (see below) | passes: 12 scenarios, 6 subtests, 0 skipped |
 | `make cross-build` | the three binaries compile statically for linux/amd64, linux/arm64 and darwin/arm64 | passes (compiled, not run, except darwin/arm64) |
 | `make tidy-check` | `go.mod` and `go.sum` are what `go mod tidy` writes | passes |
+| `make lint-files` | `actionlint` on the CI workflow (with `shellcheck` on the scripts inside it), `shellcheck` on `scripts/*.sh`, `hadolint` on the `Dockerfile`, and JSON-schema validation of the workflow (GitHub's schema) and of all four Compose files (the Compose specification) | passes. The first run found two `shellcheck` findings in the workflow's scripts (`ls` used to find a directory, an unused loop variable); both were fixed |
+| `make scan-secrets` (`gitleaks` 8.30.1) | every blob of every one of the 18 commits that existed when it ran (2.87 MB) | passes with the known false positives listed in `.gitleaksignore`. Without that file it reports 6: five README examples that pasted the development token of `config/dev.env` (a labeled throwaway; the examples now read it from the environment) and one line of an ASCII diagram. No real secret was found |
+| `go run ./scripts/notices` | `THIRD_PARTY_NOTICES.md` matches the dependencies the three released commands link on all three platforms (29 modules and the Go standard library, all MIT, BSD or Apache 2.0) | current; also enforced by `TestNoticesFileIsCurrent` |
 | `make vuln` (`govulncheck` v1.1.4) | known vulnerabilities in code the binaries call | passes with two accepted reports, both daemon-side bugs in `github.com/docker/docker` v27.5.1 that have no fixed version ([security-audit.md](security-audit.md#dependencies-and-toolchain)) |
 
 Repeated runs, for flakes, on the final tree: the whole `internal/integration` package eight times under `-race` (passed), and `TestCleanShutdownDeregistersNode` 300 times (passed; before it was fixed it failed in 2 of 60 runs and in 1 of 300, see below).
 
 Mutation checks, in which the protection under test was disabled, the test was seen to fail, and the protection was restored (done when each protection was written, on code that has not changed since): the agent's refusal of a lower epoch, the agent's refusal of a lower generation, the manager's grace for a store outage (end-to-end and unit), `FOR SHARE` in the epoch check on PostgreSQL, a route registered without authentication, and the Docker socket added to a Compose file.
+
+In the publication pass each new guard was broken on purpose and seen to fail: a wrong copyright holder and a dropped warranty clause in `LICENSE`; the README and the roadmap claiming there is no license (once in a form the first version of the check missed, which is why it was tightened); an image labeled with another license; the license left out of the Docker build context; an edited `THIRD_PARTY_NOTICES.md`; a token pasted into the README; a wildcard in `.gitleaksignore`; a local path in a document; and attribution wording in a document.
 
 ### What the end-to-end suite is, and is not
 
@@ -61,13 +67,15 @@ Mutation checks, in which the protection under test was disabled, the test was s
 | Metrics, dashboard, audit trail | **Partial** | `internal/metrics`, `internal/api`, `internal/dashboard`, `internal/manager` over real sockets; the fleet gauges are compared with what the API says | utilization is the reservation made by declared limits, not measured use; the dashboard has not been looked at in a browser and the metrics have not been scraped by a Prometheus |
 | High availability: leader election, fencing epochs, followers, leadership events | **Verified** with one etcd member | `internal/election`, `internal/etcd` against the fake and a real etcd, the store's epoch checks on PostgreSQL, `internal/integration` and `internal/e2e` (crash, handoff, etcd outage, a replaced control plane ignored by agents) | a multi-member etcd, delay and loss between components, clock skew, TLS to a non-loopback etcd: **unverified** |
 | Credentials as files, health endpoints, the `healthcheck` subcommands | **Verified** | `internal/config`, `internal/healthcheck`, `internal/agent`, `cmd/agent`, and the binaries in `internal/e2e` | |
-| Container images (`Dockerfile`, `.dockerignore`) | **Unverified** | static tests only: the pins agree with the `Makefile` and `go.mod`, the stages run as a numeric non-root user and name the health check, no credential in `ENV` or `ARG` | the images have never been built or run |
-| Compose file for the manager | **Unverified** | it parses as YAML and a static test keeps its hardening | never run |
+| Container images (`Dockerfile`, `.dockerignore`) | **Unverified** | static checks only: `hadolint` passes; tests check that the pins agree with the `Makefile` and `go.mod`, the stages run as a numeric non-root user and name the health check, no credential is in `ENV` or `ARG`, and everything the Dockerfile copies is let through by `.dockerignore` (the license and the notices included) | the images have never been built or run |
+| Compose file for the manager | **Unverified** | it validates against the Compose specification schema and a static test keeps its hardening | never run |
 | systemd units | **Unverified** | a static test keeps their sandbox settings | never loaded, never checked with `systemd-analyze` |
-| CI workflow | **Unverified** | it parses as YAML and a test checks which jobs and steps it names and that actions are pinned | it has never run on GitHub Actions; the `docker`, `images`, `e2e` and `vulnerabilities` jobs have not run anywhere |
+| CI workflow | **Unverified** | `actionlint` (including `shellcheck` on its scripts) and GitHub's workflow schema pass, and a test checks which jobs and steps it names and that actions are pinned | it has never run on GitHub Actions; the `docker`, `images`, `e2e`, `files` and `vulnerabilities` jobs have not run anywhere |
 | Binaries on Linux | **Partial** | `make cross-build` compiles them for linux/amd64 and linux/arm64 | only darwin/arm64 binaries have been run |
 | Dependencies | **Verified** with exceptions | `make vuln` | two accepted reports (above) |
 | Scale and performance | **Unverified** | none | nothing has been measured above three nodes; there is no benchmark, load test or soak test, and no figure in these documents is a measurement |
+| License and third-party notices | **Verified** | `LICENSE` is the MIT text and was compared word for word with the SPDX reference text; `TestLicenseIsMITWithTheOwnersCopyright` and `TestEveryStatementAboutTheLicenseAgrees` keep it, the README and the image labels in agreement; `THIRD_PARTY_NOTICES.md` is generated from the build and checked by a test; a license outside the reviewed list (MIT, BSD, Apache 2.0, ISC) stops the generator | that the images carry `/licenses` is checked in the Dockerfile only: the images were never built |
+| Publication hygiene | **Verified** | the secret scan above; tests that no project text contains a local path or user name, wording that credits how the project was written, a pasted token, or a license other than MIT; a review of every tracked file for executables, symlinks, generated files, caches and large blobs (the largest is 41 KB; the only executable is `scripts/vuln-check.sh`) | the author and committer identity of the existing commits is a local agent account (`OpenCode Project Agent <opencode-agent@localhost>`), left as it is |
 | The documents | **Partial** | `deploy/docs_test.go` checks that every relative link and anchor resolves; `deploy/roadmap_test.go` checks the roadmap's numbering, order and arithmetic; the example configuration is loaded by the real configuration code | statements in prose are reviewed by hand, not tested |
 
 ## Known flakes and skips
@@ -75,6 +83,21 @@ Mutation checks, in which the protection under test was disabled, the test was s
 - `TestCleanShutdownDeregistersNode` waited for the manager to have a session, then stopped the agent at once. If the agent was stopped before the registration answer reached it, it did not know its session ID and could not deregister, and the test failed (2 of 60 runs, then 1 of 300). The test now waits for the agent itself to hold the session; the behavior of the product in that millisecond (the node looks alive until its TTL, then suspect) is harmless and listed in [failure-handling.md](failure-handling.md#limitations) and in the roadmap.
 - One etcd contract subtest is skipped against a real etcd by design (above).
 - No other test is skipped in any suite listed here. The PostgreSQL, etcd, Docker and end-to-end tests are behind build tags (`integration`, `etcdintegration`, `dockerintegration`, `e2e`), so a plain `go test ./...` does not compile them; the counts above for each of those suites are for runs with the tag and the server it needs. Without a server, a tagged test skips itself and says why.
+
+## What still cannot run here
+
+These are the checks that were written and could not be run in this environment, and the reason for each. They are the content of [ROADMAP.md](../ROADMAP.md) step 1.
+
+| Check | Why it cannot run here |
+| --- | --- |
+| `make test-docker`, `internal/integration` `TestServiceDeploymentAgainstDocker` (tag `dockerintegration`) | needs a Docker daemon; none is installed project-locally and the host's must not be used |
+| `make docker-build` and running the two images, the CI `images` job | the same |
+| The Compose file, run | the same |
+| The systemd units, loaded, and `systemd-analyze` | macOS has no systemd |
+| The binaries on Linux, and the CI workflow on GitHub Actions | no Linux host; the workflow runs only on GitHub, which this pass does not touch |
+| A multi-member etcd, network delay and loss, clock skew | not built; [ROADMAP.md](../ROADMAP.md) step 12 |
+| Anything above three nodes, soak and load tests | not built; step 11 |
+| Signing releases | no signing credentials exist, and none were looked for; step 14 |
 
 ## Reproducing the checks
 
@@ -86,6 +109,9 @@ make test-integration              # PostgreSQL suites (needs `make compose-up`,
 make test-etcd                     # real etcd (needs `make etcd-test-up`, or DOCKFLEET_TEST_ETCD_ENDPOINTS)
 make test-e2e                      # real binaries; starts PostgreSQL and etcd from .tools/ unless told otherwise
 make cross-build tidy-check vuln
+make tools-lint                    # once: the pinned file linters and the secret scanner
+make lint-files scan-secrets       # the workflow, script, Dockerfile and Compose checks; gitleaks over every commit
+go run ./scripts/notices           # fails if THIRD_PARTY_NOTICES.md is out of date (`make notices` rewrites it)
 # Not run here, and needing a Docker daemon (ROADMAP.md step 1):
 make docker-test-up && DOCKFLEET_TEST_DOCKER_HOST=tcp://127.0.0.1:21297 make test-docker
 make docker-build

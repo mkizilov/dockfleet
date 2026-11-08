@@ -13,7 +13,8 @@
 # Both images contain one static binary and nothing else: no shell, no package
 # manager, no curl. They run as an unprivileged user with a read-only root
 # filesystem in the examples under deploy/examples. HEALTHCHECK is the binary
-# asking itself (`<binary> healthcheck`), so the image needs no other tool.
+# asking itself (`<binary> healthcheck`), so the image needs no other tool. Each image carries
+# the project's LICENSE and the licenses of the third-party code in the binary under /licenses.
 
 ARG GO_VERSION=1.26.10
 ARG BUF_VERSION=v1.47.2
@@ -58,6 +59,7 @@ RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
 
 FROM ${RUNTIME_IMAGE} AS manager
 COPY --from=build /out/dockfleet-manager /usr/local/bin/dockfleet-manager
+COPY LICENSE THIRD_PARTY_NOTICES.md /licenses/
 LABEL org.opencontainers.image.title="dockfleet-manager" \
       org.opencontainers.image.description="DockFleet control plane: admin API and agent gRPC service" \
       org.opencontainers.image.source="https://github.com/dockfleet/dockfleet" \
@@ -79,6 +81,7 @@ ENTRYPOINT ["/usr/local/bin/dockfleet-manager"]
 
 FROM ${RUNTIME_IMAGE} AS agent
 COPY --from=build /out/dockfleet-agent /usr/local/bin/dockfleet-agent
+COPY LICENSE THIRD_PARTY_NOTICES.md /licenses/
 LABEL org.opencontainers.image.title="dockfleet-agent" \
       org.opencontainers.image.description="DockFleet worker agent: runs the containers the manager assigns to this node" \
       org.opencontainers.image.source="https://github.com/dockfleet/dockfleet" \

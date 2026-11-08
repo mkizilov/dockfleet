@@ -1,0 +1,13 @@
+# Findings in the history of this repository that are known not to be secrets.
+# Git history is kept as it is, so these stay reported by `gitleaks git` and are listed here by their
+# exact fingerprint (commit:file:rule:line); nothing broader is ignored.
+#
+# curl-auth-header: the README's quick-start examples pasted the development token of config/dev.env,
+#   a labeled throwaway that protects nothing. The examples now read it from the environment.
+# generic-api-key: a line of an ASCII architecture diagram in docs/architecture.md.
+3e54919761e3ef8871716902d2c0141058754a5c:README.md:curl-auth-header:73
+7891ccfaeb5716a14a63345c93b5876117439b8e:README.md:curl-auth-header:68
+7891ccfaeb5716a14a63345c93b5876117439b8e:README.md:curl-auth-header:71
+9494ebe51708fed4c978d7ee518a147fe5b3ba73:README.md:curl-auth-header:56
+9494ebe51708fed4c978d7ee518a147fe5b3ba73:README.md:curl-auth-header:58
+9494ebe51708fed4c978d7ee518a147fe5b3ba73:docs/architecture.md:generic-api-key:14

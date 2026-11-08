@@ -3,6 +3,7 @@ name: ci
 # Every kind of check the repository has is a job here:
 #
 #   lint             formatting, vet, secrets, go.mod, protobuf lint
+#   files            linters for the workflow, shell scripts, Dockerfile and Compose files, and a secret scan of every commit
 #   unit             unit tests with the race detector, on Linux and macOS
 #   cross-build      the released platforms compile (static binaries)
 #   integration      PostgreSQL: store, API, scheduling, reconciliation, multi-manager
@@ -49,6 +50,23 @@ jobs:
         run: make vet
       - name: No key material in the repository
         run: make check-secrets
+
+  files:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the secret scan reads every commit
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: make tools-lint
+      - name: Lint the workflow, the shell scripts, the Dockerfile and the Compose files
+        run: make lint-files
+      - name: No secrets in any commit
+        run: make scan-secrets
 
   unit:
     strategy:
@@ -150,7 +168,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends postgresql etcd-server
-          echo "DOCKFLEET_E2E_POSTGRES_BIN=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)/postgres" >> "$GITHUB_ENV"
+          postgres_bin=$(find /usr/lib/postgresql -path '*/bin/postgres' | sort -V | tail -1)
+          test -x "${postgres_bin}"
+          echo "DOCKFLEET_E2E_POSTGRES_BIN=${postgres_bin}" >> "$GITHUB_ENV"
           echo "DOCKFLEET_E2E_ETCD_BIN=$(command -v etcd)" >> "$GITHUB_ENV"
       - name: End-to-end tests
         run: make test-e2e
@@ -200,7 +220,7 @@ jobs:
             -e DOCKFLEET_AGENT_TOKEN=ci-agent-token-0123456789 \
             --read-only --cap-drop ALL --security-opt no-new-privileges:true \
             dockfleet-manager:ci
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             status=$(docker inspect --format '{{.State.Health.Status}}' manager-smoke)
             [ "${status}" = healthy ] && break
             sleep 2

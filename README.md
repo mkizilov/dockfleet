@@ -10,11 +10,11 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 > | Mutual TLS, node enrollment, credentials as files, health checks | Implemented and **verified** |
 > | High availability (etcd leader election, fencing epochs) | Implemented; **verified** with one etcd member; multi-member etcd and network faults are unverified |
 > | Docker Engine adapter and its hardening policy | Implemented; the request it sends is verified, but it has **never run against a real Docker daemon** |
-> | Container images, Compose file, systemd units, CI workflow | Written and statically checked; **unverified** (never built, loaded or run) |
+> | Container images, Compose file, systemd units, CI workflow | Written and statically checked (the workflow, Dockerfile and Compose files pass their linters and schemas); **unverified** (never built, loaded or run) |
 > | CPU and memory use | **Partial**: declared and reserved, not measured |
 > | Scale | **Unverified**: nothing has been run above three nodes |
 >
-> Everything ran on macOS (darwin/arm64); the Linux binaries are cross-compiled but not run. No license file has been added yet. See [Limitations](#limitations).
+> Everything ran on macOS (darwin/arm64); the Linux binaries are cross-compiled but not run. DockFleet is released under the [MIT License](#license). See [Limitations](#limitations).
 
 ## Layout
 
@@ -49,6 +49,8 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 | `internal/logging`   | Structured logging (`log/slog`, JSON or text)                           |
 | `proto/`             | Protobuf definitions (`buf` module)                                     |
 | `Dockerfile`         | Two images, `manager` and `agent` targets: one static binary each, non-root, with a built-in health check ([docs/deployment.md](docs/deployment.md)) |
+| `LICENSE`, `THIRD_PARTY_NOTICES.md` | The MIT license, and the licenses of the third-party code in the binaries (generated from the build by `make notices`) |
+| `scripts/`           | `vuln-check.sh` (the vulnerability gate) and `notices/` (generates the third-party notices) |
 | `deploy/`            | Docker Compose files: development PostgreSQL, a disposable Docker daemon and a disposable etcd for tests; `deploy/examples/` holds example manager and worker configuration, Compose files and systemd units |
 | `config/dev.env`     | Development-only configuration                                          |
 | `docs/`              | [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), [Mutual TLS and enrollment](docs/mtls.md), [Docker adapter](docs/docker.md), [Control-plane state](docs/state.md), [Services API](docs/api.md), [Scheduler](docs/scheduler.md), [Reconciliation](docs/reconciliation.md), [Failure handling](docs/failure-handling.md), [Rolling deployments](docs/rollouts.md), [Container logs](docs/logs.md), [Metrics, dashboard and audit trail](docs/observability.md), [High availability](docs/high-availability.md), [Deployment guide](docs/deployment.md), [Credentials](docs/credentials.md), [Security audit](docs/security-audit.md), [Limitations and differences from Kubernetes](docs/limitations.md), [Verification status](docs/verification.md); the plan for what comes next is [ROADMAP.md](ROADMAP.md) |
@@ -78,22 +80,25 @@ make run-agent      # in another terminal
 
 No Docker? `make run-manager-memory` uses the in-memory store instead of PostgreSQL.
 
-Try the API (development token from `config/dev.env`):
+Try the API. The development token is in `config/dev.env` (a labeled throwaway; never reuse it); load it into your shell instead of pasting it:
 
 ```sh
-curl -s -H 'Authorization: Bearer dev-api-token-0123456789' http://127.0.0.1:21280/v1/nodes
+set -a; . config/dev.env; set +a        # DOCKFLEET_API_TOKEN and the development addresses
+AUTH="Authorization: Bearer $DOCKFLEET_API_TOKEN"
 
-curl -s -X POST -H 'Authorization: Bearer dev-api-token-0123456789' \
+curl -s -H "$AUTH" http://127.0.0.1:21280/v1/nodes
+
+curl -s -X POST -H "$AUTH" \
   -d '{"name":"web","image":"nginx:1.27","cpu_millis":500,"memory_bytes":134217728}' \
   http://127.0.0.1:21280/v1/workloads
 
 # Describe a service (desired state). Within a few seconds the scheduler assigns its replicas
 # to nodes, the agents start the containers, and `status` shows where each replica is, whether
 # its node acknowledged the instruction, what it reports, or why a replica could not be placed
-curl -s -X POST -H 'Authorization: Bearer dev-api-token-0123456789' \
+curl -s -X POST -H "$AUTH" \
   -d '{"name":"site","replicas":3,"spec":{"image":"nginx:1.27","cpu_millis":500,"memory_bytes":134217728,"ports":[{"container_port":80}]}}' \
   http://127.0.0.1:21280/v1/services
-curl -s -H 'Authorization: Bearer dev-api-token-0123456789' http://127.0.0.1:21280/v1/services/site
+curl -s -H "$AUTH" http://127.0.0.1:21280/v1/services/site
 ```
 
 Stop either process with Ctrl-C or `SIGTERM`; both drain and exit with status 0. `make compose-down` stops the database.
@@ -227,6 +232,10 @@ make test-e2e           # the real binaries over mutual TLS with PostgreSQL and 
 make cross-build        # the released platforms compile (static)
 make docker-build       # the two images; needs a Docker daemon
 make vuln               # govulncheck; needs network
+make tools-lint         # installs the pinned file linters and the secret scanner (actionlint, gitleaks, shellcheck, hadolint, check-jsonschema); needs network
+make lint-files         # lints the CI workflow, the shell scripts, the Dockerfile and the Compose files
+make scan-secrets       # scans every committed revision for secrets
+make notices            # regenerates THIRD_PARTY_NOTICES.md (a test fails when it is out of date)
 make test-etcd          # the election client and the managers' election against a real etcd; needs DOCKFLEET_TEST_ETCD_ENDPOINTS (`make etcd-test-up` starts a disposable etcd on 127.0.0.1:21234)
 make test-docker        # Docker Engine tests: the adapter and a service deployment; needs DOCKFLEET_TEST_DOCKER_HOST (`make docker-test-up` starts a disposable daemon on 127.0.0.1:21297)
 ```
@@ -262,4 +271,6 @@ Generated protobuf code is not committed, so run `make generate` after a fresh c
 
 ## License
 
-No license has been chosen yet.
+DockFleet is released under the [MIT License](LICENSE), copyright 2026 Mykyta Kizilov.
+
+The binaries and container images also contain third-party software under its own licenses (BSD, MIT and Apache 2.0). Their notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), which is generated from the build (`make notices`) and checked by a test, and both images carry it, with the license, under `/licenses`.
