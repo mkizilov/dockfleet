@@ -68,23 +68,51 @@ func (j *Journal) Index(want string) int {
 	return -1
 }
 
+// ImageBehavior changes what containers made from an image do once they are
+// started: an image that crashes on start, or whose health check does not pass.
+type ImageBehavior struct {
+	// ExitCode, when not zero, makes the container exit with it as soon as it is
+	// started, every time it is started.
+	ExitCode int
+	// Health, when not empty, is the result of the health check of such a
+	// container ("starting", "healthy" or "unhealthy"). It applies to containers
+	// that have a check.
+	Health string
+}
+
 // Fake is an in-memory Docker Engine for one node.
 type Fake struct {
 	nodeID  string
 	policy  *docker.Policy
 	journal *Journal
 
-	mu       sync.Mutex
-	entries  []*entry
-	images   map[string]bool
-	seq      int
-	calls    []string
-	failures map[string][]error
+	mu        sync.Mutex
+	entries   []*entry
+	images    map[string]bool
+	seq       int
+	calls     []string
+	failures  map[string][]error
+	behaviors map[string]ImageBehavior
 }
 
 // New returns an engine for the node with no images and no containers.
 func New(nodeID string) *Fake {
-	return &Fake{nodeID: nodeID, policy: docker.DefaultPolicy(), images: map[string]bool{}, failures: map[string][]error{}}
+	return &Fake{
+		nodeID: nodeID, policy: docker.DefaultPolicy(), images: map[string]bool{}, failures: map[string][]error{},
+		behaviors: map[string]ImageBehavior{},
+	}
+}
+
+// SetImageBehavior makes containers started from the image behave as b says.
+// It takes effect at their next start; the zero value restores the default.
+func (f *Fake) SetImageBehavior(ref string, b ImageBehavior) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if b == (ImageBehavior{}) {
+		delete(f.behaviors, ref)
+		return
+	}
+	f.behaviors[ref] = b
 }
 
 // WithJournal makes the engine record its changes in j as well.
@@ -338,6 +366,14 @@ func (f *Fake) Start(_ context.Context, workloadID string) error {
 	e.Health = ""
 	if e.spec.HealthCheck != nil {
 		e.Health = docker.HealthHealthy
+	}
+	if b, ok := f.behaviors[e.Image]; ok {
+		if b.ExitCode != 0 {
+			e.State, e.ExitCode = docker.StateExited, b.ExitCode
+		}
+		if b.Health != "" && e.spec.HealthCheck != nil {
+			e.Health = b.Health
+		}
 	}
 	return nil
 }

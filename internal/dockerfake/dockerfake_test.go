@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/dockfleet/dockfleet/internal/docker"
 )
@@ -130,5 +131,67 @@ func TestFailuresCrashesAndPing(t *testing.T) {
 	f.OOMKill("w1")
 	if st, _ := f.Inspect(ctx, "w1"); !st.OOMKilled || st.ExitCode != 137 {
 		t.Fatalf("after an OOM kill: %+v", st)
+	}
+}
+
+// An image can be made to crash on start, or to fail its health check, which is
+// how tests give a rollout replacements that do not work.
+func TestImageBehavior(t *testing.T) {
+	ctx := context.Background()
+	f := New("node-1")
+	f.AddImage("good:1")
+	f.AddImage("bad:1")
+	f.SetImageBehavior("bad:1", ImageBehavior{ExitCode: 3})
+	f.AddImage("sick:1")
+	f.SetImageBehavior("sick:1", ImageBehavior{Health: docker.HealthUnhealthy})
+
+	withImage := func(id, image string, check bool) docker.ContainerSpec {
+		s := spec(id)
+		s.Image = image
+		if check {
+			s.HealthCheck = &docker.HealthCheck{Command: []string{"true"}, Interval: time.Second, Timeout: time.Second, Retries: 1}
+		}
+		return s
+	}
+	for _, s := range []docker.ContainerSpec{
+		withImage("good", "good:1", true), withImage("bad", "bad:1", false), withImage("sick", "sick:1", true), withImage("sick-no-check", "sick:1", false),
+	} {
+		if _, err := f.Create(ctx, s); err != nil {
+			t.Fatalf("create %s: %v", s.WorkloadID, err)
+		}
+		if err := f.Start(ctx, s.WorkloadID); err != nil {
+			t.Fatalf("start %s: %v", s.WorkloadID, err)
+		}
+	}
+	want := map[string]struct {
+		running bool
+		exit    int
+		health  string
+	}{
+		"good":          {true, 0, docker.HealthHealthy},
+		"bad":           {false, 3, ""},
+		"sick":          {true, 0, docker.HealthUnhealthy},
+		"sick-no-check": {true, 0, ""},
+	}
+	for id, w := range want {
+		st, err := f.Inspect(ctx, id)
+		if err != nil || st.Running != w.running || st.ExitCode != w.exit || st.Health != w.health {
+			t.Errorf("%s = %+v, %v; want running %v, exit %d, health %q", id, st, err, w.running, w.exit, w.health)
+		}
+	}
+	// It applies at every start, not only the first.
+	if err := f.Start(ctx, "bad"); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := f.Inspect(ctx, "bad"); st.Running || st.ExitCode != 3 {
+		t.Fatalf("a second start of a crashing image = %+v", st)
+	}
+	// Clearing it restores the default for the next start.
+	f.SetImageBehavior("bad:1", ImageBehavior{})
+	if err := f.Start(ctx, "bad"); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := f.Inspect(ctx, "bad"); !st.Running {
+		t.Fatalf("after clearing the behavior = %+v", st)
 	}
 }

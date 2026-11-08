@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/dockfleet/dockfleet/internal/rollout"
 	"github.com/dockfleet/dockfleet/internal/scheduler"
 	"github.com/dockfleet/dockfleet/internal/store"
 )
@@ -59,6 +60,9 @@ type Report struct {
 	Deleted int
 	// NodeChanges is how many nodes changed health state.
 	NodeChanges int
+	// Rollouts is how many rollout records were written: a rollout began,
+	// made progress, completed, failed or was overtaken.
+	Rollouts int
 }
 
 // nodeEvent names a node's new health state in the audit trail.
@@ -94,6 +98,85 @@ func (r *Reconciler) event(at time.Time, action string, a Action, message string
 		e.Details["why"] = a.Why
 	}
 	return e
+}
+
+func (r *Reconciler) rolloutEvent(at time.Time, svc store.Service, rec store.Rollout, action string) store.Event {
+	details := map[string]string{"revision": strconv.Itoa(rec.Revision), "state": rec.State}
+	if rec.Reason != "" {
+		details["reason"] = rec.Reason
+	}
+	message := fmt.Sprintf("revision %d of %s: %s", rec.Revision, svc.Name, rec.State)
+	if rec.Message != "" {
+		message += ": " + rec.Message
+	}
+	return store.Event{
+		At: at, InstanceID: r.cfg.InstanceID, Actor: Actor, Action: action,
+		ResourceType: "service", ResourceID: svc.ID, Message: message, Details: details,
+	}
+}
+
+// trackRollouts keeps the record of how far each service's rollout has come:
+// it starts one for a revision that has none, notes progress, reports a rollout
+// that has made none for longer than its deadline (or that has recovered, or
+// completed), and closes the records of revisions that were overtaken. It
+// returns how many records it wrote. Nothing here changes a workload.
+func (r *Reconciler) trackRollouts(ctx context.Context, tx store.Tx, defs []store.Definition, workloads []store.Workload,
+	waiting []store.Unschedulable, nodes map[string]string, now time.Time) (int, error) {
+	records, err := tx.ListRollouts(ctx, "")
+	if err != nil {
+		return 0, fmt.Errorf("list rollouts: %w", err)
+	}
+	recordsOf := map[string][]store.Rollout{}
+	for _, rec := range records {
+		recordsOf[rec.ServiceID] = append(recordsOf[rec.ServiceID], rec)
+	}
+	workloadsOf := map[string][]store.Workload{}
+	for _, w := range workloads {
+		if w.ServiceID != "" {
+			workloadsOf[w.ServiceID] = append(workloadsOf[w.ServiceID], w)
+		}
+	}
+
+	written := 0
+	save := func(svc store.Service, rec store.Rollout, event string) error {
+		if err := tx.SaveRollout(ctx, rec); err != nil {
+			return fmt.Errorf("save the rollout of revision %d of %s: %w", rec.Revision, svc.Name, err)
+		}
+		written++
+		if event == "" {
+			return nil
+		}
+		_, err := tx.AppendEvent(ctx, r.rolloutEvent(now, svc, rec, event))
+		return err
+	}
+	for _, d := range defs {
+		svc := d.Service
+		var current *store.Rollout
+		for _, rec := range recordsOf[svc.ID] {
+			if rec.Revision == svc.CurrentRevision && svc.DeletedAt == nil {
+				kept := rec
+				current = &kept
+				continue
+			}
+			// Another revision has overtaken this one, or the service is gone.
+			if closed, ok := rollout.Supersede(rec, now); ok {
+				if err := save(svc, closed, rollout.EventSuperseded); err != nil {
+					return 0, err
+				}
+			}
+		}
+		if svc.DeletedAt != nil {
+			continue
+		}
+		facts := rollout.Assess(d, workloadsOf[svc.ID], waiting, nodes)
+		next, event := rollout.Advance(current, facts, svc.Rollout, svc.Paused, now)
+		if current == nil || !next.Same(*current) {
+			if err := save(svc, next, event); err != nil {
+				return 0, err
+			}
+		}
+	}
+	return written, nil
 }
 
 // RunOnce makes one pass in a single transaction under the placement lock, so
@@ -134,7 +217,8 @@ func (r *Reconciler) RunOnce(ctx context.Context) (Report, error) {
 			}
 			report.NodeChanges++
 		}
-		for _, a := range Plan(defs, workloads, waiting, r.cfg.Timing.States(nodes, now)) {
+		states := r.cfg.Timing.States(nodes, now)
+		for _, a := range Plan(defs, workloads, states) {
 			w := a.Workload
 			label := fmt.Sprintf("%s (revision %d, replica %d)", w.Name, w.ServiceRevision, w.ReplicaIndex)
 			switch a.Kind {
@@ -172,6 +256,11 @@ func (r *Reconciler) RunOnce(ctx context.Context) (Report, error) {
 				report.Deleted++
 			}
 		}
+		changed, err := r.trackRollouts(ctx, tx, defs, workloads, waiting, states, now)
+		if err != nil {
+			return err
+		}
+		report.Rollouts = changed
 		return nil
 	})
 	if err != nil {

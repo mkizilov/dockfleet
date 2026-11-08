@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/dockfleet/dockfleet/internal/store"
@@ -23,6 +24,10 @@ type serviceView struct {
 	Revision int               `json:"revision"`
 	Spec     store.ServiceSpec `json:"spec"`
 
+	// Rollout is how a change of spec replaces the running replicas. Changing it
+	// starts no deployment.
+	Rollout store.RolloutPolicy `json:"rollout"`
+
 	// Version changes with every modification and is the ETag.
 	Version int64 `json:"version"`
 
@@ -38,7 +43,7 @@ type serviceView struct {
 func newServiceView(svc store.Service, spec store.ServiceSpec, status serviceStatus) serviceView {
 	return serviceView{
 		ID: svc.ID, Name: svc.Name, Replicas: svc.Replicas, Revision: svc.CurrentRevision, Version: svc.Version,
-		Spec: spec, Status: status, CreatedAt: svc.CreatedAt, UpdatedAt: svc.UpdatedAt, DeletedAt: svc.DeletedAt,
+		Spec: spec, Rollout: svc.Rollout, Status: status, CreatedAt: svc.CreatedAt, UpdatedAt: svc.UpdatedAt, DeletedAt: svc.DeletedAt,
 	}
 }
 
@@ -86,10 +91,37 @@ func readIfMatch(w http.ResponseWriter, r *http.Request) (version int64, ok bool
 	return version, ok
 }
 
+// requestError is a refusal with its own status and words, for the cases a
+// store error does not describe: a rollback with nothing to go back to, a
+// revision that does not exist, a rollout policy that cannot be used.
+type requestError struct {
+	status  int
+	message string
+	// problems, when set, are reported as the details of a 400.
+	problems problems
+}
+
+func (e requestError) Error() string { return e.message }
+
+// badRollout is the refusal of a rollout policy that parses but cannot be used
+// once it is merged with the one the service has.
+func badRollout(err error) requestError {
+	message := strings.TrimPrefix(err.Error(), store.ErrInvalid.Error()+": ")
+	return requestError{
+		status: http.StatusBadRequest, message: "invalid service definition",
+		problems: problems{{Field: "rollout", Message: message}},
+	}
+}
+
 // failService answers a failed service operation. precondition is whether the
 // client sent an If-Match, which decides how a lost race is reported.
 func (s *server) failService(w http.ResponseWriter, r *http.Request, err error, precondition bool) {
+	var refusal requestError
 	switch {
+	case errors.As(err, &refusal) && refusal.problems != nil:
+		writeJSON(w, refusal.status, map[string]any{"error": refusal.message, "details": refusal.problems})
+	case errors.As(err, &refusal):
+		writeError(w, refusal.status, refusal.message)
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "service not found")
 	case errors.Is(err, store.ErrConflict):
@@ -108,12 +140,17 @@ func (s *server) createService(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	policy := in.rollout.apply(store.DefaultRolloutPolicy())
+	if err := policy.Validate(); err != nil {
+		s.failService(w, r, badRollout(err), false)
+		return
+	}
 	id, now := store.NewID(), s.now().UTC()
 	var svc store.Service
 	err := s.store.InTx(r.Context(), func(tx store.Tx) error {
 		var err error
 		svc, err = tx.CreateService(r.Context(), store.NewService{
-			ID: id, Name: in.name, Replicas: in.replicas, Spec: in.spec, CreatedBy: adminActor, At: now,
+			ID: id, Name: in.name, Replicas: in.replicas, Spec: in.spec, Rollout: policy, CreatedBy: adminActor, At: now,
 		})
 		if err != nil {
 			return err
@@ -150,11 +187,7 @@ func (s *server) listServices(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, err)
 		return
 	}
-	services := make([]store.Service, 0, len(defs))
-	for _, d := range defs {
-		services = append(services, d.Service)
-	}
-	statuses, err := s.statusesOf(r.Context(), services)
+	statuses, err := s.statusesOf(r.Context(), defs)
 	if err != nil {
 		s.internalError(w, r, err)
 		return
@@ -216,6 +249,28 @@ func (s *server) updateService(w http.ResponseWriter, r *http.Request) {
 			return store.ErrVersionConflict
 		}
 		now, expected := s.now().UTC(), want
+
+		if in.rollout != nil {
+			next := in.rollout.apply(svc.Rollout)
+			if err := next.Validate(); err != nil {
+				return badRollout(err)
+			}
+			svc, err = tx.SetRollout(ctx, svc.ID, next, svc.Paused, expected, now)
+			switch {
+			case errors.Is(err, store.ErrUnchanged):
+			case err != nil:
+				return err
+			default:
+				expected = svc.Version
+				_, err = tx.AppendEvent(ctx, s.event("service.rollout_configured", "service", svc.ID, "", map[string]string{
+					"name": svc.Name, "max_unavailable": strconv.Itoa(next.MaxUnavailable), "max_surge": strconv.Itoa(next.MaxSurge),
+					"progress_deadline_seconds": strconv.Itoa(next.ProgressDeadlineSeconds),
+				}))
+				if err != nil {
+					return err
+				}
+			}
+		}
 
 		if cur.SpecHash != in.spec.Hash() {
 			var rev store.Revision

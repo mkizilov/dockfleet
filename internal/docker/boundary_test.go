@@ -67,7 +67,7 @@ func isDockerPackage(path string) bool {
 // talks to its local Docker Engine.
 func TestManagerSideNeverImportsDocker(t *testing.T) {
 	root := filepath.Join("..", "..")
-	for _, entry := range []string{"cmd/manager", "internal/manager", "internal/api", "internal/registry", "internal/store", "internal/scheduler", "internal/placement", "internal/reconcile", "internal/protocol"} {
+	for _, entry := range []string{"cmd/manager", "internal/manager", "internal/api", "internal/registry", "internal/store", "internal/scheduler", "internal/placement", "internal/reconcile", "internal/rollout", "internal/protocol"} {
 		for path, chain := range importChains(t, root, filepath.Join(root, filepath.FromSlash(entry))) {
 			if isDockerPackage(path) {
 				t.Errorf("%s imports %s (via %s): the manager side must not depend on Docker", entry, path, strings.Join(chain, " -> "))

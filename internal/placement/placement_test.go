@@ -153,6 +153,9 @@ var placementTests = []placementTest{
 	{"scaling up places only the new replicas", eachStore(testScalingUp)},
 	{"scaling down removes nothing", eachStore(testScalingDownRemovesNothing)},
 	{"scaling up fills the lowest free slots", eachStore(testScalingFillsTheLowestFreeSlots)},
+	{"a rollout creates only the replicas the surge allows", eachStore(testRolloutCreatesWhatTheSurgeAllows)},
+	{"a paused rollout creates no replica", eachStore(testPausedRolloutCreatesNothing)},
+	{"replicas that already run the current spec are not created again", eachStore(testRollbackReplicasCountAsCurrent)},
 	{"unschedulable replicas are explained once", eachStore(testUnschedulableAreExplained)},
 	{"offline and revoked nodes get nothing", eachStore(testUnavailableNodes)},
 	{"host port conflicts", eachStore(testHostPorts)},
@@ -577,8 +580,8 @@ func testNewRevision(t *testing.T, e *env) {
 	_, _, err := e.st.DeployService(e.ctx(), svc.ID, store.Deployment{Spec: v2, CreatedBy: "test", At: t0})
 	e.must(err)
 	report := e.run()
-	// 800m of the node's 1000m are held by revision 1, so only one revision-2 replica fits.
-	if report.Placed != 0 || report.Unschedulable != 2 {
+	// The surge allows one extra replica, and the 800m of the node's 1000m that revision 1 holds leave it no room.
+	if report.Placed != 0 || report.Unschedulable != 1 {
 		t.Fatalf("report = %+v", report)
 	}
 	for _, u := range e.waiting("web") {
@@ -959,5 +962,149 @@ func testRunLoop(t *testing.T, newStore func(t *testing.T) store.Store) {
 	case <-finished:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run with a zero interval must return immediately")
+	}
+}
+
+// revisionReplicas counts the replicas of a service that are meant to run and
+// were created for revision rev.
+func (e *env) revisionReplicas(serviceID string, rev int) int {
+	e.t.Helper()
+	ws, err := e.st.ListWorkloadsForService(e.ctx(), serviceID)
+	e.must(err)
+	n := 0
+	for _, w := range ws {
+		if w.ServiceRevision == rev && w.DesiredState == store.DesiredRunning {
+			n++
+		}
+	}
+	return n
+}
+
+func (e *env) deployImage(svc store.Service, image string, cpu int64) {
+	e.t.Helper()
+	s := spec(cpu)
+	s.Image = image
+	_, _, err := e.st.DeployService(e.ctx(), svc.ID, store.Deployment{Spec: s, CreatedBy: "test", At: t0})
+	e.must(err)
+}
+
+func (e *env) setRollout(svc store.Service, unavailable, surge int, paused bool) {
+	e.t.Helper()
+	p := store.RolloutPolicy{MaxUnavailable: unavailable, MaxSurge: surge, ProgressDeadlineSeconds: 600}
+	if _, err := e.st.SetRollout(e.ctx(), svc.ID, p, paused, 0, t0); err != nil && !errors.Is(err, store.ErrUnchanged) {
+		e.t.Fatal(err)
+	}
+}
+
+// retireOne stops one replica that was created for revision rev, as the reconciler would.
+func (e *env) retireOne(serviceID string, rev int) {
+	e.t.Helper()
+	ws, err := e.st.ListWorkloadsForService(e.ctx(), serviceID)
+	e.must(err)
+	for _, w := range ws {
+		if w.ServiceRevision == rev && w.DesiredState == store.DesiredRunning {
+			_, err := e.st.SetWorkloadDesiredState(e.ctx(), w.ID, store.DesiredStopped, e.clock)
+			e.must(err)
+			return
+		}
+	}
+	e.t.Fatalf("no running replica of revision %d to retire", rev)
+}
+
+// A rolling update creates the replicas of the new spec as far as max_surge
+// allows and no further, however often the scheduler passes; retiring an old
+// replica makes room for the next one.
+func testRolloutCreatesWhatTheSurgeAllows(t *testing.T, e *env) {
+	e.node("n1", 8000, 8*gib)
+	svc := e.service("web", 3, spec(400))
+	e.run()
+	e.deployImage(svc, "nginx:1.28", 400)
+
+	// The default policy allows one extra replica.
+	if report := e.run(); report.Placed != 1 {
+		t.Fatalf("first pass = %+v, want one replica of the new spec", report)
+	}
+	for i := 0; i < 3; i++ {
+		if report := e.run(); report.Placed != 0 {
+			t.Fatalf("pass %d = %+v; the surge is used up", i+2, report)
+		}
+	}
+	if got := e.revisionReplicas(svc.ID, 2); got != 1 {
+		t.Fatalf("%d replicas of revision 2, want 1", got)
+	}
+
+	// Retiring an old replica makes room for the next one.
+	e.retireOne(svc.ID, 1)
+	if report := e.run(); report.Placed != 1 || e.revisionReplicas(svc.ID, 2) != 2 {
+		t.Fatalf("pass after a retirement = %+v, %d new replicas", report, e.revisionReplicas(svc.ID, 2))
+	}
+
+	// A larger surge: the rest is created at once, but not beyond what is missing.
+	e.setRollout(svc, 0, 3, false)
+	if report := e.run(); report.Placed != 1 || e.revisionReplicas(svc.ID, 2) != 3 {
+		t.Fatalf("pass with a larger surge = %+v, %d new replicas; only one is missing", report, e.revisionReplicas(svc.ID, 2))
+	}
+
+	// Without a surge a replica is created only after an old one has gone.
+	api := e.service("api", 2, spec(400))
+	e.run()
+	e.setRollout(api, 1, 0, false)
+	e.deployImage(api, "nginx:1.28", 400)
+	for i := 0; i < 2; i++ {
+		if report := e.run(); report.Placed != 0 {
+			t.Fatalf("pass %d without a surge = %+v", i+1, report)
+		}
+	}
+	e.retireOne(api.ID, 1)
+	if report := e.run(); report.Placed != 1 {
+		t.Fatalf("pass after the retirement = %+v", report)
+	}
+}
+
+// A paused rollout adds no replica of the new spec. A service that has none yet
+// still gets its first replicas: that is not a rollout.
+func testPausedRolloutCreatesNothing(t *testing.T, e *env) {
+	e.node("n1", 8000, 8*gib)
+	svc := e.service("web", 2, spec(400))
+	e.run()
+	e.setRollout(svc, 0, 1, true)
+	e.deployImage(svc, "nginx:1.28", 400)
+	for i := 0; i < 3; i++ {
+		if report := e.run(); report != (Report{}) {
+			t.Fatalf("pass %d = %+v; a paused rollout takes no step", i+1, report)
+		}
+	}
+	if got := e.revisionReplicas(svc.ID, 2); got != 0 {
+		t.Fatalf("%d replicas of the new spec while paused", got)
+	}
+	e.setRollout(svc, 0, 1, false)
+	if report := e.run(); report.Placed != 1 {
+		t.Fatalf("pass after the resume = %+v", report)
+	}
+
+	fresh := e.service("fresh", 2, spec(400))
+	e.setRollout(fresh, 0, 1, true)
+	if report := e.run(); report.Placed != 2 {
+		t.Fatalf("a paused service with no replicas yet = %+v, want its two replicas", report)
+	}
+}
+
+// A rollback deploys an old spec as a new revision. Replicas that still run it
+// are the replicas wanted: none is created for the new revision.
+func testRollbackReplicasCountAsCurrent(t *testing.T, e *env) {
+	e.node("n1", 8000, 8*gib)
+	svc := e.service("web", 3, spec(400))
+	e.run()
+	e.deployImage(svc, "nginx:1.28", 400)
+	if report := e.run(); report.Placed != 1 {
+		t.Fatalf("pass = %+v, want the surge replica of revision 2", report)
+	}
+
+	e.deployImage(svc, "nginx:1.27", 400) // revision 3 has revision 1's spec
+	if report := e.run(); report != (Report{}) {
+		t.Fatalf("pass after the rollback = %+v; the three replicas of revision 1 are the ones wanted", report)
+	}
+	if got := e.revisionReplicas(svc.ID, 3); got != 0 {
+		t.Fatalf("%d replicas were created for the rollback", got)
 	}
 }

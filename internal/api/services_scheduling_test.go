@@ -293,9 +293,10 @@ func testServiceStatusAcrossRevisionsScalingAndDeletion(t *testing.T, e *service
 	e.create(webService(2, 500))
 	e.schedule()
 
-	// A new revision is a new set of replicas; the old ones are not removed by scheduling.
+	// A new revision is a new set of replicas, created one extra at a time (the default surge);
+	// the old ones are not removed by scheduling.
 	put(e, "web", webUpdate("nginx:1.28", 2, 500))
-	if report := e.schedule(); report.Placed != 2 {
+	if report := e.schedule(); report.Placed != 1 {
 		t.Fatalf("report = %+v", report)
 	}
 	st := e.get("web").Status
@@ -303,7 +304,7 @@ func testServiceStatusAcrossRevisionsScalingAndDeletion(t *testing.T, e *service
 	for _, r := range st.Replicas {
 		seen = append(seen, [2]int{r.Revision, r.Index})
 	}
-	if st.ScheduledReplicas != 2 || !reflect.DeepEqual(seen, [][2]int{{1, 1}, {1, 2}, {2, 1}, {2, 2}}) {
+	if st.ScheduledReplicas != 1 || !reflect.DeepEqual(seen, [][2]int{{1, 1}, {1, 2}, {2, 1}}) {
 		t.Fatalf("status = %+v, replicas %v; the old revision's replicas are listed and only the current revision counts", st, seen)
 	}
 	if v := e.get("web"); v.Status.Replicas[2].WorkloadName == v.Status.Replicas[0].WorkloadName {
@@ -316,7 +317,7 @@ func testServiceStatusAcrossRevisionsScalingAndDeletion(t *testing.T, e *service
 		t.Fatalf("report = %+v", report)
 	}
 	st = e.get("web").Status
-	if st.DesiredReplicas != 1 || st.ScheduledReplicas != 1 || len(st.Replicas) != 4 {
+	if st.DesiredReplicas != 1 || st.ScheduledReplicas != 1 || len(st.Replicas) != 3 {
 		t.Fatalf("status after scaling down = %+v", st)
 	}
 
@@ -330,7 +331,7 @@ func testServiceStatusAcrossRevisionsScalingAndDeletion(t *testing.T, e *service
 		Services []serviceView `json:"services"`
 	}
 	decode(t, e.request(http.MethodGet, "/v1/services?include_deleted=true", ""), &list)
-	if len(list.Services) != 1 || list.Services[0].DeletedAt == nil || list.Services[0].Status.DesiredReplicas != 0 || list.Services[0].Status.ScheduledReplicas != 0 || len(list.Services[0].Status.Replicas) != 4 {
+	if len(list.Services) != 1 || list.Services[0].DeletedAt == nil || list.Services[0].Status.DesiredReplicas != 0 || list.Services[0].Status.ScheduledReplicas != 0 || len(list.Services[0].Status.Replicas) != 3 {
 		t.Fatalf("deleted service = %+v", list.Services)
 	}
 }
@@ -428,7 +429,7 @@ func TestServiceStatusCountsFailedUnhealthyAndLostReplicas(t *testing.T) {
 		moved,
 	}
 	nodes := map[string]string{"n1": store.NodeHealthy, "n2": store.NodeSuspect, "gone": store.NodeUnavailable}
-	st := buildStatus(svc, workloads, nil, nodes)
+	st := buildStatus(store.Definition{Service: svc}, workloads, nil, nodes, nil)
 
 	if st.ScheduledReplicas != 5 || st.RunningReplicas != 1 || st.UnhealthyReplicas != 1 || st.FailedReplicas != 1 || st.LostReplicas != 1 || len(st.Replicas) != 6 {
 		t.Fatalf("status = %+v", st)

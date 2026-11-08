@@ -65,9 +65,54 @@ func (p *problems) add(field, format string, args ...any) {
 
 // The request shapes use pointers so a missing field can be told from a zero one.
 type serviceBody struct {
-	Name     *string   `json:"name"`
-	Replicas *int      `json:"replicas"`
-	Spec     *specBody `json:"spec"`
+	Name     *string      `json:"name"`
+	Replicas *int         `json:"replicas"`
+	Spec     *specBody    `json:"spec"`
+	Rollout  *rolloutBody `json:"rollout"`
+}
+
+// rolloutBody is the part of a rollout policy a request sets. A field that is
+// left out keeps its value: the service's current one on an update, the default
+// when the service is created.
+type rolloutBody struct {
+	MaxUnavailable          *int `json:"max_unavailable"`
+	MaxSurge                *int `json:"max_surge"`
+	ProgressDeadlineSeconds *int `json:"progress_deadline_seconds"`
+}
+
+// apply returns base with the fields the request set. A nil body changes nothing.
+func (b *rolloutBody) apply(base store.RolloutPolicy) store.RolloutPolicy {
+	if b == nil {
+		return base
+	}
+	if b.MaxUnavailable != nil {
+		base.MaxUnavailable = *b.MaxUnavailable
+	}
+	if b.MaxSurge != nil {
+		base.MaxSurge = *b.MaxSurge
+	}
+	if b.ProgressDeadlineSeconds != nil {
+		base.ProgressDeadlineSeconds = *b.ProgressDeadlineSeconds
+	}
+	return base
+}
+
+// validate checks each field the request sets against its own range. That the
+// two limits are not both zero depends on the policy they are applied to, so
+// it is checked once they are.
+func (b *rolloutBody) validate(p *problems) {
+	if b == nil {
+		return
+	}
+	if b.MaxUnavailable != nil && (*b.MaxUnavailable < 0 || *b.MaxUnavailable > store.MaxRolloutReplicas) {
+		p.add("rollout.max_unavailable", "must be between 0 and %d", store.MaxRolloutReplicas)
+	}
+	if b.MaxSurge != nil && (*b.MaxSurge < 0 || *b.MaxSurge > store.MaxRolloutReplicas) {
+		p.add("rollout.max_surge", "must be between 0 and %d", store.MaxRolloutReplicas)
+	}
+	if b.ProgressDeadlineSeconds != nil && (*b.ProgressDeadlineSeconds < 1 || *b.ProgressDeadlineSeconds > store.MaxProgressDeadlineSeconds) {
+		p.add("rollout.progress_deadline_seconds", "must be between 1 and %d", store.MaxProgressDeadlineSeconds)
+	}
 }
 
 type specBody struct {
@@ -108,6 +153,8 @@ type serviceInput struct {
 	name     string
 	replicas int
 	spec     store.ServiceSpec
+	// rollout is nil when the request leaves the policy out.
+	rollout *rolloutBody
 }
 
 func fieldSet(names ...string) map[string]bool {
@@ -122,7 +169,8 @@ func fieldSet(names ...string) map[string]bool {
 // ignored, so a typo or a Docker option DockFleet does not implement can never
 // be silently dropped.
 var (
-	topFields     = fieldSet("name", "replicas", "spec")
+	topFields     = fieldSet("name", "replicas", "spec", "rollout")
+	rolloutFields = fieldSet("max_unavailable", "max_surge", "progress_deadline_seconds")
 	specFields    = fieldSet("image", "command", "env", "cpu_millis", "memory_bytes", "ports", "health_check", "restart_policy", "node_selector")
 	portFields    = fieldSet("container_port", "protocol", "host_port")
 	healthFields  = fieldSet("command", "interval_seconds", "timeout_seconds", "start_period_seconds", "retries")
@@ -138,7 +186,7 @@ var (
 		"security_opt", "sysctls", "cgroup_parent", "group_add", "host_ip", "extra_hosts",
 	)
 
-	readOnlyFields = fieldSet("id", "version", "revision", "status", "created_at", "updated_at", "deleted_at")
+	readOnlyFields = fieldSet("id", "version", "revision", "status", "paused", "created_at", "updated_at", "deleted_at")
 )
 
 func fieldReason(key string) string {
@@ -185,6 +233,9 @@ func (p *problems) refuseUnknown(path string, obj map[string]json.RawMessage, al
 // allow-list, at any depth.
 func (p *problems) checkFields(top map[string]json.RawMessage) {
 	p.refuseUnknown("", top, topFields)
+	if obj, ok := object(top["rollout"]); ok {
+		p.refuseUnknown("rollout", obj, rolloutFields)
+	}
 	spec, ok := object(top["spec"])
 	if !ok {
 		return
@@ -270,6 +321,8 @@ func parseService(body []byte, creating bool, pathName string) (serviceInput, pr
 	} else {
 		in.spec = b.Spec.validate(&p)
 	}
+	b.Rollout.validate(&p)
+	in.rollout = b.Rollout
 	if len(p) > 0 {
 		return serviceInput{}, p
 	}

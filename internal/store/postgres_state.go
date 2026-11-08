@@ -228,11 +228,13 @@ func (q *queries) RecordObservations(ctx context.Context, nodeID string, obs []O
 
 // ---- services and revisions (desired) ----
 
-const serviceColumns = `id, name, replicas, current_revision, version, created_at, updated_at, deleted_at`
+const serviceColumns = `id, name, replicas, current_revision, max_unavailable, max_surge, progress_deadline_seconds, paused, version, created_at, updated_at, deleted_at`
 
 func scanService(row pgx.Row) (Service, error) {
 	var s Service
-	if err := row.Scan(&s.ID, &s.Name, &s.Replicas, &s.CurrentRevision, &s.Version, &s.CreatedAt, &s.UpdatedAt, &s.DeletedAt); err != nil {
+	if err := row.Scan(&s.ID, &s.Name, &s.Replicas, &s.CurrentRevision,
+		&s.Rollout.MaxUnavailable, &s.Rollout.MaxSurge, &s.Rollout.ProgressDeadlineSeconds, &s.Paused,
+		&s.Version, &s.CreatedAt, &s.UpdatedAt, &s.DeletedAt); err != nil {
 		return Service{}, mapError(err)
 	}
 	s.CreatedAt, s.UpdatedAt, s.DeletedAt = s.CreatedAt.UTC(), s.UpdatedAt.UTC(), utcPtr(s.DeletedAt)
@@ -263,13 +265,14 @@ func (q *queries) CreateService(ctx context.Context, n NewService) (Service, err
 		return Service{}, err
 	}
 	at := n.At.UTC()
+	policy := n.Rollout.Effective()
 	var svc Service
 	err = q.atomic(ctx, func(q *queries) error {
 		var err error
 		svc, err = scanService(q.db.QueryRow(ctx,
-			`INSERT INTO services (id, name, replicas, current_revision, version, created_at, updated_at)
-			 VALUES ($1, $2, $3, 1, 1, $4, $4)
-			 RETURNING `+serviceColumns, n.ID, n.Name, n.Replicas, at))
+			`INSERT INTO services (id, name, replicas, current_revision, max_unavailable, max_surge, progress_deadline_seconds, version, created_at, updated_at)
+			 VALUES ($1, $2, $3, 1, $5, $6, $7, 1, $4, $4)
+			 RETURNING `+serviceColumns, n.ID, n.Name, n.Replicas, at, policy.MaxUnavailable, policy.MaxSurge, policy.ProgressDeadlineSeconds))
 		if err != nil {
 			return err
 		}
@@ -316,7 +319,8 @@ func (q *queries) ListServices(ctx context.Context, includeDeleted bool) ([]Serv
 
 func (q *queries) ListDefinitions(ctx context.Context, includeDeleted bool) ([]Definition, error) {
 	// The join follows services.current_revision to the revision's primary key.
-	query := `SELECT s.id, s.name, s.replicas, s.current_revision, s.version, s.created_at, s.updated_at, s.deleted_at,
+	query := `SELECT s.id, s.name, s.replicas, s.current_revision, s.max_unavailable, s.max_surge, s.progress_deadline_seconds, s.paused,
+		s.version, s.created_at, s.updated_at, s.deleted_at,
 		r.service_id, r.revision, r.spec, r.spec_hash, r.message, r.created_by, r.created_at
 		FROM services s JOIN service_revisions r ON r.service_id = s.id AND r.revision = s.current_revision`
 	if !includeDeleted {
@@ -332,7 +336,9 @@ func (q *queries) ListDefinitions(ctx context.Context, includeDeleted bool) ([]D
 		var d Definition
 		var spec []byte
 		s, r := &d.Service, &d.Revision
-		if err := rows.Scan(&s.ID, &s.Name, &s.Replicas, &s.CurrentRevision, &s.Version, &s.CreatedAt, &s.UpdatedAt, &s.DeletedAt,
+		if err := rows.Scan(&s.ID, &s.Name, &s.Replicas, &s.CurrentRevision,
+			&s.Rollout.MaxUnavailable, &s.Rollout.MaxSurge, &s.Rollout.ProgressDeadlineSeconds, &s.Paused,
+			&s.Version, &s.CreatedAt, &s.UpdatedAt, &s.DeletedAt,
 			&r.ServiceID, &r.Revision, &spec, &r.SpecHash, &r.Message, &r.CreatedBy, &r.CreatedAt); err != nil {
 			return nil, mapError(err)
 		}
@@ -343,7 +349,38 @@ func (q *queries) ListDefinitions(ctx context.Context, includeDeleted bool) ([]D
 		r.CreatedAt = r.CreatedAt.UTC()
 		out = append(out, d)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+
+	// Revisions whose spec is the current one's: a rollback deploys an old spec
+	// as a new revision, and replicas of the old revision are still right.
+	same, err := q.db.Query(ctx,
+		`SELECT r.service_id, r.revision FROM service_revisions r
+		 JOIN services s ON s.id = r.service_id
+		 JOIN service_revisions c ON c.service_id = s.id AND c.revision = s.current_revision AND c.spec_hash = r.spec_hash
+		 ORDER BY r.service_id, r.revision`)
+	if err != nil {
+		return nil, err
+	}
+	defer same.Close()
+	byService := map[string][]int{}
+	for same.Next() {
+		var id string
+		var rev int
+		if err := same.Scan(&id, &rev); err != nil {
+			return nil, mapError(err)
+		}
+		byService[id] = append(byService[id], rev)
+	}
+	if err := same.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].SameSpec = byService[out[i].Service.ID]
+	}
+	return out, nil
 }
 
 // explainNoUpdate says why a conditional UPDATE changed no row.
@@ -368,6 +405,22 @@ func (q *queries) ScaleService(ctx context.Context, id string, replicas int, exp
 		`UPDATE services SET replicas = $2, version = version + 1, updated_at = $4
 		 WHERE id = $1 AND deleted_at IS NULL AND replicas <> $2 AND ($3::bigint = 0 OR version = $3::bigint)
 		 RETURNING `+serviceColumns, id, replicas, expectedVersion, at.UTC()))
+	if errors.Is(err, ErrNotFound) {
+		return q.explainNoUpdate(ctx, id, expectedVersion)
+	}
+	return svc, err
+}
+
+func (q *queries) SetRollout(ctx context.Context, id string, policy RolloutPolicy, paused bool, expectedVersion int64, at time.Time) (Service, error) {
+	if err := policy.Validate(); err != nil {
+		return Service{}, err
+	}
+	svc, err := scanService(q.db.QueryRow(ctx,
+		`UPDATE services SET max_unavailable = $2, max_surge = $3, progress_deadline_seconds = $4, paused = $5, version = version + 1, updated_at = $7
+		 WHERE id = $1 AND deleted_at IS NULL
+		   AND (max_unavailable <> $2 OR max_surge <> $3 OR progress_deadline_seconds <> $4 OR paused <> $5)
+		   AND ($6::bigint = 0 OR version = $6::bigint)
+		 RETURNING `+serviceColumns, id, policy.MaxUnavailable, policy.MaxSurge, policy.ProgressDeadlineSeconds, paused, expectedVersion, at.UTC()))
 	if errors.Is(err, ErrNotFound) {
 		return q.explainNoUpdate(ctx, id, expectedVersion)
 	}
@@ -568,6 +621,59 @@ func (q *queries) ReplaceUnschedulable(ctx context.Context, items []Unschedulabl
 	}
 	sortUnschedulable(changed)
 	return changed, nil
+}
+
+// ---- rollouts ----
+
+const rolloutColumns = `service_id, revision, state, reason, message, paused, updated, ready, outdated, started_at, progress_at, finished_at`
+
+func scanRollout(row pgx.Row) (Rollout, error) {
+	var r Rollout
+	if err := row.Scan(&r.ServiceID, &r.Revision, &r.State, &r.Reason, &r.Message, &r.Paused, &r.Updated, &r.Ready, &r.Old,
+		&r.StartedAt, &r.ProgressAt, &r.FinishedAt); err != nil {
+		return Rollout{}, mapError(err)
+	}
+	r.StartedAt, r.ProgressAt, r.FinishedAt = r.StartedAt.UTC(), r.ProgressAt.UTC(), utcPtr(r.FinishedAt)
+	return r, nil
+}
+
+func (q *queries) ListRollouts(ctx context.Context, serviceID string) ([]Rollout, error) {
+	query := `SELECT ` + rolloutColumns + ` FROM rollouts`
+	var args []any
+	if serviceID != "" {
+		query += ` WHERE service_id = $1`
+		args = append(args, serviceID)
+	}
+	rows, err := q.db.Query(ctx, query+` ORDER BY service_id, revision DESC`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Rollout{}
+	for rows.Next() {
+		r, err := scanRollout(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (q *queries) SaveRollout(ctx context.Context, r Rollout) error {
+	if err := r.validate(); err != nil {
+		return err
+	}
+	_, err := q.db.Exec(ctx,
+		`INSERT INTO rollouts (`+rolloutColumns+`)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		 ON CONFLICT (service_id, revision) DO UPDATE SET
+		   state = EXCLUDED.state, reason = EXCLUDED.reason, message = EXCLUDED.message, paused = EXCLUDED.paused,
+		   updated = EXCLUDED.updated, ready = EXCLUDED.ready, outdated = EXCLUDED.outdated,
+		   started_at = EXCLUDED.started_at, progress_at = EXCLUDED.progress_at, finished_at = EXCLUDED.finished_at`,
+		r.ServiceID, r.Revision, r.State, r.Reason, r.Message, r.Paused, r.Updated, r.Ready, r.Old,
+		r.StartedAt.UTC(), r.ProgressAt.UTC(), utcPtr(r.FinishedAt))
+	return mapError(err)
 }
 
 // ---- events ----

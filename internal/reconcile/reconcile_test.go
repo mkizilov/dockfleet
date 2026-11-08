@@ -38,6 +38,11 @@ type env struct {
 	// failed and unhealthy are the workloads whose containers their agents
 	// report failed, or running but failing their health check.
 	failed, unhealthy map[string]bool
+	// breaks, when set, makes the agents report the workloads it selects failed,
+	// and healthOf the health check result they report ("" leaves the default,
+	// healthy for a workload that has a check).
+	breaks   func(store.Workload) bool
+	healthOf func(store.Workload) string
 }
 
 func newEnv(t *testing.T, st store.Store) *env {
@@ -148,12 +153,20 @@ func (e *env) agents() {
 				o.State = store.WorkloadStopped
 			case e.holdBack != nil && e.holdBack(w):
 				o.State = store.WorkloadPending
-			case e.failed[w.ID]:
+			case e.failed[w.ID] || (e.breaks != nil && e.breaks(w)):
 				o.State, o.ContainerID, o.Message = store.WorkloadFailed, "container-"+w.ID, "exited with code 1"
 			case e.unhealthy[w.ID]:
 				o.State, o.ContainerID, o.Health = store.WorkloadRunning, "container-"+w.ID, store.HealthUnhealthy
 			default:
 				o.State, o.ContainerID = store.WorkloadRunning, "container-"+w.ID
+				if w.HealthCheck != nil {
+					o.Health = store.HealthHealthy
+				}
+				if e.healthOf != nil {
+					if h := e.healthOf(w); h != "" {
+						o.Health = h
+					}
+				}
 			}
 			reports = append(reports, o)
 		}
@@ -280,7 +293,15 @@ type reconcileTest struct {
 var reconcileTests = []reconcileTest{
 	{"the control loop deploys, scales, rolls out and removes a service", testControlLoopLifecycle},
 	{"a replica that never comes up keeps the old one", testFailedRolloutKeepsTheOldReplica},
-	{"a fixed host port is handed over to the new revision", testFixedHostPortIsHandedOver},
+	{"a fixed host port needs max_unavailable before the rollout can go on", testFixedHostPortNeedsMaxUnavailable},
+	{"a rolling update stays within max_surge and max_unavailable", testRollingUpdateStaysWithinThePolicy},
+	{"replacements that fail leave the old replicas running and are reported", testFailingReplacementsAreReported},
+	{"a rollout without room waits, says why, and goes on when the policy allows", testRolloutWithoutRoom},
+	{"a paused rollout stands still and its deadline stops", testPausedRolloutStandsStill},
+	{"health checks decide when a replica is ready", testHealthGatesReadiness},
+	{"a rollback keeps the replicas that already run the old spec", testRollbackKeepsMatchingReplicas},
+	{"a rollback after a finished rollout rolls back gradually", testRollbackAfterACompletedRollout},
+	{"a new revision overtakes a rollout that was not finished", testRolloutIsSuperseded},
 	{"replicas of a lost node move, and the node is cleaned up when it returns", testLostNodeReplicasMove},
 	{"a manager that was down does not mistake its own absence for dead nodes", testManagerRestartDoesNotMoveReplicas},
 	{"a node that goes quiet and comes back keeps its replicas", testSuspectNodeKeepsItsReplicas},
@@ -401,7 +422,7 @@ func testFailedRolloutKeepsTheOldReplica(t *testing.T, newStore func(t *testing.
 	e.deploy("web", "broken:1")
 	e.settle()
 	list := e.workloads("web")
-	if len(list) != 4 {
+	if len(list) != 3 { // the two old replicas, and the one extra replica the default surge allows
 		t.Fatalf("workloads:\n%s", e.describe())
 	}
 	for _, w := range list[:2] {
@@ -419,44 +440,6 @@ func testFailedRolloutKeepsTheOldReplica(t *testing.T, newStore func(t *testing.
 	rolled := e.wantReplicas("web", 2, 2, "broken:1")
 	if rolled[0].ID == old[0].ID {
 		t.Fatal("the new revision reused a workload")
-	}
-}
-
-// Two replicas cannot publish the same host port on one node, so the new
-// revision can only start once the old one has let go of it.
-func testFixedHostPortIsHandedOver(t *testing.T, newStore func(t *testing.T) store.Store) {
-	e := newEnv(t, newStore(t))
-	e.node("n1")
-	withPort := func(image string) store.ServiceSpec {
-		s := spec(image)
-		s.Ports = []store.ServicePort{{ContainerPort: 80, Protocol: "tcp", HostPort: 18080}}
-		return s
-	}
-	svc, err := e.st.CreateService(e.ctx(), store.NewService{ID: "svc-web", Name: "web", Replicas: 1, Spec: withPort("nginx:1.0"), CreatedBy: "test", At: e.clock})
-	e.must(err)
-	e.settle()
-	old := e.wantReplicas("web", 1, 1, "nginx:1.0")
-
-	_, _, err = e.st.DeployService(e.ctx(), svc.ID, store.Deployment{Spec: withPort("nginx:2.0"), CreatedBy: "test", At: e.clock})
-	e.must(err)
-	e.settle()
-	rolled := e.wantReplicas("web", 2, 1, "nginx:2.0")
-	if rolled[0].ID == old[0].ID {
-		t.Fatal("the new revision reused the old workload")
-	}
-	events, err := e.st.ListEvents(e.ctx(), store.EventFilter{ResourceType: "workload", Limit: store.MaxEventLimit})
-	e.must(err)
-	stopped := 0
-	for _, ev := range events {
-		if ev.Action == "replica.stopped" {
-			stopped++
-			if ev.ResourceID != old[0].ID || ev.Details["reason"] != ReasonPortHandover {
-				t.Fatalf("event = %+v", ev)
-			}
-		}
-	}
-	if stopped != 1 {
-		t.Fatalf("%d replicas were stopped, want the old one only", stopped)
 	}
 }
 

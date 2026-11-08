@@ -101,9 +101,12 @@ func (e *serviceEnv) agents() {
 		for _, w := range workloads {
 			e.reports++
 			o := store.Observation{WorkloadID: w.ID, AckedGeneration: w.Generation, ObservedAt: e.clock.Add(time.Duration(e.reports) * time.Millisecond)}
-			if w.DesiredState == store.DesiredStopped {
+			switch {
+			case w.DesiredState == store.DesiredStopped:
 				o.State = store.WorkloadStopped
-			} else {
+			case e.failImage != "" && w.Image == e.failImage:
+				o.State, o.ContainerID, o.Message = store.WorkloadFailed, "c-"+w.ID, "exited with code 1"
+			default:
 				o.State, o.ContainerID, o.Message = store.WorkloadRunning, "c-"+w.ID, "running"
 			}
 			reports = append(reports, o)

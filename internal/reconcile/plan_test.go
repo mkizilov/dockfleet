@@ -166,7 +166,7 @@ func TestPlan(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var got []want
-			for _, a := range Plan(definitions(tt.services), tt.workloads, nil, nil) {
+			for _, a := range Plan(definitions(tt.services), tt.workloads, nil) {
 				got = append(got, want{a.Kind, a.Reason, a.Workload.Name})
 			}
 			if !reflect.DeepEqual(got, tt.want) {
@@ -190,7 +190,7 @@ func TestPlanDoesNotDependOnInputOrder(t *testing.T) {
 		}
 		return out
 	}
-	want := names(Plan(definitions(services), workloads, nil, nil))
+	want := names(Plan(definitions(services), workloads, nil))
 	if len(want) != 4 {
 		t.Fatalf("plan = %v", want)
 	}
@@ -198,7 +198,7 @@ func TestPlanDoesNotDependOnInputOrder(t *testing.T) {
 	for i, w := range workloads {
 		reversed[len(workloads)-1-i] = w
 	}
-	if got := names(Plan(definitions([]store.Service{services[1], services[0]}), reversed, nil, nil)); !reflect.DeepEqual(got, want) {
+	if got := names(Plan(definitions([]store.Service{services[1], services[0]}), reversed, nil)); !reflect.DeepEqual(got, want) {
 		t.Fatalf("plan = %v, want %v", got, want)
 	}
 }
@@ -209,8 +209,8 @@ func TestPlanConverges(t *testing.T) {
 	services := []store.Service{service("web", 1, 2)}
 	workloads := []store.Workload{up(workload("web", 1, 1)), up(workload("web", 1, 2)), up(workload("web", 2, 1))}
 
-	first := Plan(definitions(services), workloads, nil, nil)
-	if len(first) != 2 || !reflect.DeepEqual(first, Plan(definitions(services), workloads, nil, nil)) {
+	first := Plan(definitions(services), workloads, nil)
+	if len(first) != 2 || !reflect.DeepEqual(first, Plan(definitions(services), workloads, nil)) {
 		t.Fatalf("plan = %+v", first)
 	}
 	// Apply the stops, as the store would, then let the nodes confirm.
@@ -221,7 +221,7 @@ func TestPlanConverges(t *testing.T) {
 			}
 		}
 	}
-	second := Plan(definitions(services), workloads, nil, nil)
+	second := Plan(definitions(services), workloads, nil)
 	if len(second) != 2 || second[0].Kind != ActionDelete || second[1].Kind != ActionDelete {
 		t.Fatalf("after the nodes confirmed: %+v", second)
 	}
@@ -231,60 +231,112 @@ func TestPlanConverges(t *testing.T) {
 			left = append(left, w)
 		}
 	}
-	if third := Plan(definitions(services), left, nil, nil); len(third) != 0 {
+	if third := Plan(definitions(services), left, nil); len(third) != 0 {
 		t.Fatalf("the plan keeps asking for changes: %+v", third)
 	}
 }
 
-// A replica that publishes a fixed host port cannot run beside its successor
-// on the same node, so when the scheduler says the successor is blocked by
-// that port, the old replica is stopped to free it.
-func TestPlanHandsOverFixedHostPorts(t *testing.T) {
-	port := func(host int, protocol string) store.ServicePort {
-		return store.ServicePort{ContainerPort: 80, Protocol: protocol, HostPort: host}
-	}
-	withPorts := func(w store.Workload, ports ...store.ServicePort) store.Workload {
-		w.Ports = ports
-		return w
-	}
-	blocked := func(code string) []store.Unschedulable {
-		return []store.Unschedulable{{ServiceID: "web", Revision: 2, ReplicaIndex: 1, Code: code}}
-	}
-	def := func(ports ...store.ServicePort) []store.Definition {
-		return []store.Definition{{Service: service("web", 1, 2), Revision: store.Revision{ServiceID: "web", Revision: 2, Spec: store.ServiceSpec{Ports: ports}}}}
-	}
-	old := func(ports ...store.ServicePort) []store.Workload {
-		return []store.Workload{withPorts(up(workload("web", 1, 1)), ports...)}
-	}
+func withPolicy(s store.Service, unavailable, surge int, paused bool) store.Service {
+	s.Rollout = store.RolloutPolicy{MaxUnavailable: unavailable, MaxSurge: surge, ProgressDeadlineSeconds: 600}
+	s.Paused = paused
+	return s
+}
 
+// notReady is a replica whose container exists but has not reported running.
+func notReady(w store.Workload) store.Workload { return observed(w, store.WorkloadPending, w.Generation) }
+
+// The reconciler retires old replicas as far as the service's policy allows:
+// ready ones only while at least the wanted count minus max_unavailable stay
+// ready, the ones that provide nothing at once, and none while paused.
+func TestPlanRetiresOldReplicasWithinThePolicy(t *testing.T) {
+	type replicas struct{ ready, unready int }
+	build := func(rev int, r replicas) []store.Workload {
+		var out []store.Workload
+		for i := 1; i <= r.ready; i++ {
+			out = append(out, up(workload("web", rev, i)))
+		}
+		for i := 1; i <= r.unready; i++ {
+			w := workload("web", rev, r.ready+i)
+			if rev == 2 {
+				w = notReady(w)
+			}
+			out = append(out, w)
+		}
+		return out
+	}
 	tests := []struct {
-		name    string
-		defs    []store.Definition
-		current []store.Workload
-		waiting []store.Unschedulable
-		want    int
+		name                     string
+		want, unavailable, surge int
+		paused                   bool
+		old, new                 replicas
+		stops                    []string
 	}{
-		{"the new replica is blocked by the port the old one holds", def(port(8080, "tcp")), old(port(8080, "tcp")), blocked(scheduler.CodeHostPortConflict), 1},
-		{"an empty protocol is tcp on both sides", def(port(8080, "")), old(port(8080, "tcp")), blocked(scheduler.CodeHostPortConflict), 1},
-		{"no explanation yet: the old replica stays", def(port(8080, "tcp")), old(port(8080, "tcp")), nil, 0},
-		{"blocked by something else (resources)", def(port(8080, "tcp")), old(port(8080, "tcp")), blocked(scheduler.CodeInsufficientResources), 0},
-		{"the old replica does not hold the port", def(port(8080, "tcp")), old(port(9090, "tcp")), blocked(scheduler.CodeHostPortConflict), 0},
-		{"the same number on another protocol", def(port(8080, "udp")), old(port(8080, "tcp")), blocked(scheduler.CodeHostPortConflict), 0},
-		{"a port the node chooses is never in conflict", def(port(0, "tcp")), old(port(0, "tcp")), blocked(scheduler.CodeHostPortConflict), 0},
-		// Any replica of the new revision that is blocked needs an old one to let go; which one is blocked does not matter.
-		{"the explanation is for another replica of the new revision", def(port(8080, "tcp")), old(port(8080, "tcp")),
-			[]store.Unschedulable{{ServiceID: "web", Revision: 2, ReplicaIndex: 2, Code: scheduler.CodeHostPortConflict}}, 1},
-		{"the explanation is for an older revision", def(port(8080, "tcp")), old(port(8080, "tcp")),
-			[]store.Unschedulable{{ServiceID: "web", Revision: 1, ReplicaIndex: 1, Code: scheduler.CodeHostPortConflict}}, 0},
+		{"nothing new is ready: no old replica goes", 3, 0, 1, false, replicas{3, 0}, replicas{0, 1}, []string{}},
+		{"one new replica is ready: one old replica goes", 3, 0, 1, false, replicas{3, 0}, replicas{1, 0},
+			[]string{"stop superseded web-r1-3"}},
+		{"two are ready, beyond the surge: the excess goes, and one more for the second", 3, 0, 1, false, replicas{3, 0}, replicas{2, 0},
+			[]string{"stop superseded web-r1-2", "stop superseded web-r1-3"}},
+		{"every replica is up to date: nothing to retire", 3, 0, 1, false, replicas{0, 0}, replicas{3, 0}, []string{}},
+
+		{"max_unavailable 1 without surge: one old replica goes before any new one exists", 3, 1, 0, false, replicas{3, 0}, replicas{0, 0},
+			[]string{"stop superseded web-r1-3"}},
+		{"...and no more until the new one is ready", 3, 1, 0, false, replicas{2, 0}, replicas{0, 1}, []string{}},
+		{"...then one more", 3, 1, 0, false, replicas{2, 0}, replicas{1, 0}, []string{"stop superseded web-r1-2"}},
+		{"max_unavailable 2: two go at once", 3, 2, 1, false, replicas{3, 0}, replicas{0, 0},
+			[]string{"stop superseded web-r1-2", "stop superseded web-r1-3"}},
+		{"unready new replicas still let max_unavailable be used", 3, 1, 1, false, replicas{3, 0}, replicas{0, 1},
+			[]string{"stop superseded web-r1-3"}},
+		{"...but only once", 3, 1, 1, false, replicas{2, 0}, replicas{0, 1}, []string{}},
+
+		{"old replicas that are not ready go at once", 3, 0, 1, false, replicas{2, 1}, replicas{0, 0},
+			[]string{"stop superseded web-r1-3"}},
+
+		{"a paused rollout retires nothing", 3, 0, 1, true, replicas{3, 0}, replicas{1, 0}, []string{}},
+		{"...not even a replica that is not ready", 3, 0, 1, true, replicas{2, 1}, replicas{0, 0}, []string{}},
+		{"...but it still drops what a scale-down left behind", 2, 0, 1, true, replicas{3, 0}, replicas{0, 0},
+			[]string{"stop scaled_down web-r1-3"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			actions := Plan(tt.defs, tt.current, tt.waiting, nil)
-			if len(actions) != tt.want {
-				t.Fatalf("plan = %+v, want %d actions", actions, tt.want)
+			svc := withPolicy(service("web", tt.want, 2), tt.unavailable, tt.surge, tt.paused)
+			workloads := append(build(1, tt.old), build(2, tt.new)...)
+			got := describe(Plan([]store.Definition{{Service: svc}}, workloads, nil))
+			if !reflect.DeepEqual(got, tt.stops) {
+				t.Fatalf("plan = %v\nwant   %v", got, tt.stops)
 			}
-			if tt.want == 1 && (actions[0].Kind != ActionStop || actions[0].Reason != ReasonPortHandover || actions[0].Workload.Name != "web-r1-1") {
-				t.Fatalf("plan = %+v", actions)
+		})
+	}
+}
+
+// A replica on a node that has gone quiet may be running, but the rollout does
+// not count on it: it is not capacity, so nothing is given up for it, and it is
+// not retired either, since nobody knows it is not serving. If the node comes
+// back the replica is counted again; if it is given up on, the failover stops it.
+func TestPlanDoesNotCountOnOrRetireReplicasOnQuietNodes(t *testing.T) {
+	svc := service("web", 2, 2)
+	quiet := map[string]string{"slow": store.NodeSuspect}
+	tests := []struct {
+		name      string
+		workloads []store.Workload
+		stops     []string
+	}{
+		{"the quiet old replica stays, and so does the healthy one: only two can be counted on",
+			[]store.Workload{up(workload("web", 1, 1)), up(onNode(workload("web", 1, 2), "slow")), up(workload("web", 2, 1))},
+			[]string{}},
+		{"with a second new replica ready the healthy old one may go, the quiet one still stays",
+			[]store.Workload{up(workload("web", 1, 1)), up(onNode(workload("web", 1, 2), "slow")), up(workload("web", 2, 1)), up(workload("web", 2, 2))},
+			[]string{"stop superseded web-r1-1"}},
+		{"a quiet old replica that is not ready provides nothing and goes",
+			[]store.Workload{up(workload("web", 1, 1)), onNode(workload("web", 1, 2), "slow"), up(workload("web", 2, 1))},
+			[]string{"stop superseded web-r1-2"}},
+		{"a new replica on a quiet node does not count as ready",
+			[]store.Workload{up(workload("web", 1, 1)), up(workload("web", 1, 2)), up(onNode(workload("web", 2, 1), "slow"))},
+			[]string{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := describe(Plan([]store.Definition{{Service: svc}}, tt.workloads, quiet)); !reflect.DeepEqual(got, tt.stops) {
+				t.Fatalf("plan = %v, want %v", got, tt.stops)
 			}
 		})
 	}
@@ -362,7 +414,7 @@ func TestPlanGivesUpOnLostNodes(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := describe(Plan(definitions(tt.services), tt.workloads, nil, lost))
+			got := describe(Plan(definitions(tt.services), tt.workloads, lost))
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("plan = %v, want %v", got, tt.want)
 			}
@@ -501,7 +553,7 @@ func TestPlanChoosesWhichReplicasToStop(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			services := []store.Service{service("web", tt.want, 1)}
-			got := describeWhy(Plan(definitions(services), tt.workloads, nil, tt.nodes))
+			got := describeWhy(Plan(definitions(services), tt.workloads, tt.nodes))
 			if !reflect.DeepEqual(got, tt.stops) {
 				t.Fatalf("plan = %v\nwant   %v", got, tt.stops)
 			}
@@ -510,7 +562,7 @@ func TestPlanChoosesWhichReplicasToStop(t *testing.T) {
 			for i, w := range tt.workloads {
 				reversed[len(tt.workloads)-1-i] = w
 			}
-			if again := describeWhy(Plan(definitions(services), reversed, nil, tt.nodes)); !reflect.DeepEqual(again, tt.stops) {
+			if again := describeWhy(Plan(definitions(services), reversed, tt.nodes)); !reflect.DeepEqual(again, tt.stops) {
 				t.Fatalf("plan from the reversed input = %v\nwant %v", again, tt.stops)
 			}
 		})
@@ -526,7 +578,7 @@ func TestPlanScalesDownDuringADeployment(t *testing.T) {
 		up(workload("web", 1, 1)), up(workload("web", 1, 2)),
 		up(workload("web", 2, 1)), up(workload("web", 2, 2)), up(workload("web", 2, 3)), workload("web", 2, 4),
 	}
-	got := describeWhy(Plan(definitions(services), workloads, nil, nil))
+	got := describeWhy(Plan(definitions(services), workloads, nil))
 	want := []string{
 		// Two of the four new replicas are surplus; the one not running goes first, then the highest numbered.
 		"stop scaled_down web-r2-3 newest",
@@ -542,39 +594,34 @@ func TestPlanScalesDownDuringADeployment(t *testing.T) {
 	}
 }
 
-// Old replicas that hold a host port the new ones need are let go as many as there are blocked new ones.
-func TestPlanHandsOverAsManyHostPortsAsAreBlocked(t *testing.T) {
-	port := store.ServicePort{ContainerPort: 80, Protocol: "tcp", HostPort: 8080}
-	held := func(w store.Workload) store.Workload {
-		w.Ports = []store.ServicePort{port}
-		return up(w)
-	}
-	defs := []store.Definition{{
-		Service:  service("web", 3, 2),
-		Revision: store.Revision{ServiceID: "web", Revision: 2, Spec: store.ServiceSpec{Ports: []store.ServicePort{port}}},
-	}}
-	old := []store.Workload{held(workload("web", 1, 1)), held(workload("web", 1, 2)), up(workload("web", 1, 3))}
-	blocked := func(n int) []store.Unschedulable {
-		var out []store.Unschedulable
-		for i := 1; i <= n; i++ {
-			out = append(out, store.Unschedulable{ServiceID: "web", Revision: 2, ReplicaIndex: i, Code: scheduler.CodeHostPortConflict})
-		}
-		return out
-	}
+// A rollback deploys an old spec as a new revision. The replicas that still run
+// the revision it returns to are the replicas it wants: they are kept, whatever
+// revision they were created for, and only what ran the spec it leaves is retired.
+func TestPlanKeepsReplicasThatAlreadyRunTheCurrentSpec(t *testing.T) {
+	// Revision 3 is revision 1's spec again; revision 2 was the one that went wrong.
+	def := store.Definition{Service: service("web", 3, 3), SameSpec: []int{1, 3}}
 	tests := []struct {
-		blocked int
-		want    []string
+		name      string
+		workloads []store.Workload
+		stops     []string
 	}{
-		{0, []string{}},
-		{1, []string{"stop port_handover web-r1-2"}},
-		{2, []string{"stop port_handover web-r1-1", "stop port_handover web-r1-2"}},
-		// Only two old replicas hold the port, however many new ones wait for it.
-		{3, []string{"stop port_handover web-r1-1", "stop port_handover web-r1-2"}},
+		{"the bad replicas go and the others are not touched",
+			[]store.Workload{up(workload("web", 1, 1)), up(workload("web", 1, 2)), up(workload("web", 1, 3)), up(workload("web", 2, 1)), failedW(workload("web", 2, 2))},
+			[]string{"stop superseded web-r2-1", "stop superseded web-r2-2"}},
+		{"nothing is left to do once they are gone",
+			[]store.Workload{up(workload("web", 1, 1)), up(workload("web", 1, 2)), up(workload("web", 1, 3))}, []string{}},
+		{"replicas of the revision itself count the same",
+			[]store.Workload{up(workload("web", 1, 1)), up(workload("web", 3, 2)), up(workload("web", 1, 3)), up(workload("web", 2, 1))},
+			[]string{"stop superseded web-r2-1"}},
+		{"a bad replica stays until enough of the right ones are ready",
+			[]store.Workload{up(workload("web", 1, 1)), up(workload("web", 1, 2)), notReady(workload("web", 1, 3)), up(workload("web", 2, 1))},
+			[]string{}},
 	}
 	for _, tt := range tests {
-		got := describe(Plan(defs, old, blocked(tt.blocked), nil))
-		if !reflect.DeepEqual(got, tt.want) {
-			t.Errorf("%d blocked: plan = %v, want %v", tt.blocked, got, tt.want)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			if got := describe(Plan([]store.Definition{def}, tt.workloads, nil)); !reflect.DeepEqual(got, tt.stops) {
+				t.Fatalf("plan = %v\nwant   %v", got, tt.stops)
+			}
+		})
 	}
 }

@@ -22,6 +22,10 @@ A service definition is **desired state**: it says what an administrator wants, 
 | `GET /v1/services/{name}/revisions` | Deployment history, oldest first | `200` |
 | `GET /v1/services/{name}/scale` | The wanted replica count and the progress towards it | `200`, `ETag` |
 | `PUT /v1/services/{name}/scale` | Set the wanted replica count (see [Scaling](#scaling)) | `200`, `ETag` |
+| `GET /v1/services/{name}/rollout` | The rollout policy, whether rollouts are paused, the progress of the current deployment and how earlier ones ended | `200`, `ETag` |
+| `POST /v1/services/{name}/pause` | Hold rollouts where they are | `200`, `ETag` |
+| `POST /v1/services/{name}/resume` | Let them go on | `200`, `ETag` |
+| `POST /v1/services/{name}/rollback` | Return to an earlier spec, as a new revision | `200`, `ETag` |
 
 Services are addressed by **name**, which is unique among live services. A deleted service's name can be used again by a new service (with a new `id`), so a deleted service is no longer addressable by name; `GET /v1/services?include_deleted=true` still lists it.
 
@@ -58,7 +62,8 @@ Other statuses: `404` unknown service, `409` name already in use (or a concurren
     },
     "restart_policy": {"condition": "on-failure", "max_retries": 5, "backoff_seconds": 1, "max_backoff_seconds": 60},
     "node_selector": {"zone": "a"}
-  }
+  },
+  "rollout": {"max_unavailable": 0, "max_surge": 1, "progress_deadline_seconds": 600}
 }
 ```
 
@@ -75,12 +80,13 @@ Other statuses: `404` unknown service, `409` name already in use (or a concurren
 | `spec.health_check` | no | `command`: program and arguments run inside the container, exit status 0 is healthy; at most 32 arguments. Exec form only: a leading `CMD`, `CMD-SHELL` or `NONE` is refused, so there is no shell string. `interval_seconds` (default 30, max 3600), `timeout_seconds` (5, max 300), `start_period_seconds` (0, max 3600), `retries` (3, max 10); zero or omitted means the default. |
 | `spec.restart_policy` | no | `condition` is `no`, `on-failure` or `always`. `max_retries` (1-100) is how many restarts in a row are allowed: default 5 for `on-failure`; for `always` it is optional and means no limit when omitted. `backoff_seconds` (1-3600, default 1) is the wait before the second restart in a row, doubling with each further one up to `max_backoff_seconds` (1-3600, default 60, at least `backoff_seconds`). The first restart is immediate. A container that has run for 30 seconds starts over. `no` takes none of the three. Omitted means `on-failure` with 5 retries. A container that turns unhealthy is stopped and restarted under the same policy ([failure-handling.md](failure-handling.md)). |
 | `spec.node_selector` | no | Up to 16 labels a node must carry. The scheduler only places a replica on a node whose labels include all of them. |
+| `rollout` | no | How a change of spec replaces the running replicas ([rollouts.md](rollouts.md)): `max_surge` (0-1000, default 1) is how many replicas may run above `replicas` while it does, `max_unavailable` (0-1000, default 0) how many below it may be not ready, `progress_deadline_seconds` (1-86400, default 600) how long it may go without progress before it is reported failed. They cannot both be 0: a rollout could never replace a replica. A field left out keeps its value (the service's current one on an update, the default on creation). It belongs to the service, not to a revision: changing it starts no deployment. |
 
 Defaults are written into the stored definition, and the definition is put in a canonical form (ports sorted, empty values dropped, the default restart waits stored as absent, so writing `"backoff_seconds": 1` and leaving it out are one definition). So `GET` shows what is stored, the same definition written differently is not a change, and **what `GET` returns is a valid `PUT` body** apart from the read-only fields below.
 
 ### Rejected options
 
-Only the fields above exist. Anything else is refused rather than ignored, so a typo or an unimplemented option can never be silently dropped. Docker options that would weaken the isolation between a container and its host get a specific message: `privileged`, `cap_add`, `devices`, `device_cgroup_rules`, `volumes`, `volumes_from`, `mounts`, `binds` (so no Docker socket or host path can be mounted), `network_mode`, `pid`/`pid_mode`, `ipc`/`ipc_mode`, `uts`/`uts_mode`, `userns_mode`, `security_opt`, `sysctls`, `cgroup_parent`, `group_add`, `host_ip`, `extra_hosts`. `id`, `version`, `revision`, `status`, `created_at`, `updated_at` and `deleted_at` are read-only.
+Only the fields above exist. Anything else is refused rather than ignored, so a typo or an unimplemented option can never be silently dropped. Docker options that would weaken the isolation between a container and its host get a specific message: `privileged`, `cap_add`, `devices`, `device_cgroup_rules`, `volumes`, `volumes_from`, `mounts`, `binds` (so no Docker socket or host path can be mounted), `network_mode`, `pid`/`pid_mode`, `ipc`/`ipc_mode`, `uts`/`uts_mode`, `userns_mode`, `security_opt`, `sysctls`, `cgroup_parent`, `group_add`, `host_ip`, `extra_hosts`. `id`, `version`, `revision`, `status`, `paused`, `created_at`, `updated_at` and `deleted_at` are read-only (pausing is `POST /v1/services/{name}/pause`).
 
 The limits are kept at least as strict as the agent's container policy ([docker.md](docker.md)): the agent re-checks every container it creates and refuses privileged mode, Docker socket mounts and the rest again, so a definition the API accepts is never one an agent would reject for its content.
 
@@ -94,6 +100,7 @@ The limits are kept at least as strict as the agent's container policy ([docker.
   "revision": 2,
   "version": 5,
   "spec": { "...": "as above" },
+  "rollout": {"max_unavailable": 0, "max_surge": 1, "progress_deadline_seconds": 600},
   "status": { "...": "see Scheduling status" },
   "created_at": "2026-01-01T12:00:00Z",
   "updated_at": "2026-01-02T08:30:00Z"
@@ -106,7 +113,8 @@ The limits are kept at least as strict as the agent's container policy ([docker.
 
 `PUT` replaces the definition. It must carry `replicas` and a complete `spec` (`name` is optional and must match the URL). Then:
 
-- a changed `spec` becomes a **new deployment revision** (revision numbers only grow; rolling back is a `PUT` of an old spec, which becomes a new revision with the old content);
+- a changed `spec` becomes a **new deployment revision** and a **rolling deployment** ([rollouts.md](rollouts.md)): revision numbers only grow; rolling back is a `PUT` of an old spec, or `POST /v1/services/{name}/rollback`, which becomes a new revision with the old content;
+- a changed `rollout` policy is recorded (`service.rollout_configured`) and starts no deployment;
 - a changed `replicas` is a **scaling** and adds no revision (`PUT /v1/services/{name}/scale` changes only the count: see [Scaling](#scaling));
 - an identical definition changes nothing: same version, no revision, no event.
 
@@ -167,6 +175,17 @@ curl -s -X PUT -H "Authorization: Bearer $TOKEN" -d '{"replicas":5}' $API/v1/ser
 curl -s -H "Authorization: Bearer $TOKEN" $API/v1/services/web/scale   # progress
 ```
 
+## Rolling deployments
+
+Changing the `spec` deploys a new revision, and the running replicas are replaced a few at a time, within the service's `rollout` policy: at most `max_surge` replicas above the wanted count, at least `replicas` minus `max_unavailable` ready. [rollouts.md](rollouts.md) describes the rules in full; in short:
+
+- `GET /v1/services/{name}/rollout` reports the policy, whether the service is paused, the progress of the current deployment (`state` `progressing`, `paused`, `complete` or `failed`; replicas of the new spec created and ready, old ones left; the `message` that says what it is waiting for; when it started, last progressed and will be reported failed) and `history`, how each earlier revision's rollout ended. The same progress is `status.rollout` of every service view.
+- A rollout that has no room for its extra replica, or no new replica that is ready, **waits and says so** instead of giving up capacity the policy forbids; after `progress_deadline_seconds` without progress it is reported `failed` (`reason` `progress_deadline_exceeded`) with the cause in `message`, and the `rollout.failed` event. It is still carried on, and goes back to `progressing` if it moves again.
+- `POST /v1/services/{name}/pause` and `/resume` hold and release rollouts. Both are idempotent: asking for the state the service is in changes nothing, records nothing, and succeeds, even with an out-of-date `If-Match`. While paused no replica of the new spec is added and no old one retired; the progress deadline does not run.
+- `POST /v1/services/{name}/rollback` deploys an earlier revision's spec again as a new revision. Without a body it is the latest earlier revision whose spec differs from the current one; `{"revision": N}` names it, and then the request is idempotent (a service that already runs that spec answers `"changed": false`). Replicas that still run that spec are kept. A rollback clears a pause. `409` when there is nothing to go back to, `404` for a revision that does not exist.
+
+The answers of the POSTs carry `changed`, and `rolled_back_to` for a rollback.
+
 ## Scheduling status
 
 Every service view (`GET /v1/services`, `GET /v1/services/{name}` and the responses of `POST`, `PUT` and `DELETE`) carries what the scheduler has decided:
@@ -181,6 +200,7 @@ Every service view (`GET /v1/services`, `GET /v1/services/{name}` and the respon
   "unhealthy_replicas": 0,
   "lost_replicas": 0,
   "scaling": {"state": "scaling_up", "desired": 3, "ready": 1, "starting": 1, "waiting": 1, "surplus": 0, "stopping": 0, "outdated": 0, "message": "..."},
+  "rollout": {"revision": 2, "state": "progressing", "message": "...", "paused": false, "desired": 3, "updated": 1, "ready": 0, "outdated": 3, "surge": 1, "unavailable": 0, "started_at": "...", "progress_at": "...", "deadline_at": "..."},
   "replicas": [
     {"revision": 2, "index": 1, "workload_id": "9c1e...", "workload_name": "web-r2-1-3f9a2c",
      "node_id": "worker-1", "desired_state": "running", "generation": 1, "acknowledged": false, "phase": "scheduled",
@@ -202,7 +222,7 @@ Every service view (`GET /v1/services`, `GET /v1/services/{name}` and the respon
 }
 ```
 
-- `scaling` is the progress towards the wanted count, as described under [Scaling](#scaling).
+- `scaling` is the progress towards the wanted count, as described under [Scaling](#scaling). `rollout` is the progress of the current revision's deployment, as described under [Rolling deployments](#rolling-deployments); `outdated` counts replicas that do not run the current spec, and a replica of an older revision that runs the same spec (after a rollback) is not one.
 - `scheduled_replicas` counts the replicas of the current revision that have a workload meant to run, up to the wanted count; `unschedulable_replicas` those that have none because no node qualifies.
 - `running_replicas` counts the wanted replicas of the current revision whose agent reports the container running and healthy on a node that is not unavailable. The others are counted where they are: `failed_replicas` (the container failed and is not being restarted, or not yet), `unhealthy_replicas` (it runs but fails its health check) and `lost_replicas` (its node is unavailable, so the manager is moving it). A replica that has not reported yet is only `scheduled`. How failures are handled is in [failure-handling.md](failure-handling.md).
 - `replicas` lists the service's workloads, by revision and index, including those of older revisions: they stay until the reconciler has replaced them (an older revision's replica is stopped for each replica of the current revision that runs) and their node has confirmed that the container is gone. `phase` is what the node's agent last reported, or `scheduled` before it has reported anything; `message` and `container_id` are the agent's words and the container it reported; `health` is its health check result (absent without a check), `restart_count` how often the agent restarted it, `exit_code` how it last ended, and `node_health` the state of its node (`healthy`, `suspect`, `unavailable`). The replica that was moved off a lost node stays listed as `stopped` until its node confirms. The decision (`node_id`, `desired_state`, `generation`) and the observation (`phase`, `acknowledged`) are separate facts: `generation` counts the instructions given for the workload, and `acknowledged` says its node has received the latest. See [reconciliation.md](reconciliation.md).
@@ -226,8 +246,8 @@ Each successful change is recorded in `GET /v1/events` in the same transaction a
 
 ## Not yet
 
-No pagination of the service list, no partial (`PATCH`) updates, no secret values, no image allow-list, no per-user authentication (one shared admin token), and no rescheduling of a replica whose container failed beyond its restart limit (see [failure-handling.md](failure-handling.md#limitations)).
+No pagination of the service list, no partial (`PATCH`) updates, no secret values, no image allow-list, no per-user authentication (one shared admin token), no rescheduling of a replica whose container failed beyond its restart limit (see [failure-handling.md](failure-handling.md#limitations)), and no automatic rollback of a failed rollout ([rollouts.md](rollouts.md#limitations)).
 
 ## Tests
 
-`internal/api/services_*_test.go` is one suite run against the in-memory store always and against PostgreSQL under the `integration` build tag (`make test-integration`; every test gets a throwaway database). It covers authentication (missing, malformed and wrong credentials on every route), CRUD, equivalent definitions, optimistic locking, deletion and name reuse, revisions, events, a validation table of over a hundred bad inputs, every unsafe option at every nesting level, request limits, that the handlers never create a workload, and the status after a scheduling pass (assigned, unschedulable with a reason for every node, across revisions, scaling and deletion), the node view and the standalone workload refusals. The scale endpoint has its own tests in the same suite: reading and setting the count with the progress at each step, repeated and stale requests, fifteen kinds of bad request, a scale-up and scale-down through the scheduler, the reconciler and simulated agents (the replicas that stay are the very same workloads), more replicas than fit, and a scaling while a node is unavailable. PostgreSQL-only tests restart the store on the same database and run two managers against one.
+`internal/api/services_*_test.go` is one suite run against the in-memory store always and against PostgreSQL under the `integration` build tag (`make test-integration`; every test gets a throwaway database). It covers authentication (missing, malformed and wrong credentials on every route), CRUD, equivalent definitions, optimistic locking, deletion and name reuse, revisions, events, a validation table of over a hundred bad inputs, every unsafe option at every nesting level, request limits, that the handlers never create a workload, and the status after a scheduling pass (assigned, unschedulable with a reason for every node, across revisions, scaling and deletion), the node view and the standalone workload refusals. The scale endpoint has its own tests in the same suite: reading and setting the count with the progress at each step, repeated and stale requests, fifteen kinds of bad request, a scale-up and scale-down through the scheduler, the reconciler and simulated agents (the replicas that stay are the very same workloads), more replicas than fit, and a scaling while a node is unavailable. The rollout part has its own: the policy in the definition and its validation, pausing and resuming, rolling back (the previous revision, a named one, repeated and refused requests), and the progress of a rollout from its first step to a reported failure and a rollback that keeps the replicas it returns to. PostgreSQL-only tests restart the store on the same database and run two managers against one.

@@ -12,12 +12,21 @@
 // replica there.
 //
 // A service wants a number of replicas, not particular ones. When it has more
-// than it wants (it was scaled down, or a new revision's replicas are up), the
-// reconciler chooses which to stop: the ones doing the least good first (failed,
-// unhealthy, on a node that has gone quiet, not running yet), then the ones that
-// make a node carry more than its share, then the ones that have been restarted
-// most and are newest. A healthy replica that has run for a while is the last to
-// go, and nothing that stays is touched, so scaling down restarts nothing.
+// than it wants (it was scaled down), the reconciler chooses which to stop: the
+// ones doing the least good first (failed, unhealthy, on a node that has gone
+// quiet, not ready yet), then the ones that make a node carry more than its
+// share, then the ones that have been restarted most and are newest. A healthy
+// replica that has run for a while is the last to go, and nothing that stays is
+// touched, so scaling down restarts nothing.
+//
+// A change of spec is a rollout (internal/rollout): replicas of the new spec
+// are created by the scheduler as far as the service's surge allows, and the
+// reconciler retires old ones as far as its unavailable limit allows, so the
+// service keeps the capacity the policy promises. Replicas that already run
+// the current spec are kept whichever revision they were created for, which is
+// what makes a rollback cheap: the replicas of the revision it returns to are
+// still there. The reconciler also keeps the record of how far each rollout
+// has come, and reports one that stalls.
 //
 // A node that has been silent for longer than its lease is given up on: its
 // workloads are told to stop (generation up, so a node that comes back learns at
@@ -32,9 +41,9 @@ package reconcile
 
 import (
 	"sort"
-	"strconv"
 	"time"
 
+	"github.com/dockfleet/dockfleet/internal/rollout"
 	"github.com/dockfleet/dockfleet/internal/scheduler"
 	"github.com/dockfleet/dockfleet/internal/store"
 )
@@ -51,8 +60,7 @@ const (
 const (
 	ReasonScaledDown     = "scaled_down"      // the service has more replicas than it wants
 	ReasonServiceDeleted = "service_deleted"  // the service was deleted
-	ReasonSuperseded     = "superseded"       // a replica of the current revision is up in its place
-	ReasonPortHandover   = "port_handover"    // the new replica needs the fixed host port the old one holds
+	ReasonSuperseded     = "superseded"       // the replica has an older spec and the rollout may retire it
 	ReasonNodeLost       = "node_unavailable" // the node has been silent for longer than its lease
 	ReasonRetired        = "retired"          // the node confirmed that the container is gone
 )
@@ -62,7 +70,7 @@ const (
 	WhyFailed      = "failed"       // its container failed and is not running
 	WhyUnhealthy   = "unhealthy"    // it runs but fails its health check
 	WhySuspectNode = "suspect_node" // its node has gone quiet
-	WhyNotRunning  = "not_running"  // it has not come up yet
+	WhyNotRunning  = "not_running"  // it is not ready yet
 	WhySpread      = "spread"       // its node carried more of the service than the others
 	WhyRestarts    = "restarts"     // it had been restarted most
 	WhyNewest      = "newest"       // it was the newest of equals
@@ -77,41 +85,10 @@ type Action struct {
 	Workload store.Workload
 }
 
-// replicaUp is whether a workload's replica has done what it was started for:
-// its agent has received the latest instruction and reports the container
-// running, or finished successfully.
-func replicaUp(w store.Workload) bool {
-	o := w.Observed
-	return w.DesiredState == store.DesiredRunning && o != nil && o.AckedGeneration >= w.Generation &&
-		(o.State == store.WorkloadRunning || o.State == store.WorkloadSucceeded)
-}
-
 // containerGone is whether the node has confirmed that a workload that is
 // meant to be stopped no longer has a container. Only a report made after the
 // node received the instruction counts.
 func containerGone(w store.Workload) bool { return w.ContainerGone() }
-
-// sharesHostPort is whether any of a workload's fixed host ports is also in the new spec's.
-func sharesHostPort(held, wanted []store.ServicePort) bool {
-	key := func(p store.ServicePort) string {
-		if p.Protocol == "" {
-			p.Protocol = "tcp"
-		}
-		return p.Protocol + "/" + strconv.Itoa(p.HostPort)
-	}
-	used := map[string]bool{}
-	for _, p := range held {
-		if p.HostPort != 0 {
-			used[key(p)] = true
-		}
-	}
-	for _, p := range wanted {
-		if p.HostPort != 0 && used[key(p)] {
-			return true
-		}
-	}
-	return false
-}
 
 // How much good a replica does, from least (removed first) to most.
 const (
@@ -131,7 +108,7 @@ func tierOf(w store.Workload, nodes map[string]string) int {
 		return tierUnhealthy
 	case nodes[w.NodeID] == store.NodeSuspect:
 		return tierSuspectNode
-	case !replicaUp(w):
+	case !rollout.Ready(w):
 		return tierNotRunning
 	}
 	return tierServing
@@ -230,21 +207,21 @@ func whyChosen(w store.Workload, rest []store.Workload, chosen int, load map[str
 }
 
 // Plan lists the changes that bring workloads closer to the services' definitions.
-// waiting holds the scheduler's explanations for replicas it could not place, and
-// nodes the health state of each node (a node that is not listed is healthy).
+// nodes is the health state of each node (a node that is not listed is healthy).
 //
-//   - A service with more replicas of its current revision than it wants stops
-//     the surplus, the ones doing the least good first. So does one with
-//     replicas of an older revision, once replicas of the current revision are
-//     up: it keeps as many old ones as it still lacks new ones, so a deployment
-//     replaces replicas one by one and never leaves a gap; if the new replicas
-//     never come up, the old ones stay.
-//   - Every replica of a deleted service is stopped, whatever its revision.
-//   - The exception to the rolling replacement is a fixed host port: when new
-//     replicas cannot be placed because every node already uses a host port that
-//     old replicas hold and the new ones need too, as many old ones as there
-//     are blocked new ones are stopped to free it. There is a gap then, because
-//     the two cannot run side by side.
+//   - A service with more replicas of its current spec than it wants stops the
+//     surplus, the ones doing the least good first.
+//   - Old replicas (another spec than the current one) are retired within the
+//     service's rollout policy. Those beyond the wanted count go at once, which
+//     is what a scale-down during a rollout leaves. Unless the rollout is
+//     paused, old replicas that provide nothing (not ready) go too, and ready
+//     ones go as long as at least the wanted count minus max_unavailable stay
+//     ready. An old replica on a node that has gone quiet is left alone: it is
+//     not counted on, and not given up on either until the node returns or the
+//     failover takes over. A rollout therefore never leaves the service with
+//     less capacity than its policy promises, and when it cannot retire an old
+//     replica without doing so it waits and says why.
+//   - Every replica of a deleted service is stopped, whatever its spec.
 //   - A workload on a lost node is stopped, so that its replica is started on
 //     another node. It is not counted when choosing what else to stop.
 //   - A stopped workload whose node confirmed the container is gone is deleted.
@@ -252,24 +229,16 @@ func whyChosen(w store.Workload, rest []store.Workload, chosen int, load map[str
 // Workloads that belong to no service are not touched: a standalone workload
 // is pinned to the node an administrator chose, so there is nowhere to move it.
 // The result is ordered by workload name, stops before deletes.
-func Plan(defs []store.Definition, workloads []store.Workload, waiting []store.Unschedulable, nodes map[string]string) []Action {
+func Plan(defs []store.Definition, workloads []store.Workload, nodes map[string]string) []Action {
 	byService := make(map[string][]store.Workload, len(defs))
 	for _, w := range workloads {
 		if w.ServiceID != "" {
 			byService[w.ServiceID] = append(byService[w.ServiceID], w)
 		}
 	}
-	portBlocked := map[string]int{}
-	for _, u := range waiting {
-		if u.Code == scheduler.CodeHostPortConflict {
-			portBlocked[u.ServiceID+"/"+strconv.Itoa(u.Revision)]++
-		}
-	}
-
 	var actions []Action
 	for _, d := range defs {
-		blocked := portBlocked[d.Service.ID+"/"+strconv.Itoa(d.Service.CurrentRevision)]
-		actions = append(actions, planService(d, byService[d.Service.ID], blocked, nodes)...)
+		actions = append(actions, planService(d, byService[d.Service.ID], nodes)...)
 	}
 	sort.SliceStable(actions, func(i, j int) bool {
 		a, b := actions[i], actions[j]
@@ -281,9 +250,29 @@ func Plan(defs []store.Definition, workloads []store.Workload, waiting []store.U
 	return actions
 }
 
-// planService plans one service. portBlocked is how many replicas of its current
-// revision the scheduler could not place because of a host port.
-func planService(d store.Definition, workloads []store.Workload, portBlocked int, nodes map[string]string) []Action {
+// tally counts workloads and the ones among them that can be counted on.
+func tally(ws []store.Workload, nodes map[string]string) (n, counted int) {
+	for _, w := range ws {
+		if rollout.Available(w, nodes) {
+			counted++
+		}
+	}
+	return len(ws), counted
+}
+
+// without returns ws minus the workloads in chosen.
+func without(ws []store.Workload, chosen map[string]bool) []store.Workload {
+	var out []store.Workload
+	for _, w := range ws {
+		if !chosen[w.ID] {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// planService plans one service.
+func planService(d store.Definition, workloads []store.Workload, nodes map[string]string) []Action {
 	s := d.Service
 	want, down := s.Replicas, ReasonScaledDown
 	if s.DeletedAt != nil {
@@ -300,7 +289,7 @@ func planService(d store.Definition, workloads []store.Workload, portBlocked int
 			}
 		case nodes[w.NodeID] == store.NodeUnavailable:
 			actions = append(actions, Action{Kind: ActionStop, Reason: ReasonNodeLost, Workload: w})
-		case w.ServiceRevision == s.CurrentRevision:
+		case d.Serves(w.ServiceRevision):
 			current = append(current, w)
 		default:
 			old = append(old, w)
@@ -308,46 +297,53 @@ func planService(d store.Definition, workloads []store.Workload, portBlocked int
 	}
 
 	chosen := map[string]bool{}
-	stop := func(c choice, reason string) {
-		chosen[c.w.ID] = true
-		actions = append(actions, Action{Kind: ActionStop, Reason: reason, Why: c.why, Workload: c.w})
+	stop := func(cs []choice, reason func(store.Workload) string) {
+		for _, c := range cs {
+			chosen[c.w.ID] = true
+			actions = append(actions, Action{Kind: ActionStop, Reason: reason(c.w), Why: c.why, Workload: c.w})
+		}
+	}
+	// A replica that is beyond the wanted count was scaled away; any other old
+	// replica is retired by the rollout.
+	retired := func(w store.Workload) string {
+		if w.ReplicaIndex > want {
+			return down
+		}
+		return ReasonSuperseded
 	}
 
-	// Replicas of the current revision beyond what is wanted.
-	surplus := pick(current, len(current)-want, nodes)
-	for _, c := range surplus {
-		stop(c, down)
+	// Replicas of the current spec beyond what is wanted.
+	stop(pick(current, len(current)-want, nodes), func(store.Workload) string { return down })
+	if s.DeletedAt != nil {
+		stop(pick(old, len(old), nodes), func(store.Workload) string { return down })
+		return actions
+	}
+	kept := without(current, chosen)
+
+	// Old replicas beyond the wanted count go whatever their state.
+	c := rollout.Census{Want: want, Old: len(old)}
+	c.Updated, c.UpdatedReady = tally(kept, nodes)
+	stop(pick(old, rollout.Excess(c), nodes), retired)
+	if s.Paused {
+		return actions
 	}
 
-	// Replicas of older revisions: all of them beyond the count wanted, and
-	// then one for every replica of the current revision that is up.
-	up := 0
-	for _, w := range current {
-		if !chosen[w.ID] && replicaUp(w) {
-			up++
+	// An old replica that is not ready provides nothing, so retiring it costs
+	// nothing. A ready one goes as far as the unavailable limit allows, and only
+	// if its node is not under suspicion: a replica that cannot be counted on is
+	// not a reason to retire it, nor is it counted as capacity.
+	var unready, counted []store.Workload
+	for _, w := range without(old, chosen) {
+		switch {
+		case !rollout.Ready(w):
+			unready = append(unready, w)
+		case rollout.Available(w, nodes):
+			counted = append(counted, w)
 		}
 	}
-	keep := max(0, want-up)
-	for _, c := range pick(old, len(old)-keep, nodes) {
-		reason := ReasonSuperseded
-		if c.w.ReplicaIndex > want {
-			reason = down
-		}
-		stop(c, reason)
-	}
-
-	// Old replicas that hold a host port the new ones need.
-	if portBlocked > 0 {
-		var holders []store.Workload
-		for _, w := range old {
-			if !chosen[w.ID] && sharesHostPort(w.Ports, d.Revision.Spec.Ports) {
-				holders = append(holders, w)
-			}
-		}
-		for _, c := range pick(holders, portBlocked, nodes) {
-			stop(c, ReasonPortHandover)
-		}
-	}
+	stop(pick(unready, len(unready), nodes), retired)
+	c.Old, c.OldReady = len(counted), len(counted)
+	stop(pick(counted, rollout.Stoppable(s.Rollout, false, c), nodes), retired)
 	return actions
 }
 

@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/dockfleet/dockfleet/internal/rollout"
 	"github.com/dockfleet/dockfleet/internal/scheduler"
 	"github.com/dockfleet/dockfleet/internal/store"
 )
@@ -119,7 +120,7 @@ type replicaKey struct {
 }
 
 // findWaiting lists the replicas that need a node: for each live service, as
-// many replicas of its current revision as it lacks, each in the lowest slot
+// many replicas of its current spec as it lacks, each in the lowest slot
 // (replica index) that is free. A service that wants 3 and has 2 workloads
 // meant to run lacks one, whichever slots the two hold: scaling down stops the
 // replicas that are doing the least good, not the highest numbered, so the slots
@@ -127,6 +128,13 @@ type replicaKey struct {
 // state the workload is in, except that a workload that was stopped on a lost
 // node no longer holds its slot: that node cannot be asked to remove the
 // container, and the replica must not wait for it.
+//
+// A replica runs the current spec if it was created for the current revision or
+// for one with the same spec, which is what a rollback returns to: the replicas
+// that still run it are the ones wanted, and the service lacks only the rest.
+// While old replicas run, the service's rollout policy limits how many may be
+// created now (internal/rollout): the extra replicas of a rolling update, and no
+// more, so a rollout is gradual, and none at all while it is paused.
 func findWaiting(defs []store.Definition, workloads []store.Workload, lost map[string]bool) []waiting {
 	byService := make(map[string][]store.Workload, len(defs))
 	for _, w := range workloads {
@@ -137,19 +145,14 @@ func findWaiting(defs []store.Definition, workloads []store.Workload, lost map[s
 	var out []waiting
 	for _, d := range defs {
 		svc, spec := d.Service, d.Revision.Spec
-		taken, active := map[int]bool{}, 0
+		taken := map[int]bool{}
 		for _, w := range byService[svc.ID] {
-			if w.ServiceRevision != svc.CurrentRevision {
-				continue
-			}
-			if w.DesiredState == store.DesiredRunning {
-				active++
-			}
-			if !(w.DesiredState == store.DesiredStopped && lost[w.NodeID]) {
+			if d.Serves(w.ServiceRevision) && !(w.DesiredState == store.DesiredStopped && lost[w.NodeID]) {
 				taken[w.ReplicaIndex] = true
 			}
 		}
-		for i, lacking := 1, svc.Replicas-active; lacking > 0; i++ {
+		lacking := rollout.CreateBudget(svc.Rollout, svc.Paused, rollout.Count(d, byService[svc.ID], nil))
+		for i := 1; lacking > 0; i++ {
 			if taken[i] {
 				continue
 			}

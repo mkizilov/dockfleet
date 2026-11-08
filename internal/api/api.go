@@ -98,6 +98,10 @@ func New(cfg Config) http.Handler {
 	mux.Handle("GET /v1/services/{name}/revisions", s.auth(s.listServiceRevisions))
 	mux.Handle("GET /v1/services/{name}/scale", s.auth(s.getScale))
 	mux.Handle("PUT /v1/services/{name}/scale", s.auth(s.putScale))
+	mux.Handle("GET /v1/services/{name}/rollout", s.auth(s.getRollout))
+	mux.Handle("POST /v1/services/{name}/pause", s.auth(s.pauseRollout))
+	mux.Handle("POST /v1/services/{name}/resume", s.auth(s.resumeRollout))
+	mux.Handle("POST /v1/services/{name}/rollback", s.auth(s.rollbackService))
 	return s.logRequests(mux)
 }
 

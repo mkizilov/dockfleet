@@ -32,6 +32,9 @@ type serviceEnv struct {
 	// reports the simulated agents made (see services_scale_test.go).
 	down    map[string]bool
 	reports int
+	// failImage, when set, makes the simulated agents report the containers of
+	// that image failed.
+	failImage string
 }
 
 func newServiceEnv(t *testing.T, st store.Store) *serviceEnv {
@@ -161,6 +164,11 @@ var serviceTests = []serviceTest{
 	{"scale: progress to the final state", testScaleReportsProgress},
 	{"scale: more than the cluster can hold", testScaleBeyondCapacity},
 	{"scale: while a node is unavailable", testScaleWithANodeUnavailable},
+	{"rollout policy in the definition", testRolloutPolicyInTheDefinition},
+	{"rollout policy validation", testRolloutPolicyValidation},
+	{"pausing and resuming a rollout", testRolloutPauseResume},
+	{"rolling back", testRolloutRollback},
+	{"rollout progress, failure and recovery", testRolloutProgressAndFailure},
 	{"the node view explains availability", testNodeViewExplainsAvailability},
 	{"events", testServiceEvents},
 }
@@ -190,6 +198,10 @@ func testServiceAuthentication(t *testing.T, e *serviceEnv) {
 		{http.MethodGet, "/v1/services/web/revisions", ""},
 		{http.MethodGet, "/v1/services/web/scale", ""},
 		{http.MethodPut, "/v1/services/web/scale", `{"replicas":9}`},
+		{http.MethodGet, "/v1/services/web/rollout", ""},
+		{http.MethodPost, "/v1/services/web/pause", ""},
+		{http.MethodPost, "/v1/services/web/resume", ""},
+		{http.MethodPost, "/v1/services/web/rollback", ""},
 	}
 	credentials := []string{
 		"",

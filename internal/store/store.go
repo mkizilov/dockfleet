@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"time"
 )
 
@@ -382,6 +383,69 @@ func (s ServiceSpec) validate() error {
 	return nil
 }
 
+// Rollout policy bounds and defaults.
+const (
+	DefaultMaxUnavailable          = 0
+	DefaultMaxSurge                = 1
+	DefaultProgressDeadlineSeconds = 600
+
+	// MaxRolloutReplicas bounds MaxUnavailable and MaxSurge.
+	MaxRolloutReplicas = 1000
+	// MaxProgressDeadlineSeconds is one day.
+	MaxProgressDeadlineSeconds = 86400
+)
+
+// RolloutPolicy says how a new revision replaces the old one. It belongs to
+// the service, not to a revision: changing it starts no deployment.
+//
+// MaxSurge is how many replicas may run above the wanted count while a
+// rollout is going on. MaxUnavailable is how many replicas below the wanted
+// count may be not ready. Together they say how much capacity the rollout may
+// use and how much it may give up; a rollout never goes beyond either, and
+// reports it when it cannot move without doing so. ProgressDeadlineSeconds is
+// how long a rollout may go without any progress before it is reported failed.
+type RolloutPolicy struct {
+	MaxUnavailable          int `json:"max_unavailable"`
+	MaxSurge                int `json:"max_surge"`
+	ProgressDeadlineSeconds int `json:"progress_deadline_seconds"`
+}
+
+// DefaultRolloutPolicy replaces one replica at a time and never gives up
+// availability: one extra replica, none missing.
+func DefaultRolloutPolicy() RolloutPolicy {
+	return RolloutPolicy{
+		MaxUnavailable: DefaultMaxUnavailable, MaxSurge: DefaultMaxSurge, ProgressDeadlineSeconds: DefaultProgressDeadlineSeconds,
+	}
+}
+
+// Effective is the policy with defaults for what is unset: the zero value is
+// the default policy, and a deadline of zero is the default deadline. Stored
+// policies are always complete; this is for values built in code.
+func (p RolloutPolicy) Effective() RolloutPolicy {
+	if p.MaxUnavailable == 0 && p.MaxSurge == 0 {
+		p.MaxSurge = DefaultMaxSurge
+	}
+	if p.ProgressDeadlineSeconds == 0 {
+		p.ProgressDeadlineSeconds = DefaultProgressDeadlineSeconds
+	}
+	return p
+}
+
+// Validate reports why the policy cannot be used, or nil.
+func (p RolloutPolicy) Validate() error {
+	switch {
+	case p.MaxUnavailable < 0 || p.MaxUnavailable > MaxRolloutReplicas:
+		return fmt.Errorf("%w: max_unavailable must be between 0 and %d", ErrInvalid, MaxRolloutReplicas)
+	case p.MaxSurge < 0 || p.MaxSurge > MaxRolloutReplicas:
+		return fmt.Errorf("%w: max_surge must be between 0 and %d", ErrInvalid, MaxRolloutReplicas)
+	case p.MaxUnavailable == 0 && p.MaxSurge == 0:
+		return fmt.Errorf("%w: max_unavailable and max_surge cannot both be 0: a rollout could never replace a replica", ErrInvalid)
+	case p.ProgressDeadlineSeconds < 1 || p.ProgressDeadlineSeconds > MaxProgressDeadlineSeconds:
+		return fmt.Errorf("%w: progress_deadline_seconds must be between 1 and %d", ErrInvalid, MaxProgressDeadlineSeconds)
+	}
+	return nil
+}
+
 // Service is the desired definition of a replicated workload: how many
 // replicas to run and which revision of the spec they should run.
 type Service struct {
@@ -389,6 +453,11 @@ type Service struct {
 	Name            string `json:"name"`
 	Replicas        int    `json:"replicas"`         // desired replica count
 	CurrentRevision int    `json:"current_revision"` // desired deployment revision
+	// Rollout is how a change of revision is carried out. Paused holds a
+	// rollout where it is: no replica of the new revision is added and no old
+	// one is retired for it until the service is resumed.
+	Rollout RolloutPolicy `json:"rollout"`
+	Paused  bool          `json:"paused"`
 	// Version increases with every change to the service and is the token
 	// for optimistic locking.
 	Version   int64      `json:"version"`
@@ -401,6 +470,112 @@ type Service struct {
 type Definition struct {
 	Service  Service  `json:"service"`
 	Revision Revision `json:"revision"`
+	// SameSpec lists the revisions, the current one included, whose spec is the
+	// current one's. A rollback deploys an old spec as a new revision; replicas
+	// still running the old revision already are what is wanted, and are kept.
+	SameSpec []int `json:"same_spec,omitempty"`
+}
+
+// Serves reports whether a replica created for revision rev runs what the
+// service currently asks for.
+func (d Definition) Serves(rev int) bool {
+	return rev == d.Service.CurrentRevision || slices.Contains(d.SameSpec, rev)
+}
+
+// SameSpecRevisions are the numbers of the revisions with the same spec as
+// revision current, in order, current included.
+func SameSpecRevisions(revs []Revision, current int) []int {
+	var hash string
+	for _, r := range revs {
+		if r.Revision == current {
+			hash = r.SpecHash
+		}
+	}
+	var out []int
+	for _, r := range revs {
+		if r.SpecHash == hash {
+			out = append(out, r.Revision)
+		}
+	}
+	return out
+}
+
+// Rollout states.
+const (
+	// RolloutProgressing: the revision is being rolled out and has made progress
+	// within its deadline.
+	RolloutProgressing = "progressing"
+	// RolloutComplete: every wanted replica of the revision is ready and no
+	// replica of another spec is left.
+	RolloutComplete = "complete"
+	// RolloutFailed: the rollout made no progress for longer than its deadline.
+	// It is still carried on: it goes back to progressing if it moves again.
+	RolloutFailed = "failed"
+	// RolloutSuperseded: another revision was deployed (or the service deleted)
+	// before this one completed.
+	RolloutSuperseded = "superseded"
+)
+
+// RolloutDeadlineExceeded is the reason of a rollout that made no progress for
+// longer than its deadline.
+const RolloutDeadlineExceeded = "progress_deadline_exceeded"
+
+// ValidRolloutState reports whether s is a rollout state.
+func ValidRolloutState(s string) bool {
+	switch s {
+	case RolloutProgressing, RolloutComplete, RolloutFailed, RolloutSuperseded:
+		return true
+	}
+	return false
+}
+
+// Rollout is the manager's record of how far the deployment of one revision of
+// a service has come. It is derived from the workloads and the agents' reports
+// by the reconciler, which is its only writer; nothing is ever decided from it
+// except whether the rollout has stalled.
+type Rollout struct {
+	ServiceID string `json:"service_id"`
+	Revision  int    `json:"revision"`
+	State     string `json:"state"`
+	// Reason is a code for a failure and Message the explanation recorded when
+	// the state last changed to complete or failed.
+	Reason  string `json:"reason,omitempty"`
+	Message string `json:"message,omitempty"`
+	// Paused is whether the reconciler has seen the service paused.
+	Paused bool `json:"paused"`
+	// Updated, Ready and Old are the best the rollout has reached: the most
+	// replicas of the revision's spec that existed and that were ready, and the
+	// fewest old replicas that were left. Anything better than these is
+	// progress and moves ProgressAt.
+	Updated int `json:"updated"`
+	Ready   int `json:"ready"`
+	Old     int `json:"old"`
+
+	StartedAt  time.Time  `json:"started_at"`
+	ProgressAt time.Time  `json:"progress_at"`
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
+}
+
+func (r Rollout) validate() error {
+	switch {
+	case r.ServiceID == "" || r.Revision < 1:
+		return fmt.Errorf("%w: a rollout needs a service and a revision of at least 1", ErrInvalid)
+	case !ValidRolloutState(r.State):
+		return fmt.Errorf("%w: rollout state %q", ErrInvalid, r.State)
+	case r.Updated < 0 || r.Ready < 0 || r.Old < 0:
+		return fmt.Errorf("%w: rollout counts must not be negative", ErrInvalid)
+	case r.StartedAt.IsZero() || r.ProgressAt.IsZero():
+		return fmt.Errorf("%w: a rollout needs a start and a progress time", ErrInvalid)
+	}
+	return nil
+}
+
+// Same reports whether two records say the same thing, so a caller can skip a
+// write that would change nothing.
+func (r Rollout) Same(o Rollout) bool {
+	return r.ServiceID == o.ServiceID && r.Revision == o.Revision && r.State == o.State && r.Reason == o.Reason &&
+		r.Message == o.Message && r.Paused == o.Paused && r.Updated == o.Updated && r.Ready == o.Ready && r.Old == o.Old &&
+		r.StartedAt.Equal(o.StartedAt) && r.ProgressAt.Equal(o.ProgressAt) && equalTimePtr(r.FinishedAt, o.FinishedAt)
 }
 
 // Revision is an immutable snapshot of a service's spec. Revision numbers
@@ -417,10 +592,12 @@ type Revision struct {
 
 // NewService describes a service to create together with its first revision.
 type NewService struct {
-	ID        string
-	Name      string
-	Replicas  int
-	Spec      ServiceSpec
+	ID       string
+	Name     string
+	Replicas int
+	Spec     ServiceSpec
+	// Rollout is the policy for rollouts; the zero value is the default policy.
+	Rollout   RolloutPolicy
 	Message   string
 	CreatedBy string
 	At        time.Time
@@ -429,6 +606,9 @@ type NewService struct {
 func (n NewService) validate() error {
 	if n.ID == "" || !ValidName(n.Name) || n.Replicas < 0 {
 		return fmt.Errorf("%w: a service needs an id, a valid name and a non-negative replica count", ErrInvalid)
+	}
+	if err := n.Rollout.Effective().Validate(); err != nil {
+		return err
 	}
 	return n.Spec.validate()
 }
@@ -612,6 +792,10 @@ type ServiceRepository interface {
 	// DeployService records a new revision and makes it current (ErrUnchanged
 	// when the spec equals the current revision's).
 	DeployService(ctx context.Context, id string, d Deployment) (Service, Revision, error)
+	// SetRollout sets the rollout policy and whether rollouts are paused
+	// (ErrUnchanged if both are as given; ErrInvalid for a policy that fails
+	// Validate). It changes no revision and no workload.
+	SetRollout(ctx context.Context, id string, policy RolloutPolicy, paused bool, expectedVersion int64, at time.Time) (Service, error)
 	// DeleteService marks the service deleted and its desired replicas zero.
 	// Its revisions and workloads are kept.
 	DeleteService(ctx context.Context, id string, expectedVersion int64, at time.Time) (Service, error)
@@ -642,6 +826,18 @@ type SchedulingRepository interface {
 	ListUnschedulable(ctx context.Context, serviceID string) ([]Unschedulable, error)
 }
 
+// RolloutRepository stores the progress of deployments. The reconciler is its
+// only writer.
+type RolloutRepository interface {
+	// ListRollouts returns the rollouts of one service, or of all services when
+	// serviceID is empty, ordered by service and then newest revision first.
+	ListRollouts(ctx context.Context, serviceID string) ([]Rollout, error)
+	// SaveRollout writes the record of one revision of a service, replacing an
+	// earlier one. It returns ErrNotFound when the revision does not exist and
+	// ErrInvalid for a malformed record.
+	SaveRollout(ctx context.Context, r Rollout) error
+}
+
 // LeaseRepository stores named leases with fencing tokens, the building block
 // for "only one manager does this" duties such as a reconciler. Managers
 // pass their own clock, so they need synchronized clocks (NTP).
@@ -664,6 +860,7 @@ type Repositories interface {
 	WorkloadRepository
 	ServiceRepository
 	SchedulingRepository
+	RolloutRepository
 	EventRepository
 	LeaseRepository
 }

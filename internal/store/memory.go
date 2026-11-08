@@ -29,6 +29,13 @@ type memState struct {
 	leases       map[string]Lease
 
 	unschedulable map[slotKey]Unschedulable
+	rollouts      map[rolloutKey]Rollout
+}
+
+// rolloutKey identifies the rollout of one revision of a service.
+type rolloutKey struct {
+	serviceID string
+	revision  int
 }
 
 // slotKey identifies one replica slot of a service revision.
@@ -52,6 +59,7 @@ func newMemState() memState {
 		leases:       map[string]Lease{},
 
 		unschedulable: map[slotKey]Unschedulable{},
+		rollouts:      map[rolloutKey]Rollout{},
 	}
 }
 
@@ -169,7 +177,15 @@ func (s memState) clone() memState {
 	for k, v := range s.unschedulable {
 		c.unschedulable[k] = cloneUnschedulable(v)
 	}
+	for k, v := range s.rollouts {
+		c.rollouts[k] = cloneRollout(v)
+	}
 	return c
+}
+
+func cloneRollout(r Rollout) Rollout {
+	r.FinishedAt = clonePtr(r.FinishedAt)
+	return r
 }
 
 func cloneUnschedulable(u Unschedulable) Unschedulable {
@@ -504,7 +520,10 @@ func (m *Memory) CreateService(_ context.Context, n NewService) (Service, error)
 			return Service{}, ErrConflict
 		}
 	}
-	svc := Service{ID: n.ID, Name: n.Name, Replicas: n.Replicas, CurrentRevision: 1, Version: 1, CreatedAt: at, UpdatedAt: at}
+	svc := Service{
+		ID: n.ID, Name: n.Name, Replicas: n.Replicas, CurrentRevision: 1, Rollout: n.Rollout.Effective(),
+		Version: 1, CreatedAt: at, UpdatedAt: at,
+	}
 	m.s.services[svc.ID] = svc
 	m.s.revisions[svc.ID] = []Revision{{
 		ServiceID: svc.ID, Revision: 1, Spec: cloneSpec(n.Spec), SpecHash: n.Spec.Hash(),
@@ -561,7 +580,11 @@ func (m *Memory) ListDefinitions(ctx context.Context, includeDeleted bool) ([]De
 	defer m.mu.RUnlock()
 	out := make([]Definition, 0, len(services))
 	for _, svc := range services {
-		out = append(out, Definition{Service: svc, Revision: cloneRevision(m.s.revisions[svc.ID][svc.CurrentRevision-1])})
+		out = append(out, Definition{
+			Service:  svc,
+			Revision: cloneRevision(m.s.revisions[svc.ID][svc.CurrentRevision-1]),
+			SameSpec: SameSpecRevisions(m.s.revisions[svc.ID], svc.CurrentRevision),
+		})
 	}
 	return out, nil
 }
@@ -625,6 +648,26 @@ func (m *Memory) DeployService(_ context.Context, id string, d Deployment) (Serv
 	svc.UpdatedAt = at
 	m.s.services[id] = svc
 	return cloneService(svc), cloneRevision(rev), nil
+}
+
+func (m *Memory) SetRollout(_ context.Context, id string, policy RolloutPolicy, paused bool, expectedVersion int64, at time.Time) (Service, error) {
+	if err := policy.Validate(); err != nil {
+		return Service{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	svc, err := m.mutable(id, expectedVersion)
+	if err != nil {
+		return Service{}, err
+	}
+	if svc.Rollout == policy && svc.Paused == paused {
+		return cloneService(svc), ErrUnchanged
+	}
+	svc.Rollout, svc.Paused = policy, paused
+	svc.Version++
+	svc.UpdatedAt = at.UTC()
+	m.s.services[id] = svc
+	return cloneService(svc), nil
 }
 
 func (m *Memory) DeleteService(_ context.Context, id string, expectedVersion int64, at time.Time) (Service, error) {
@@ -731,6 +774,41 @@ func (m *Memory) ListUnschedulable(_ context.Context, serviceID string) ([]Unsch
 	}
 	sortUnschedulable(out)
 	return out, nil
+}
+
+// ---- rollouts ----
+
+func (m *Memory) ListRollouts(_ context.Context, serviceID string) ([]Rollout, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := []Rollout{}
+	for key, r := range m.s.rollouts {
+		if serviceID == "" || key.serviceID == serviceID {
+			out = append(out, cloneRollout(r))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ServiceID != out[j].ServiceID {
+			return out[i].ServiceID < out[j].ServiceID
+		}
+		return out[i].Revision > out[j].Revision
+	})
+	return out, nil
+}
+
+func (m *Memory) SaveRollout(_ context.Context, r Rollout) error {
+	if err := r.validate(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if r.Revision > len(m.s.revisions[r.ServiceID]) {
+		return fmt.Errorf("%w: revision %d of service %s", ErrNotFound, r.Revision, r.ServiceID)
+	}
+	r = cloneRollout(r)
+	r.StartedAt, r.ProgressAt, r.FinishedAt = r.StartedAt.UTC(), r.ProgressAt.UTC(), utcPtr(r.FinishedAt)
+	m.s.rollouts[rolloutKey{r.ServiceID, r.Revision}] = r
+	return nil
 }
 
 // ---- events ----
