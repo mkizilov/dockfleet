@@ -15,22 +15,25 @@ import (
 
 	"github.com/dockfleet/dockfleet/internal/api"
 	"github.com/dockfleet/dockfleet/internal/config"
+	"github.com/dockfleet/dockfleet/internal/netutil"
 	"github.com/dockfleet/dockfleet/internal/protocol"
+	"github.com/dockfleet/dockfleet/internal/registry"
 	"github.com/dockfleet/dockfleet/internal/store"
 )
 
 // Manager is the control plane: the admin HTTP API plus the agent-facing gRPC service.
 type Manager struct {
-	cfg    config.Manager
-	store  store.Store
-	logger *slog.Logger
-	tls    *tls.Config
+	cfg      config.Manager
+	store    store.Store
+	registry *registry.Registry
+	logger   *slog.Logger
+	tls      *tls.Config
 }
 
 // New prepares the manager. TLS material is loaded eagerly so a bad
 // certificate fails startup instead of the first connection.
 func New(cfg config.Manager, st store.Store, logger *slog.Logger) (*Manager, error) {
-	m := &Manager{cfg: cfg, store: st, logger: logger}
+	m := &Manager{cfg: cfg, store: st, registry: registry.New(st, logger), logger: logger}
 	if cfg.TLSCertFile != "" {
 		tlsConfig, err := protocol.ServerTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile)
 		if err != nil {
@@ -41,10 +44,25 @@ func New(cfg config.Manager, st store.Store, logger *slog.Logger) (*Manager, err
 	return m, nil
 }
 
+// Sessions returns the node sessions currently held by the registry.
+func (m *Manager) Sessions() []registry.Session {
+	return m.registry.Sessions()
+}
+
 // Serve runs both servers on the given listeners until ctx is canceled or one
-// of them fails, then shuts both down within cfg.ShutdownTimeout. It returns
-// nil after a clean, requested shutdown.
+// of them fails, then shuts both down within cfg.ShutdownTimeout. It takes
+// ownership of the listeners and returns nil after a clean, requested
+// shutdown. Without TLS both listeners must be loopback: remote access waits
+// for TLS.
 func (m *Manager) Serve(ctx context.Context, apiLn, grpcLn net.Listener) error {
+	if m.tls == nil {
+		err := errors.Join(netutil.RequireLoopback("api", apiLn), netutil.RequireLoopback("grpc", grpcLn))
+		if err != nil {
+			_ = apiLn.Close()
+			_ = grpcLn.Close()
+			return err
+		}
+	}
 	httpSrv := &http.Server{
 		Handler: api.New(api.Config{
 			Store:   m.store,
@@ -59,8 +77,12 @@ func (m *Manager) Serve(ctx context.Context, apiLn, grpcLn net.Listener) error {
 		IdleTimeout:       60 * time.Second,
 		ErrorLog:          slog.NewLogLogger(m.logger.Handler(), slog.LevelWarn),
 	}
-	nodes := protocol.NewNodeServer(m.store, m.cfg.HeartbeatInterval, m.logger)
-	grpcSrv := protocol.NewGRPCServer(nodes, m.cfg.AgentToken, m.tls)
+	nodes := protocol.NewNodeServer(m.registry, m.cfg.HeartbeatInterval, m.logger)
+	grpcSrv := protocol.NewGRPCServer(nodes, protocol.ServerOptions{
+		Token:          m.cfg.AgentToken,
+		TLS:            m.tls,
+		HandlerTimeout: m.cfg.RequestTimeout,
+	})
 
 	errCh := make(chan error, 2)
 	var wg sync.WaitGroup

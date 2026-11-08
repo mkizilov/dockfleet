@@ -100,4 +100,31 @@ func runStoreConformance(t *testing.T, s Store) {
 	if err != nil || len(ws) != 1 || ws[0].ID != "w1" {
 		t.Fatalf("ListWorkloads = %+v, %v", ws, err)
 	}
+	if gw.StatusUpdatedAt != nil || gw.StatusMessage != "" {
+		t.Fatalf("new workload must have no status report: %+v", gw)
+	}
+
+	forNode, err := s.ListWorkloadsForNode(ctx, "node-a")
+	if err != nil || len(forNode) != 1 || forNode[0].ID != "w1" {
+		t.Fatalf("ListWorkloadsForNode(node-a) = %+v, %v", forNode, err)
+	}
+	other, err := s.ListWorkloadsForNode(ctx, "node-b")
+	if err != nil || other == nil || len(other) != 0 {
+		t.Fatalf("ListWorkloadsForNode(node-b) = %+v, %v; want empty non-nil", other, err)
+	}
+
+	reported := testTime.Add(time.Hour)
+	if err := s.UpdateWorkloadStatus(ctx, "w1", "node-a", WorkloadPending, "accepted", reported); err != nil {
+		t.Fatalf("UpdateWorkloadStatus: %v", err)
+	}
+	gw, err = s.GetWorkload(ctx, "w1")
+	if err != nil || gw.State != WorkloadPending || gw.StatusMessage != "accepted" || gw.StatusUpdatedAt == nil || !gw.StatusUpdatedAt.Equal(reported) {
+		t.Fatalf("workload after status update = %+v, %v", gw, err)
+	}
+	if err := s.UpdateWorkloadStatus(ctx, "w1", "node-b", WorkloadRunning, "", reported); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("status from the wrong node: error = %v, want ErrNotFound", err)
+	}
+	if err := s.UpdateWorkloadStatus(ctx, "nope", "node-a", WorkloadRunning, "", reported); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("status for unknown workload: error = %v, want ErrNotFound", err)
+	}
 }

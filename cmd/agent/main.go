@@ -49,7 +49,7 @@ func run() error {
 			return err
 		}
 	}
-	client, err := protocol.Dial(cfg.ManagerAddr, cfg.Token, tlsConfig)
+	client, err := protocol.Dial(protocol.ClientConfig{Addr: cfg.ManagerAddr, Token: cfg.Token, TLS: tlsConfig})
 	if err != nil {
 		return err
 	}
@@ -64,5 +64,11 @@ func run() error {
 		AgentVersion: version.Version,
 	}
 	logger.Info("starting dockfleet agent", "version", version.Version, "node_id", cfg.NodeID, "manager_addr", cfg.ManagerAddr)
-	return agent.New(node, client, engine, logger).Run(ctx)
+	return agent.New(agent.Config{
+		Node:       node,
+		Manager:    client,
+		Docker:     engine,
+		Logger:     logger,
+		RPCTimeout: cfg.RPCTimeout,
+	}).Run(ctx)
 }

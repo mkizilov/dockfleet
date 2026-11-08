@@ -1,8 +1,8 @@
 # DockFleet
 
-DockFleet is a distributed container orchestration system written in Go. A central **manager** keeps cluster state in PostgreSQL and places workloads; **agents** on worker nodes register with the manager and report liveness.
+DockFleet is a distributed container orchestration system written in Go. A central **manager** keeps cluster state in PostgreSQL and places workloads; **agents** on worker nodes register with the manager, heartbeat, receive their assigned workloads and report status.
 
-> **Status: project skeleton.** Both processes start, authenticate, talk gRPC and shut down gracefully. The manager records placement decisions, but **no containers are created, started or stopped yet**. See [Limitations](#limitations).
+> **Status: early.** The manager-agent gRPC protocol (versioned registration, heartbeats, assignments, status reports) works end to end, and both processes shut down gracefully. The manager records placement decisions, but **no containers are created, started or stopped yet**: agents acknowledge assignments as `pending`. See [Limitations](#limitations).
 
 ## Layout
 
@@ -14,7 +14,10 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 | `internal/scheduler` | Workload placement (pure functions, no I/O)                             |
 | `internal/agent`     | Node logic: register, heartbeat, retry, re-register                     |
 | `internal/store`     | Persistence: `Store` interface, PostgreSQL and in-memory implementations |
-| `internal/protocol`  | gRPC service, client, bearer-token auth, TLS helpers                    |
+| `internal/protocol`  | gRPC service, client, versioning, errors, bearer-token auth, TLS helpers |
+| `internal/registry`  | Manager-side node registry: sessions, heartbeats, status reports        |
+| `internal/netutil`   | Loopback checks behind the plaintext-only-on-loopback rule              |
+| `internal/integration` | Tests running simulated agents against a manager over gRPC           |
 | `internal/docker`    | Docker Engine client (reachability check only for now)                  |
 | `internal/manager`   | Wires the API, gRPC server and store; owns graceful shutdown            |
 | `internal/config`    | Environment-based configuration with secure-default validation          |
@@ -22,7 +25,7 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 | `proto/`             | Protobuf definitions (`buf` module)                                     |
 | `deploy/`            | Docker Compose file for development dependencies                        |
 | `config/dev.env`     | Development-only configuration                                          |
-| `docs/`              | [Architecture](docs/architecture.md)                                    |
+| `docs/`              | [Architecture](docs/architecture.md), [Protocol](docs/protocol.md)      |
 
 ## Prerequisites
 
@@ -33,8 +36,8 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 ## Quick start
 
 ```sh
-make tools          # install pinned buf + protoc plugins into .tools/bin
-make proto          # generate gRPC code (internal/protocol/dockfleet/, not committed)
+make generate       # pinned buf + protoc plugins into .tools/bin, lint, generate gRPC code
+                    # (output: internal/protocol/dockfleet/, not committed)
 make tidy           # resolve modules and write go.sum
 make check          # gofmt check, go vet, unit tests with -race
 make build          # bin/dockfleet-manager and bin/dockfleet-agent
@@ -74,7 +77,11 @@ Stop either process with Ctrl-C or `SIGTERM`; both drain and exit with status 0.
 | `GET /v1/workloads`       | yes  | All workloads                                                       |
 | `GET /v1/workloads/{id}`  | yes  | One workload                                                        |
 
-Errors are `{"error": "..."}`. A workload request that fits on no ready node returns `409`.
+Errors are `{"error": "..."}`. A workload request that fits on no ready node returns `409`. Once the target node's agent reports on a workload, its `state` changes from `scheduled` to the reported state (`pending`, `running`, `succeeded`, `failed`, `stopped`) and `status_message` / `status_updated_at` are filled in.
+
+## Manager-agent protocol
+
+Agents dial the manager over gRPC, send a protocol version, node identity and CPU/memory capacity, heartbeat at the interval the manager returns, receive their assigned workloads and report status. Plaintext is only allowed on loopback; anything else needs TLS plus the bearer token. Versions, errors and the session lifecycle are documented in [docs/protocol.md](docs/protocol.md).
 
 ## Configuration
 
@@ -93,9 +100,11 @@ All settings are environment variables. The manager and agent refuse to start on
 | `DOCKFLEET_TLS_CERT_FILE` / `_KEY_FILE` | manager | unset               | Enables TLS 1.3 on both listeners                          |
 | `DOCKFLEET_HEARTBEAT_INTERVAL`   | manager | `10s`                        | Sent to agents on registration                             |
 | `DOCKFLEET_NODE_TTL`             | manager | `30s`                        | Node is `not_ready` after this long without a heartbeat; at least 2x the interval |
+| `DOCKFLEET_REQUEST_TIMEOUT`      | manager | `10s`                        | Deadline for each gRPC call                                |
 | `DOCKFLEET_SHUTDOWN_TIMEOUT`     | manager | `15s`                        | Drain budget before connections are forced closed          |
 | `DOCKFLEET_MANAGER_ADDR`         | agent   | `127.0.0.1:21281`            | Non-loopback requires `DOCKFLEET_TLS_CA_FILE`              |
 | `DOCKFLEET_TLS_CA_FILE`          | agent   | unset                        | CA bundle that signed the manager certificate              |
+| `DOCKFLEET_RPC_TIMEOUT`          | agent   | `5s`                         | Deadline for each call to the manager                      |
 | `DOCKFLEET_NODE_ID`              | agent   | hostname                     | `[A-Za-z0-9._-]`, at most 63 characters                    |
 | `DOCKFLEET_NODE_NAME`            | agent   | node ID                      |                                                            |
 | `DOCKFLEET_NODE_CPU_MILLIS`      | agent   | CPU count x 1000             | Declared capacity                                          |
@@ -111,13 +120,14 @@ make cover              # per-package coverage
 make test-integration   # PostgreSQL store tests; needs `make compose-up`
 ```
 
-Unit tests need no Docker, database or network. Network-style tests use in-memory transports (`bufconn`, fake HTTP round-trippers) or loopback ports 21290-21291 (`internal/manager`). PostgreSQL tests are behind the `integration` build tag and read `DOCKFLEET_TEST_DATABASE_URL`.
+Unit tests need no Docker, database or network. `internal/integration` runs real agent loops against a real manager over gRPC on an in-memory transport (registration, heartbeats, assignments and status reports, manager restart and reconnection, long outages, graceful deregistration, superseded sessions, incompatible protocol versions, bad credentials). Other network-style tests use `bufconn`, fake HTTP round-trippers, or loopback ports 21290-21293 (`internal/manager`). PostgreSQL tests are behind the `integration` build tag and read `DOCKFLEET_TEST_DATABASE_URL`.
 
-Generated protobuf code is not committed, so run `make proto` after a fresh clone and after editing `proto/`.
+Generated protobuf code is not committed, so run `make generate` after a fresh clone and `make proto` after editing `proto/`.
 
 ## Limitations
 
-- No container lifecycle: `scheduled` workloads are never started, and nothing reconciles them.
+- No container lifecycle: assigned workloads are never started, so agents report them `pending`, and nothing reconciles failures.
+- Sessions are held in manager memory (one manager only); two agents configured with the same node ID will keep superseding each other.
 - Scheduling is a single-manager spread strategy; a lock serializes placement in one process only.
 - Node capacity is declared by the agent, not measured.
 - Registered nodes are never deleted; dead nodes stay listed as `not_ready`.

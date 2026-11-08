@@ -12,7 +12,15 @@ var (
 	ErrConflict = errors.New("already exists")
 )
 
-const WorkloadScheduled = "scheduled"
+// Workload states. The manager sets scheduled; the rest are reported by agents.
+const (
+	WorkloadScheduled = "scheduled"
+	WorkloadPending   = "pending"
+	WorkloadRunning   = "running"
+	WorkloadSucceeded = "succeeded"
+	WorkloadFailed    = "failed"
+	WorkloadStopped   = "stopped"
+)
 
 var namePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`)
 
@@ -34,14 +42,16 @@ type Node struct {
 
 // Workload is desired state only: a placement decision, nothing is run yet.
 type Workload struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Image       string    `json:"image"`
-	CPUMillis   int64     `json:"cpu_millis"`
-	MemoryBytes int64     `json:"memory_bytes"`
-	NodeID      string    `json:"node_id"`
-	State       string    `json:"state"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID              string     `json:"id"`
+	Name            string     `json:"name"`
+	Image           string     `json:"image"`
+	CPUMillis       int64      `json:"cpu_millis"`
+	MemoryBytes     int64      `json:"memory_bytes"`
+	NodeID          string     `json:"node_id"`
+	State           string     `json:"state"`
+	StatusMessage   string     `json:"status_message"`
+	StatusUpdatedAt *time.Time `json:"status_updated_at,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
 }
 
 // Store persists cluster state. Implementations must be safe for concurrent use.
@@ -58,6 +68,11 @@ type Store interface {
 	CreateWorkload(ctx context.Context, w Workload) (Workload, error)
 	GetWorkload(ctx context.Context, id string) (Workload, error)
 	ListWorkloads(ctx context.Context) ([]Workload, error)
+	// ListWorkloadsForNode returns the workloads assigned to nodeID, ordered by name.
+	ListWorkloadsForNode(ctx context.Context, nodeID string) ([]Workload, error)
+	// UpdateWorkloadStatus records an agent-reported state. It returns
+	// ErrNotFound when the workload does not exist or is assigned to another node.
+	UpdateWorkloadStatus(ctx context.Context, id, nodeID, state, message string, at time.Time) error
 
 	Ping(ctx context.Context) error
 	Close()

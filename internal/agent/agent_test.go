@@ -13,18 +13,28 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/dockfleet/dockfleet/internal/protocol"
+	dockfleetv1 "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/v1"
 )
 
-type fakeManager struct {
-	mu             sync.Mutex
-	registerErrs   []error // consumed one per RegisterNode call
-	registerCalls  int
-	heartbeatCalls int
-	heartbeatErrs  []error // consumed one per Heartbeat call
-	interval       time.Duration
+type heartbeatCall struct {
+	sessionID string
+	statuses  []*dockfleetv1.WorkloadStatus
 }
 
-func (f *fakeManager) RegisterNode(context.Context, protocol.NodeInfo) (time.Duration, error) {
+type fakeManager struct {
+	mu            sync.Mutex
+	sessionSeq    int
+	registerErrs  []error // consumed one per Register call; nil entries succeed
+	registerCalls int
+	heartbeatErrs []error // consumed one per Heartbeat call; nil entries succeed
+	heartbeats    []heartbeatCall
+	assignments   []*dockfleetv1.WorkloadAssignment
+	deregistered  []string
+	deregisterErr error
+	interval      time.Duration
+}
+
+func (f *fakeManager) Register(context.Context, protocol.NodeInfo) (protocol.Session, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.registerCalls++
@@ -32,28 +42,50 @@ func (f *fakeManager) RegisterNode(context.Context, protocol.NodeInfo) (time.Dur
 		err := f.registerErrs[0]
 		f.registerErrs = f.registerErrs[1:]
 		if err != nil {
-			return 0, err
+			return protocol.Session{}, err
 		}
 	}
-	return f.interval, nil
+	f.sessionSeq++
+	return protocol.Session{ID: "session-" + string(rune('0'+f.sessionSeq)), HeartbeatInterval: f.interval, Assignments: f.assignments}, nil
 }
 
-func (f *fakeManager) Heartbeat(context.Context, string) error {
+func (f *fakeManager) Heartbeat(_ context.Context, _, sessionID string, statuses []*dockfleetv1.WorkloadStatus) ([]*dockfleetv1.WorkloadAssignment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.heartbeatCalls++
+	f.heartbeats = append(f.heartbeats, heartbeatCall{sessionID: sessionID, statuses: statuses})
 	if len(f.heartbeatErrs) > 0 {
 		err := f.heartbeatErrs[0]
 		f.heartbeatErrs = f.heartbeatErrs[1:]
-		return err
+		if err != nil {
+			return nil, err
+		}
 	}
-	return nil
+	return f.assignments, nil
 }
 
-func (f *fakeManager) counts() (registers, heartbeats int) {
+func (f *fakeManager) Deregister(_ context.Context, _, sessionID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.registerCalls, f.heartbeatCalls
+	f.deregistered = append(f.deregistered, sessionID)
+	return f.deregisterErr
+}
+
+func (f *fakeManager) registers() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.registerCalls
+}
+
+func (f *fakeManager) calls() []heartbeatCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]heartbeatCall(nil), f.heartbeats...)
+}
+
+func (f *fakeManager) deregistrations() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.deregistered...)
 }
 
 type fakeDocker struct{ err error }
@@ -62,34 +94,56 @@ func (d fakeDocker) Ping(context.Context) error { return d.err }
 func (d fakeDocker) Close() error               { return nil }
 
 func newTestAgent(m Manager, d fakeDocker) *Agent {
-	a := New(protocol.NodeInfo{ID: "node-1"}, m, d, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	a.retryMin = time.Millisecond
-	a.retryMax = 4 * time.Millisecond
-	return a
+	return New(Config{
+		Node:       protocol.NodeInfo{ID: "node-1"},
+		Manager:    m,
+		Docker:     d,
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		RPCTimeout: time.Second,
+		RetryMin:   time.Millisecond,
+		RetryMax:   4 * time.Millisecond,
+	})
 }
 
-func startAgent(t *testing.T, a *Agent) (stop func() error) {
+type running struct {
+	t      *testing.T
+	cancel context.CancelFunc
+	done   chan error
+	once   sync.Once
+	result error
+}
+
+func start(t *testing.T, a *Agent) *running {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- a.Run(ctx) }()
-	stopped := false
-	stop = func() error {
-		if stopped {
-			return nil
-		}
-		stopped = true
-		cancel()
+	r := &running{t: t, cancel: cancel, done: make(chan error, 1)}
+	go func() { r.done <- a.Run(ctx) }()
+	t.Cleanup(func() { _ = r.stop() })
+	return r
+}
+
+// stop cancels the agent and returns what Run returned.
+func (r *running) stop() error {
+	r.once.Do(func() {
+		r.cancel()
 		select {
-		case err := <-done:
-			return err
+		case r.result = <-r.done:
 		case <-time.After(5 * time.Second):
-			t.Fatal("agent did not stop after context cancellation")
-			return nil
+			r.t.Error("agent did not stop after context cancellation")
 		}
+	})
+	return r.result
+}
+
+// wait returns Run's result without canceling, for agents expected to exit on their own.
+func (r *running) wait() error {
+	select {
+	case err := <-r.done:
+		return err
+	case <-time.After(5 * time.Second):
+		r.t.Fatal("agent did not exit on its own")
+		return nil
 	}
-	t.Cleanup(func() { _ = stop() })
-	return stop
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -103,71 +157,169 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-func TestRunRegistersThenHeartbeatsAndStopsCleanly(t *testing.T) {
-	m := &fakeManager{interval: 2 * time.Millisecond}
-	stop := startAgent(t, newTestAgent(m, fakeDocker{}))
+func assignment(id string) *dockfleetv1.WorkloadAssignment {
+	return &dockfleetv1.WorkloadAssignment{WorkloadId: id, Name: id, Image: "img"}
+}
 
-	waitFor(t, "three heartbeats", func() bool { _, h := m.counts(); return h >= 3 })
-	if err := stop(); err != nil {
+func TestRunRegistersHeartbeatsAndDeregistersOnShutdown(t *testing.T) {
+	m := &fakeManager{interval: 2 * time.Millisecond}
+	r := start(t, newTestAgent(m, fakeDocker{}))
+
+	waitFor(t, "three heartbeats", func() bool { return len(m.calls()) >= 3 })
+	if err := r.stop(); err != nil {
 		t.Fatalf("Run returned %v, want nil on cancellation", err)
 	}
-	if r, _ := m.counts(); r != 1 {
-		t.Errorf("registered %d times, want 1", r)
+	if m.registers() != 1 {
+		t.Errorf("registered %d times, want 1", m.registers())
+	}
+	for _, c := range m.calls() {
+		if c.sessionID != "session-1" {
+			t.Fatalf("heartbeat used session %q, want session-1", c.sessionID)
+		}
+	}
+	if got := m.deregistrations(); len(got) != 1 || got[0] != "session-1" {
+		t.Errorf("deregistrations = %v, want [session-1]", got)
 	}
 }
 
 func TestRunRetriesRegistrationUntilManagerIsAvailable(t *testing.T) {
-	m := &fakeManager{
-		interval:     2 * time.Millisecond,
-		registerErrs: []error{errors.New("down"), errors.New("down"), errors.New("down")},
-	}
-	startAgent(t, newTestAgent(m, fakeDocker{}))
+	down := status.Error(codes.Unavailable, "down")
+	m := &fakeManager{interval: 2 * time.Millisecond, registerErrs: []error{down, down, down}}
+	start(t, newTestAgent(m, fakeDocker{}))
 
-	waitFor(t, "a heartbeat after retries", func() bool { _, h := m.counts(); return h >= 1 })
-	if r, _ := m.counts(); r != 4 {
-		t.Errorf("registered %d times, want 4 (3 failures + 1 success)", r)
+	waitFor(t, "a heartbeat after retries", func() bool { return len(m.calls()) >= 1 })
+	if m.registers() != 4 {
+		t.Errorf("registered %d times, want 4 (3 failures + 1 success)", m.registers())
 	}
 }
 
-func TestRunReRegistersWhenManagerForgetsNode(t *testing.T) {
-	m := &fakeManager{
-		interval:      2 * time.Millisecond,
-		heartbeatErrs: []error{status.Error(codes.NotFound, "node is not registered")},
+func TestRunStopsOnPermanentRegistrationErrors(t *testing.T) {
+	tests := map[string]error{
+		"incompatible version": &protocol.Error{Code: dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_INCOMPATIBLE_VERSION, Message: "major mismatch"},
+		"invalid request":      &protocol.Error{Code: dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_INVALID_REQUEST, Message: "bad node id"},
+		"bad credentials":      status.Error(codes.Unauthenticated, "no"),
 	}
-	startAgent(t, newTestAgent(m, fakeDocker{}))
-
-	waitFor(t, "re-registration", func() bool { r, _ := m.counts(); return r >= 2 })
+	for name, cause := range tests {
+		t.Run(name, func(t *testing.T) {
+			m := &fakeManager{registerErrs: []error{cause}}
+			r := start(t, newTestAgent(m, fakeDocker{}))
+			err := r.wait()
+			if err == nil || !errors.Is(err, cause) {
+				t.Fatalf("Run returned %v, want an error wrapping %v", err, cause)
+			}
+			if m.registers() != 1 {
+				t.Errorf("a permanent rejection must not be retried, got %d attempts", m.registers())
+			}
+			if len(m.deregistrations()) != 0 {
+				t.Error("an agent that never registered must not deregister")
+			}
+		})
+	}
 }
 
-func TestRunSurvivesHeartbeatFailures(t *testing.T) {
-	m := &fakeManager{
-		interval:      2 * time.Millisecond,
-		heartbeatErrs: []error{errors.New("blip"), errors.New("blip")},
-	}
-	startAgent(t, newTestAgent(m, fakeDocker{}))
+func TestRunRegistersAgainWhenSessionIsLost(t *testing.T) {
+	lost := &protocol.Error{Code: dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_REGISTERED, Message: "restarted"}
+	m := &fakeManager{interval: 2 * time.Millisecond, heartbeatErrs: []error{lost}}
+	start(t, newTestAgent(m, fakeDocker{}))
 
-	waitFor(t, "heartbeats after transient errors", func() bool { _, h := m.counts(); return h >= 4 })
-	if r, _ := m.counts(); r != 1 {
-		t.Errorf("transient errors must not trigger re-registration, got %d registrations", r)
+	waitFor(t, "a heartbeat on the second session", func() bool {
+		for _, c := range m.calls() {
+			if c.sessionID == "session-2" {
+				return true
+			}
+		}
+		return false
+	})
+	if m.registers() != 2 {
+		t.Errorf("registered %d times, want 2", m.registers())
+	}
+}
+
+func TestRunSurvivesTransientHeartbeatFailures(t *testing.T) {
+	blip := status.Error(codes.Unavailable, "blip")
+	m := &fakeManager{interval: 2 * time.Millisecond, heartbeatErrs: []error{blip, blip, context.DeadlineExceeded}}
+	start(t, newTestAgent(m, fakeDocker{}))
+
+	waitFor(t, "heartbeats after transient errors", func() bool { return len(m.calls()) >= 5 })
+	if m.registers() != 1 {
+		t.Errorf("transient errors must not trigger re-registration, got %d registrations", m.registers())
 	}
 }
 
 func TestRunStopsWhileManagerIsDown(t *testing.T) {
-	m := &fakeManager{registerErrs: []error{errors.New("down")}}
+	m := &fakeManager{registerErrs: []error{status.Error(codes.Unavailable, "down")}}
 	a := newTestAgent(m, fakeDocker{})
-	a.retryMin = time.Hour
-	a.retryMax = time.Hour
-	stop := startAgent(t, a)
+	a.cfg.RetryMin = time.Hour
+	a.cfg.RetryMax = time.Hour
+	r := start(t, a)
 
-	waitFor(t, "first registration attempt", func() bool { r, _ := m.counts(); return r >= 1 })
-	if err := stop(); err != nil {
+	waitFor(t, "the first registration attempt", func() bool { return m.registers() >= 1 })
+	if err := r.stop(); err != nil {
 		t.Fatalf("Run returned %v, want nil", err)
+	}
+	if len(m.deregistrations()) != 0 {
+		t.Error("an agent that never registered must not deregister")
+	}
+}
+
+func TestStatusReportsFollowAssignments(t *testing.T) {
+	m := &fakeManager{interval: 2 * time.Millisecond, assignments: []*dockfleetv1.WorkloadAssignment{assignment("w2"), assignment("w1")}}
+	start(t, newTestAgent(m, fakeDocker{}))
+
+	waitFor(t, "a heartbeat", func() bool { return len(m.calls()) >= 1 })
+	first := m.calls()[0].statuses
+	if len(first) != 2 || first[0].GetWorkloadId() != "w1" || first[1].GetWorkloadId() != "w2" {
+		t.Fatalf("statuses must cover every assignment, ordered by ID: %v", first)
+	}
+	for _, st := range first {
+		if st.GetPhase() != dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_PENDING || st.GetMessage() != runtimeMissing {
+			t.Fatalf("unexpected status %v", st)
+		}
+	}
+
+	m.mu.Lock()
+	m.assignments = []*dockfleetv1.WorkloadAssignment{assignment("w1")}
+	m.mu.Unlock()
+	waitFor(t, "w2 to be dropped from reports", func() bool {
+		calls := m.calls()
+		return len(calls[len(calls)-1].statuses) == 1
+	})
+}
+
+func TestReconcileKeepsExistingStatuses(t *testing.T) {
+	a := newTestAgent(&fakeManager{}, fakeDocker{})
+	a.reconcile([]*dockfleetv1.WorkloadAssignment{assignment("w1")})
+	a.statuses["w1"].Phase = dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_RUNNING
+	a.reconcile([]*dockfleetv1.WorkloadAssignment{assignment("w1"), assignment("w2")})
+
+	if a.statuses["w1"].GetPhase() != dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_RUNNING {
+		t.Error("reconcile must not reset a known workload")
+	}
+	if a.statuses["w2"].GetPhase() != dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_PENDING {
+		t.Error("a new workload must start pending")
+	}
+	a.reconcile(nil)
+	if len(a.statuses) != 0 {
+		t.Errorf("unassigned workloads must be forgotten: %v", a.statuses)
 	}
 }
 
 func TestRunToleratesUnreachableDocker(t *testing.T) {
 	m := &fakeManager{interval: 2 * time.Millisecond}
-	startAgent(t, newTestAgent(m, fakeDocker{err: errors.New("no socket")}))
+	start(t, newTestAgent(m, fakeDocker{err: errors.New("no socket")}))
 
-	waitFor(t, "a heartbeat", func() bool { _, h := m.counts(); return h >= 1 })
+	waitFor(t, "a heartbeat", func() bool { return len(m.calls()) >= 1 })
+}
+
+func TestDeregisterFailureDoesNotFailShutdown(t *testing.T) {
+	m := &fakeManager{interval: 2 * time.Millisecond, deregisterErr: errors.New("manager gone")}
+	r := start(t, newTestAgent(m, fakeDocker{}))
+
+	waitFor(t, "a heartbeat", func() bool { return len(m.calls()) >= 1 })
+	if err := r.stop(); err != nil {
+		t.Fatalf("Run returned %v, want nil", err)
+	}
+	if len(m.deregistrations()) != 1 {
+		t.Errorf("deregistrations = %v, want one attempt", m.deregistrations())
+	}
 }

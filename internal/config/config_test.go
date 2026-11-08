@@ -29,7 +29,7 @@ func TestLoadManagerDefaults(t *testing.T) {
 	if c.Store != "postgres" || c.LogFormat != "json" || c.LogLevel != "info" {
 		t.Errorf("unexpected defaults: %+v", c)
 	}
-	if c.HeartbeatInterval != 10*time.Second || c.NodeTTL != 30*time.Second || c.ShutdownTimeout != 15*time.Second {
+	if c.HeartbeatInterval != 10*time.Second || c.NodeTTL != 30*time.Second || c.ShutdownTimeout != 15*time.Second || c.RequestTimeout != 10*time.Second {
 		t.Errorf("unexpected durations: %+v", c)
 	}
 }
@@ -50,6 +50,7 @@ func TestLoadManagerRejectsInsecureOrInvalid(t *testing.T) {
 		{"cert without key", func(m map[string]string) { m["DOCKFLEET_TLS_CERT_FILE"] = "c.pem" }, "set together"},
 		{"bad duration", func(m map[string]string) { m["DOCKFLEET_NODE_TTL"] = "soon" }, "DOCKFLEET_NODE_TTL"},
 		{"ttl too small", func(m map[string]string) { m["DOCKFLEET_NODE_TTL"] = "15s" }, "twice"},
+		{"bad request timeout", func(m map[string]string) { m["DOCKFLEET_REQUEST_TIMEOUT"] = "0s" }, "DOCKFLEET_REQUEST_TIMEOUT"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -114,7 +115,7 @@ func TestLoadAgent(t *testing.T) {
 	if c.Labels["zone"] != "a" || c.Labels["tier"] != "gold" || len(c.Labels) != 2 {
 		t.Errorf("unexpected labels: %v", c.Labels)
 	}
-	if c.ManagerAddr != "127.0.0.1:21281" || c.DockerHost != "unix:///var/run/docker.sock" {
+	if c.ManagerAddr != "127.0.0.1:21281" || c.DockerHost != "unix:///var/run/docker.sock" || c.RPCTimeout != 5*time.Second {
 		t.Errorf("unexpected defaults: %+v", c)
 	}
 }
@@ -129,6 +130,7 @@ func TestLoadAgentRejectsInvalid(t *testing.T) {
 		{"bad node id", func(m map[string]string) { m["DOCKFLEET_NODE_ID"] = "bad id" }, "invalid"},
 		{"bad label", func(m map[string]string) { m["DOCKFLEET_NODE_LABELS"] = "novalue" }, "DOCKFLEET_NODE_LABELS"},
 		{"bad memory", func(m map[string]string) { m["DOCKFLEET_NODE_MEMORY_MB"] = "-5" }, "DOCKFLEET_NODE_MEMORY_MB"},
+		{"bad rpc timeout", func(m map[string]string) { m["DOCKFLEET_RPC_TIMEOUT"] = "fast" }, "DOCKFLEET_RPC_TIMEOUT"},
 		{"remote manager without CA", func(m map[string]string) { m["DOCKFLEET_MANAGER_ADDR"] = "manager.example.com:443" }, "DOCKFLEET_TLS_CA_FILE"},
 	}
 	for _, tt := range tests {
@@ -149,16 +151,5 @@ func TestLoadAgentRemoteManagerWithCA(t *testing.T) {
 	vars["DOCKFLEET_TLS_CA_FILE"] = "ca.pem"
 	if _, err := LoadAgent(getenv(vars)); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestIsLoopbackAddr(t *testing.T) {
-	for addr, want := range map[string]bool{
-		"127.0.0.1:1": true, "localhost:1": true, "[::1]:1": true,
-		"0.0.0.0:1": false, ":1": false, "10.0.0.1:1": false, "nonsense": false,
-	} {
-		if got := isLoopbackAddr(addr); got != want {
-			t.Errorf("isLoopbackAddr(%q) = %v, want %v", addr, got, want)
-		}
 	}
 }

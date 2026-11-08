@@ -113,6 +113,33 @@ func (m *Memory) ListWorkloads(_ context.Context) ([]Workload, error) {
 	return out, nil
 }
 
+func (m *Memory) ListWorkloadsForNode(_ context.Context, nodeID string) ([]Workload, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := []Workload{}
+	for _, w := range m.workloads {
+		if w.NodeID == nodeID {
+			out = append(out, w)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func (m *Memory) UpdateWorkloadStatus(_ context.Context, id, nodeID, state, message string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	w, ok := m.workloads[id]
+	if !ok || w.NodeID != nodeID {
+		return ErrNotFound
+	}
+	w.State = state
+	w.StatusMessage = message
+	w.StatusUpdatedAt = &at
+	m.workloads[id] = w
+	return nil
+}
+
 func (m *Memory) Ping(context.Context) error { return nil }
 
 func (m *Memory) Close() {}

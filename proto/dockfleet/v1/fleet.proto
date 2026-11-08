@@ -4,33 +4,137 @@ package dockfleet.v1;
 
 option go_package = "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/v1;dockfleetv1";
 
-// NodeService is served by the manager and called by agents.
+// NodeService is served by the manager and called by agents. Agents always
+// dial the manager; the manager never connects to agents.
+//
+// Lifecycle:
+//  1. RegisterNode: the agent announces its protocol version, identity and
+//     capacity. The manager checks the version, persists the node and returns
+//     a session_id plus the workloads currently assigned to the node.
+//  2. Heartbeat (every heartbeat_interval_ms): the agent proves liveness and
+//     reports the status of every workload it knows about. The manager answers
+//     with the complete set of workloads assigned to the node.
+//  3. DeregisterNode: the agent announces a clean shutdown so the manager can
+//     mark the node unavailable immediately instead of waiting for a timeout.
+//
+// Failures that the agent can act on carry a ProtocolError in the gRPC status
+// details. See docs/protocol.md.
 service NodeService {
-  // RegisterNode announces a node and its declared capacity. It is idempotent
-  // and is repeated by an agent whenever the manager forgets the node.
+  // RegisterNode is idempotent. Registering a node that already has a session
+  // replaces that session; the older session is then SESSION_SUPERSEDED.
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
 
-  // Heartbeat refreshes the liveness timestamp of a registered node.
-  // It returns NOT_FOUND when the node is not registered.
+  // Heartbeat refreshes liveness, records workload status reports and returns
+  // the desired workload set. It fails with NOT_REGISTERED or
+  // SESSION_SUPERSEDED when the agent must register again.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // DeregisterNode ends a session. It is best effort and never required.
+  rpc DeregisterNode(DeregisterNodeRequest) returns (DeregisterNodeResponse);
+}
+
+// ProtocolVersion identifies the wire protocol. A different major version is
+// incompatible. A manager accepts an agent with the same major version and a
+// minor version no newer than its own; an agent accepts a manager with the
+// same major version.
+message ProtocolVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+}
+
+// NodeIdentity names a node. node_id is chosen by the operator, must be stable
+// across agent restarts and unique in the fleet.
+message NodeIdentity {
+  string node_id = 1;
+  string name = 2;
+  map<string, string> labels = 3;
+  string agent_version = 4;
+}
+
+// NodeCapacity is the total resources the node offers, as declared by the agent.
+message NodeCapacity {
+  int64 cpu_millis = 1;
+  int64 memory_bytes = 2;
+}
+
+// WorkloadAssignment is the desired state of one workload on the node.
+message WorkloadAssignment {
+  string workload_id = 1;
+  string name = 2;
+  string image = 3;
+  int64 cpu_millis = 4;
+  int64 memory_bytes = 5;
+}
+
+enum WorkloadPhase {
+  WORKLOAD_PHASE_UNSPECIFIED = 0;
+  // The agent accepted the assignment but has not started it.
+  WORKLOAD_PHASE_PENDING = 1;
+  WORKLOAD_PHASE_RUNNING = 2;
+  WORKLOAD_PHASE_SUCCEEDED = 3;
+  WORKLOAD_PHASE_FAILED = 4;
+  WORKLOAD_PHASE_STOPPED = 5;
+}
+
+// WorkloadStatus is the agent's observation of one workload.
+message WorkloadStatus {
+  string workload_id = 1;
+  WorkloadPhase phase = 2;
+  string message = 3;
+}
+
+enum ProtocolErrorCode {
+  PROTOCOL_ERROR_CODE_UNSPECIFIED = 0;
+  // The peer's protocol version is not supported. Do not retry.
+  PROTOCOL_ERROR_CODE_INCOMPATIBLE_VERSION = 1;
+  // The manager has no session for this node (for example after a restart).
+  // Register again.
+  PROTOCOL_ERROR_CODE_NOT_REGISTERED = 2;
+  // A newer registration replaced this session. Register again.
+  PROTOCOL_ERROR_CODE_SESSION_SUPERSEDED = 3;
+  // The request is malformed or violates a limit. Do not retry unchanged.
+  PROTOCOL_ERROR_CODE_INVALID_REQUEST = 4;
+}
+
+// ProtocolError is attached to the gRPC status details of failed calls.
+message ProtocolError {
+  ProtocolErrorCode code = 1;
+  string message = 2;
+  // The sender's own protocol version, so the peer can report a useful mismatch.
+  ProtocolVersion supported_version = 3;
 }
 
 message RegisterNodeRequest {
-  string node_id = 1;
-  string name = 2;
-  int64 cpu_millis = 3;
-  int64 memory_bytes = 4;
-  map<string, string> labels = 5;
-  string agent_version = 6;
+  ProtocolVersion protocol_version = 1;
+  NodeIdentity identity = 2;
+  NodeCapacity capacity = 3;
 }
 
 message RegisterNodeResponse {
-  // Interval at which the agent should send heartbeats.
-  int64 heartbeat_interval_ms = 1;
+  ProtocolVersion protocol_version = 1;
+  // Opaque session token; send it with every Heartbeat and DeregisterNode.
+  string session_id = 2;
+  int64 heartbeat_interval_ms = 3;
+  // The complete set of workloads assigned to the node right now.
+  repeated WorkloadAssignment assignments = 4;
 }
 
 message HeartbeatRequest {
   string node_id = 1;
+  string session_id = 2;
+  // The complete set of workloads the agent knows about.
+  repeated WorkloadStatus statuses = 3;
 }
 
-message HeartbeatResponse {}
+message HeartbeatResponse {
+  // The complete set of workloads assigned to the node right now. A workload
+  // missing from this list is no longer assigned.
+  repeated WorkloadAssignment assignments = 1;
+}
+
+message DeregisterNodeRequest {
+  string node_id = 1;
+  string session_id = 2;
+}
+
+message DeregisterNodeResponse {}

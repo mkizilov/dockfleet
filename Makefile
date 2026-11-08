@@ -29,6 +29,9 @@ tools: ## Install pinned buf and protoc plugins into .tools/bin
 proto: ## Generate Go code from proto/ (required before build and test)
 	buf generate proto
 
+.PHONY: generate
+generate: tools proto-lint proto ## One-shot reproducible bindings: pinned tools, lint, generate
+
 .PHONY: proto-lint
 proto-lint: ## Lint the protobuf definitions
 	buf lint proto

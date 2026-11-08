@@ -23,9 +23,10 @@ DockFleet is a distributed container orchestration system: a manager (control pl
 ### Layout and dependency direction
 
 - `cmd/manager`, `cmd/agent`: entry points only. Parse config, wire dependencies, handle signals. No business logic.
-- `internal/manager` wires `api`, `protocol` and `store`; `internal/agent` wires `protocol` and `docker`.
-- `internal/api` (admin HTTP), `internal/protocol` (gRPC), `internal/scheduler` (pure placement), `internal/store` (persistence), `internal/docker` (Engine client), `internal/config`, `internal/logging`.
-- Lower layers (`store`, `scheduler`, `config`, `logging`) must not import `api`, `protocol`, `manager` or `agent`. Depend on small interfaces (`store.Store`, `protocol.Registry`, `agent.Manager`, `docker.Client`) so each package is testable with fakes.
+- `internal/manager` wires `api`, `protocol`, `registry` and `store`; `internal/agent` wires `protocol` and `docker`.
+- `internal/api` (admin HTTP), `internal/protocol` (gRPC service, client, versioning), `internal/registry` (manager-side node sessions), `internal/scheduler` (pure placement), `internal/store` (persistence), `internal/docker` (Engine client), `internal/netutil`, `internal/config`, `internal/logging`. `internal/integration` is tests only.
+- Lower layers (`store`, `scheduler`, `registry`, `config`, `logging`, `netutil`) must not import `api`, `protocol`, `manager` or `agent`. Depend on small interfaces (`store.Store`, `registry.Store`, `protocol.Registry`, `agent.Manager`, `docker.Client`) so each package is testable with fakes.
+- The wire protocol is `proto/dockfleet/v1/fleet.proto` and `docs/protocol.md`. Any protocol change updates both, follows the versioning rules there, and is exercised in `internal/integration`.
 - Generated protobuf code lives in `internal/protocol/dockfleet/` and is git-ignored. Edit `proto/`, then run `make proto`. Never hand-edit generated files.
 
 ### Scoped changes
@@ -39,7 +40,7 @@ DockFleet is a distributed container orchestration system: a manager (control pl
 ### Test coverage
 
 - Every new package or behavior ships with tests in the same change; bug fixes include a regression test that fails without the fix.
-- Test through interfaces with fakes. Use `bufconn` for gRPC and `httptest` recorders or fake `http.RoundTripper`s for HTTP and Docker; open a real socket only when the test is about the socket, and then only on `127.0.0.1` in ports 21200–21299 (currently 21290–21291 in `internal/manager`). Use `t.TempDir()` for files.
+- Test through interfaces with fakes. Use `bufconn` for gRPC and `httptest` recorders or fake `http.RoundTripper`s for HTTP and Docker; open a real socket only when the test is about the socket, and then only on `127.0.0.1` in ports 21200–21299 (currently 21290–21293 in `internal/manager`; `internal/integration` uses an in-memory transport and no ports). Use `t.TempDir()` for files.
 - Tests must not need Docker, a database or the internet. PostgreSQL tests are tagged `integration` and read `DOCKFLEET_TEST_DATABASE_URL`; both stores must keep passing `runStoreConformance`.
 - Tests must be deterministic: no fixed sleeps as synchronization (poll with a deadline), injected clocks where time matters, and `-race` clean.
 - Cover failure paths (bad input, auth failure, dependency errors, cancellation), not only success.
@@ -63,8 +64,8 @@ DockFleet is a distributed container orchestration system: a manager (control pl
 Run from the repository root with a Go 1.23+ toolchain, installed under this repository (for example in `.tools/` or `.agent-local/`) when working in the sandbox.
 
 ```sh
-make tools              # pinned buf + protoc plugins into .tools/bin (needs network)
-make proto-lint proto   # lint and generate protobuf code
+make generate           # pinned buf + protoc plugins into .tools/bin, lint, generate code (needs network once)
+make proto-lint proto   # lint and generate protobuf code with the tools already installed
 make tidy               # go mod tidy; writes go.sum (needs network)
 make check              # gofmt check, go vet, go test -race ./...
 make build              # bin/dockfleet-manager, bin/dockfleet-agent

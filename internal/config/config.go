@@ -3,13 +3,13 @@ package config
 import (
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/dockfleet/dockfleet/internal/netutil"
 	"github.com/dockfleet/dockfleet/internal/store"
 )
 
@@ -36,6 +36,7 @@ type Manager struct {
 	TLSKeyFile        string
 	HeartbeatInterval time.Duration
 	NodeTTL           time.Duration
+	RequestTimeout    time.Duration
 	ShutdownTimeout   time.Duration
 }
 
@@ -52,6 +53,7 @@ type Agent struct {
 	MemoryBytes int64
 	Labels      map[string]string
 	DockerHost  string
+	RPCTimeout  time.Duration
 }
 
 // LoadManager reads and validates manager configuration. Defaults are secure:
@@ -73,6 +75,7 @@ func LoadManager(get Getenv) (Manager, error) {
 	c.TLSKeyFile = env(get, "DOCKFLEET_TLS_KEY_FILE", "")
 	c.HeartbeatInterval = duration(get, "DOCKFLEET_HEARTBEAT_INTERVAL", 10*time.Second, &errs)
 	c.NodeTTL = duration(get, "DOCKFLEET_NODE_TTL", 30*time.Second, &errs)
+	c.RequestTimeout = duration(get, "DOCKFLEET_REQUEST_TIMEOUT", 10*time.Second, &errs)
 	c.ShutdownTimeout = duration(get, "DOCKFLEET_SHUTDOWN_TIMEOUT", 15*time.Second, &errs)
 
 	switch c.Store {
@@ -105,7 +108,7 @@ func LoadManager(get Getenv) (Manager, error) {
 			{"DOCKFLEET_API_ADDR", c.APIAddr},
 			{"DOCKFLEET_GRPC_ADDR", c.GRPCAddr},
 		} {
-			if !isLoopbackAddr(a.addr) {
+			if !netutil.IsLoopbackAddr(a.addr) {
 				fail("%s=%q is not a loopback address; configure TLS or bind to loopback", a.name, a.addr)
 			}
 		}
@@ -133,6 +136,7 @@ func LoadAgent(get Getenv) (Agent, error) {
 	c.Token = env(get, "DOCKFLEET_AGENT_TOKEN", "")
 	c.TLSCAFile = env(get, "DOCKFLEET_TLS_CA_FILE", "")
 	c.DockerHost = env(get, "DOCKFLEET_DOCKER_HOST", "unix:///var/run/docker.sock")
+	c.RPCTimeout = duration(get, "DOCKFLEET_RPC_TIMEOUT", 5*time.Second, &errs)
 	c.CPUMillis = positiveInt(get, "DOCKFLEET_NODE_CPU_MILLIS", int64(runtime.NumCPU())*1000, &errs)
 	// Declared capacity, not measured: host memory detection is future work.
 	c.MemoryBytes = positiveInt(get, "DOCKFLEET_NODE_MEMORY_MB", 1024, &errs) << 20
@@ -159,7 +163,7 @@ func LoadAgent(get Getenv) (Agent, error) {
 	if len(c.Token) < minTokenLength {
 		fail("DOCKFLEET_AGENT_TOKEN must be set to at least %d characters", minTokenLength)
 	}
-	if c.TLSCAFile == "" && !isLoopbackAddr(c.ManagerAddr) {
+	if c.TLSCAFile == "" && !netutil.IsLoopbackAddr(c.ManagerAddr) {
 		fail("DOCKFLEET_MANAGER_ADDR=%q is not a loopback address; set DOCKFLEET_TLS_CA_FILE", c.ManagerAddr)
 	}
 
@@ -220,16 +224,4 @@ func parseLabels(raw string) (map[string]string, error) {
 		return nil, fmt.Errorf("at most %d labels are allowed", maxLabels)
 	}
 	return labels, nil
-}
-
-func isLoopbackAddr(addr string) bool {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return false
-	}
-	if host == "localhost" {
-		return true
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }

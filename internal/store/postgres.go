@@ -20,8 +20,11 @@ var migrationFS embed.FS
 const migrationLockID int64 = 0x646f636b666c74
 
 const (
-	nodeColumns     = `id, name, cpu_millis, memory_bytes, labels, agent_version, registered_at, last_heartbeat`
-	workloadColumns = `id, name, image, cpu_millis, memory_bytes, node_id, state, created_at`
+	nodeColumns = `id, name, cpu_millis, memory_bytes, labels, agent_version, registered_at, last_heartbeat`
+	// workloadInsertColumns are the columns a new workload sets; the status
+	// columns are written later by agent reports.
+	workloadInsertColumns = `id, name, image, cpu_millis, memory_bytes, node_id, state, created_at`
+	workloadColumns       = `id, name, image, cpu_millis, memory_bytes, node_id, state, created_at, status_message, status_updated_at`
 )
 
 // Postgres is the PostgreSQL-backed Store.
@@ -126,11 +129,15 @@ func scanNode(row pgx.Row) (Node, error) {
 
 func scanWorkload(row pgx.Row) (Workload, error) {
 	var w Workload
-	err := row.Scan(&w.ID, &w.Name, &w.Image, &w.CPUMillis, &w.MemoryBytes, &w.NodeID, &w.State, &w.CreatedAt)
+	err := row.Scan(&w.ID, &w.Name, &w.Image, &w.CPUMillis, &w.MemoryBytes, &w.NodeID, &w.State, &w.CreatedAt, &w.StatusMessage, &w.StatusUpdatedAt)
 	if err != nil {
 		return Workload{}, mapError(err)
 	}
 	w.CreatedAt = w.CreatedAt.UTC()
+	if w.StatusUpdatedAt != nil {
+		utc := w.StatusUpdatedAt.UTC()
+		w.StatusUpdatedAt = &utc
+	}
 	return w, nil
 }
 
@@ -187,7 +194,7 @@ func (p *Postgres) ListNodes(ctx context.Context) ([]Node, error) {
 
 func (p *Postgres) CreateWorkload(ctx context.Context, w Workload) (Workload, error) {
 	return scanWorkload(p.pool.QueryRow(ctx,
-		`INSERT INTO workloads (`+workloadColumns+`)
+		`INSERT INTO workloads (`+workloadInsertColumns+`)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		 RETURNING `+workloadColumns,
 		w.ID, w.Name, w.Image, w.CPUMillis, w.MemoryBytes, w.NodeID, w.State, w.CreatedAt))
@@ -212,6 +219,36 @@ func (p *Postgres) ListWorkloads(ctx context.Context) ([]Workload, error) {
 		out = append(out, w)
 	}
 	return out, rows.Err()
+}
+
+func (p *Postgres) ListWorkloadsForNode(ctx context.Context, nodeID string) ([]Workload, error) {
+	rows, err := p.pool.Query(ctx, `SELECT `+workloadColumns+` FROM workloads WHERE node_id = $1 ORDER BY name`, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Workload{}
+	for rows.Next() {
+		w, err := scanWorkload(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) UpdateWorkloadStatus(ctx context.Context, id, nodeID, state, message string, at time.Time) error {
+	tag, err := p.pool.Exec(ctx,
+		`UPDATE workloads SET state = $3, status_message = $4, status_updated_at = $5 WHERE id = $1 AND node_id = $2`,
+		id, nodeID, state, message, at)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (p *Postgres) Ping(ctx context.Context) error {
