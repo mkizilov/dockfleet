@@ -1,0 +1,49 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{{.RefreshMeta}}
+<title>{{.Title}} - DockFleet</title>
+<link rel="stylesheet" href="/dashboard/static/style.css">
+</head>
+<body>
+<header>
+<h1>DockFleet</h1>
+{{if .Active}}
+<nav>
+<a href="/dashboard"{{if eq .Active "overview"}} class="active"{{end}}>Overview</a>
+<a href="/dashboard/events"{{if eq .Active "events"}} class="active"{{end}}>Events</a>
+</nav>
+<form method="post" action="/dashboard/logout"><button type="submit">Log out</button></form>
+{{end}}
+</header>
+<main>
+{{template "content" .}}
+</main>
+<footer>Page made <time datetime="{{stamp .Generated}}">{{stamp .Generated}}</time>{{if .Refresh}}; it reloads every {{.Refresh}} seconds{{end}}.</footer>
+</body>
+</html>
+{{end}}
+
+{{define "eventTable"}}
+{{if .}}
+<table class="events">
+<thead><tr><th>When (UTC)</th><th>Action</th><th>Resource</th><th>Message</th><th>Actor</th><th>Details</th></tr></thead>
+<tbody>
+{{range .}}
+<tr>
+<td><time datetime="{{stamp .At}}">{{stamp .At}}</time></td>
+<td><code>{{.Action}}</code></td>
+<td>{{if eq .ResourceType "node"}}<a href="/dashboard/nodes/{{.ResourceID}}">node {{.ResourceID}}</a>{{else}}{{.ResourceType}} <small>{{.ResourceID}}</small>{{end}}</td>
+<td>{{.Message}}</td>
+<td>{{.Actor}}</td>
+<td>{{range kv .Details}}<code>{{.}}</code> {{end}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{else}}
+<p class="empty">No events.</p>
+{{end}}
+{{end}}

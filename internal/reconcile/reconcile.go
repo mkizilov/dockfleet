@@ -31,8 +31,20 @@ type Config struct {
 	// Timing says when a silent node is suspect and when it is given up on and
 	// its replicas are started elsewhere. The zero value never gives up on one.
 	Timing scheduler.Timing
+	// Observer, when set, is told how the loop is doing.
+	Observer Observer
 	// Now defaults to time.Now; tests set it.
 	Now func() time.Time
+}
+
+// Observer is told how the reconciler is doing; the manager turns it into metrics.
+type Observer interface {
+	// ReconcilePass is called after every pass of Run with how long it took and
+	// why it failed, if it did. A pass cut short by shutdown is not reported.
+	ReconcilePass(d time.Duration, report Report, err error)
+	// RolloutFailed is called for each rollout a pass reported failed, once the
+	// pass is saved (a pass that is rolled back reports none).
+	RolloutFailed(service string)
 }
 
 // Reconciler applies Plan to the store.
@@ -121,7 +133,7 @@ func (r *Reconciler) rolloutEvent(at time.Time, svc store.Service, rec store.Rol
 // completed), and closes the records of revisions that were overtaken. It
 // returns how many records it wrote. Nothing here changes a workload.
 func (r *Reconciler) trackRollouts(ctx context.Context, tx store.Tx, defs []store.Definition, workloads []store.Workload,
-	waiting []store.Unschedulable, nodes map[string]string, now time.Time) (int, error) {
+	waiting []store.Unschedulable, nodes map[string]string, now time.Time, failed *[]string) (int, error) {
 	records, err := tx.ListRollouts(ctx, "")
 	if err != nil {
 		return 0, fmt.Errorf("list rollouts: %w", err)
@@ -143,6 +155,9 @@ func (r *Reconciler) trackRollouts(ctx context.Context, tx store.Tx, defs []stor
 			return fmt.Errorf("save the rollout of revision %d of %s: %w", rec.Revision, svc.Name, err)
 		}
 		written++
+		if event == rollout.EventFailed {
+			*failed = append(*failed, svc.Name)
+		}
 		if event == "" {
 			return nil
 		}
@@ -186,8 +201,9 @@ func (r *Reconciler) trackRollouts(ctx context.Context, tx store.Tx, defs []stor
 // and if anything fails nothing is saved and the next pass starts over.
 func (r *Reconciler) RunOnce(ctx context.Context) (Report, error) {
 	var report Report
+	var failed []string
 	err := r.cfg.Store.InTx(ctx, func(tx store.Tx) error {
-		report = Report{}
+		report, failed = Report{}, nil
 		if err := tx.LockPlacement(ctx); err != nil {
 			return err
 		}
@@ -256,7 +272,7 @@ func (r *Reconciler) RunOnce(ctx context.Context) (Report, error) {
 				report.Deleted++
 			}
 		}
-		changed, err := r.trackRollouts(ctx, tx, defs, workloads, waiting, states, now)
+		changed, err := r.trackRollouts(ctx, tx, defs, workloads, waiting, states, now, &failed)
 		if err != nil {
 			return err
 		}
@@ -265,6 +281,11 @@ func (r *Reconciler) RunOnce(ctx context.Context) (Report, error) {
 	})
 	if err != nil {
 		return Report{}, err
+	}
+	if r.cfg.Observer != nil {
+		for _, service := range failed {
+			r.cfg.Observer.RolloutFailed(service)
+		}
 	}
 	return report, nil
 }
@@ -292,7 +313,11 @@ func (r *Reconciler) Run(ctx context.Context) {
 func (r *Reconciler) pass(ctx context.Context) {
 	passCtx, cancel := context.WithTimeout(ctx, max(r.cfg.Interval, maxPassDuration))
 	defer cancel()
+	began := time.Now()
 	report, err := r.RunOnce(passCtx)
+	if r.cfg.Observer != nil && (err == nil || ctx.Err() == nil) {
+		r.cfg.Observer.ReconcilePass(time.Since(began), report, err)
+	}
 	switch {
 	case err != nil && ctx.Err() != nil:
 		// Shutting down; nothing was saved.

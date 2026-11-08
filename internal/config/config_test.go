@@ -474,3 +474,25 @@ func TestLoadAgentLogSettings(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadManagerObservabilitySettings(t *testing.T) {
+	c, err := LoadManager(getenv(managerEnv()))
+	if err != nil || !c.MetricsEnabled || !c.DashboardEnabled {
+		t.Fatalf("metrics and the dashboard are on by default (both need the admin token): %+v, %v", c, err)
+	}
+	for value, want := range map[string]bool{"false": false, "0": false, "true": true, "1": true} {
+		vars := managerEnv()
+		vars["DOCKFLEET_METRICS_ENABLED"] = value
+		vars["DOCKFLEET_DASHBOARD_ENABLED"] = value
+		if c, err := LoadManager(getenv(vars)); err != nil || c.MetricsEnabled != want || c.DashboardEnabled != want {
+			t.Errorf("%q: %+v, %v", value, c, err)
+		}
+	}
+	for _, key := range []string{"DOCKFLEET_METRICS_ENABLED", "DOCKFLEET_DASHBOARD_ENABLED"} {
+		vars := managerEnv()
+		vars[key] = "sometimes"
+		if _, err := LoadManager(getenv(vars)); err == nil || !strings.Contains(err.Error(), key) {
+			t.Errorf("%s=sometimes: error = %v, want one naming the setting", key, err)
+		}
+	}
+}

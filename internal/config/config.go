@@ -75,6 +75,12 @@ type Manager struct {
 	LogWindowBytes   int
 	LogReconnectWait time.Duration
 	LogWriteTimeout  time.Duration
+
+	// MetricsEnabled serves GET /metrics in the Prometheus text format (admin
+	// token required) and records request, scheduling and reconciliation metrics.
+	// DashboardEnabled serves the administrative dashboard under /dashboard.
+	MetricsEnabled   bool
+	DashboardEnabled bool
 }
 
 // TLSEnabled reports whether the manager serves TLS. TLS always means mutual
@@ -163,6 +169,8 @@ func LoadManager(get Getenv) (Manager, error) {
 	c.LogWindowBytes = intInRange(get, "DOCKFLEET_LOG_WINDOW_KIB", 256, 64, 16384, &errs) << 10
 	c.LogReconnectWait = duration(get, "DOCKFLEET_LOG_RECONNECT_WAIT", 30*time.Second, &errs)
 	c.LogWriteTimeout = duration(get, "DOCKFLEET_LOG_WRITE_TIMEOUT", 30*time.Second, &errs)
+	c.MetricsEnabled = boolean(get, "DOCKFLEET_METRICS_ENABLED", true, &errs)
+	c.DashboardEnabled = boolean(get, "DOCKFLEET_DASHBOARD_ENABLED", true, &errs)
 
 	switch c.Store {
 	case "postgres":

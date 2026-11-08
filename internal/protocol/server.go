@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
 
 	"github.com/dockfleet/dockfleet/internal/logstream"
 	dockfleetv1 "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/v1"
@@ -122,6 +123,10 @@ type ServerOptions struct {
 	// never). Clients reconnect transparently, which makes a renewed client
 	// certificate take effect on connections that would otherwise outlive it.
 	MaxConnectionAge time.Duration
+	// Observe, when set, is called after every unary call with its full method
+	// name, the status code it ended with and how long it took, calls refused
+	// for their credentials included.
+	Observe func(method string, code codes.Code, d time.Duration)
 	// Now overrides the clock used to check certificate validity per call (tests).
 	Now func() time.Time
 }
@@ -152,7 +157,12 @@ func NewGRPCServer(nodes *NodeServer, opts ServerOptions) (*grpc.Server, error) 
 	}
 	// Streams get the same authentication as calls, but no deadline: a log
 	// stream lives as long as the agent's session.
-	serverOpts = append(serverOpts, grpc.ChainUnaryInterceptor(auth, unaryDeadline(wait)), grpc.ChainStreamInterceptor(streamAuth))
+	unary := []grpc.UnaryServerInterceptor{auth, unaryDeadline(wait)}
+	if opts.Observe != nil {
+		// First, so that it also sees the calls the authentication refuses.
+		unary = append([]grpc.UnaryServerInterceptor{unaryObserve(opts.Observe)}, unary...)
+	}
+	serverOpts = append(serverOpts, grpc.ChainUnaryInterceptor(unary...), grpc.ChainStreamInterceptor(streamAuth))
 	if opts.MaxConnectionAge > 0 {
 		serverOpts = append(serverOpts, grpc.KeepaliveParams(keepalive.ServerParameters{
 			MaxConnectionAge:      opts.MaxConnectionAge,
@@ -162,6 +172,15 @@ func NewGRPCServer(nodes *NodeServer, opts ServerOptions) (*grpc.Server, error) 
 	srv := grpc.NewServer(serverOpts...)
 	dockfleetv1.RegisterNodeServiceServer(srv, nodes)
 	return srv, nil
+}
+
+func unaryObserve(observe func(method string, code codes.Code, d time.Duration)) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		start := time.Now()
+		resp, err := handler(ctx, req)
+		observe(info.FullMethod, status.Code(err), time.Since(start))
+		return resp, err
+	}
 }
 
 func unaryDeadline(d time.Duration) grpc.UnaryServerInterceptor {

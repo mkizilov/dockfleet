@@ -144,7 +144,7 @@ func (s *server) putScale(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		out, changed = scaled, true
-		_, err = tx.AppendEvent(ctx, s.event("service.scaled", "service", svc.ID, "", map[string]string{
+		_, err = tx.AppendEvent(ctx, s.event(ctx, "service.scaled", "service", svc.ID, "", map[string]string{
 			"name": svc.Name, "from_replicas": strconv.Itoa(previous), "to_replicas": strconv.Itoa(replicas),
 		}))
 		return err

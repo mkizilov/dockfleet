@@ -137,7 +137,7 @@ func (s *server) holdRollout(w http.ResponseWriter, r *http.Request, paused bool
 			return err
 		}
 		out, changed = held, true
-		_, err = tx.AppendEvent(ctx, s.event(action, "service", svc.ID, "", map[string]string{
+		_, err = tx.AppendEvent(ctx, s.event(ctx, action, "service", svc.ID, "", map[string]string{
 			"name": svc.Name, "revision": strconv.Itoa(svc.CurrentRevision),
 		}))
 		return err
@@ -278,7 +278,7 @@ func (s *server) rollbackService(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 		}
-		_, err = tx.AppendEvent(ctx, s.event("service.rolled_back", "service", svc.ID, "", map[string]string{
+		_, err = tx.AppendEvent(ctx, s.event(ctx, "service.rolled_back", "service", svc.ID, "", map[string]string{
 			"name": svc.Name, "from_revision": strconv.Itoa(cur.Revision), "to_revision": strconv.Itoa(rev.Revision),
 			"target_revision": strconv.Itoa(to.Revision), "image": to.Spec.Image,
 		}))

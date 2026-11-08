@@ -181,6 +181,12 @@ var serviceTests = []serviceTest{
 	{"logs need the admin token and a log source", testLogsNeedTheAdminTokenAndALogSource},
 	{"too many log streams are refused", testTooManyLogStreamsAreRefused},
 	{"a slow log client is dropped", testASlowLogClientIsDropped},
+	{"metrics need the admin token and are off without metrics", testMetricsNeedTheAdminTokenAndAreOffWithoutMetrics},
+	{"metrics describe the fleet", testMetricsDescribeTheFleet},
+	{"metrics follow the fleet as it changes", testMetricsFollowTheFleetAsItChanges},
+	{"request latency is labeled by route, not by path", testRequestLatencyIsLabeledByRouteNotByPath},
+	{"administrative changes are audited", testAdministrativeChangesAreAudited},
+	{"audit records cover refusals and keep secrets out", testAuditRecordsRefusalsAndKeepSecretsOut},
 	{"the node view explains availability", testNodeViewExplainsAvailability},
 	{"events", testServiceEvents},
 }

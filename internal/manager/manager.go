@@ -12,10 +12,13 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 
 	"github.com/dockfleet/dockfleet/internal/api"
 	"github.com/dockfleet/dockfleet/internal/config"
+	"github.com/dockfleet/dockfleet/internal/dashboard"
 	"github.com/dockfleet/dockfleet/internal/logstream"
+	"github.com/dockfleet/dockfleet/internal/metrics"
 	"github.com/dockfleet/dockfleet/internal/netutil"
 	"github.com/dockfleet/dockfleet/internal/pki"
 	"github.com/dockfleet/dockfleet/internal/placement"
@@ -24,6 +27,7 @@ import (
 	"github.com/dockfleet/dockfleet/internal/registry"
 	"github.com/dockfleet/dockfleet/internal/scheduler"
 	"github.com/dockfleet/dockfleet/internal/store"
+	"github.com/dockfleet/dockfleet/internal/version"
 )
 
 const (
@@ -43,6 +47,7 @@ type Manager struct {
 	scheduler  *placement.Scheduler
 	reconciler *reconcile.Reconciler
 	logs       *logstream.Hub
+	metrics    *metrics.Metrics // nil when metrics are off
 	timing     scheduler.Timing
 	logger     *slog.Logger
 	apiTLS     *tls.Config
@@ -54,6 +59,19 @@ func overcommit(cfg config.Manager) scheduler.Overcommit {
 	return scheduler.Overcommit{CPU: cfg.CPUOvercommit, Memory: cfg.MemoryOvercommit}
 }
 
+// loopMetrics turns what the control loops report about their passes into metrics.
+type loopMetrics struct{ m *metrics.Metrics }
+
+func (l loopMetrics) SchedulingPass(d time.Duration, r placement.Report, err error) {
+	l.m.ObserveSchedulingPass(d, r.Placed, r.NewReasons, err)
+}
+
+func (l loopMetrics) ReconcilePass(d time.Duration, _ reconcile.Report, err error) {
+	l.m.ObserveReconcilePass(d, err)
+}
+
+func (l loopMetrics) RolloutFailed(service string) { l.m.DeploymentFailed(service) }
+
 // New prepares the manager. TLS material is loaded eagerly so a bad
 // certificate or CA bundle fails startup instead of the first connection.
 //
@@ -64,15 +82,24 @@ func New(cfg config.Manager, st store.Store, logger *slog.Logger) (*Manager, err
 	// Silence from before this manager started is not counted against a node:
 	// a manager that was down cannot tell a dead node from one it could not hear.
 	timing := scheduler.Timing{SuspectAfter: cfg.NodeTTL, UnavailableAfter: cfg.NodeUnavailableAfter, Since: time.Now()}
+	// With metrics off the observers stay nil interfaces, which the loops skip.
+	var instruments *metrics.Metrics
+	var schedulingObserver placement.Observer
+	var reconcileObserver reconcile.Observer
+	if cfg.MetricsEnabled {
+		instruments = metrics.New(version.Version, time.Now())
+		schedulingObserver, reconcileObserver = loopMetrics{instruments}, loopMetrics{instruments}
+	}
 	m := &Manager{
-		cfg: cfg, store: st, logger: logger, timing: timing,
+		cfg: cfg, store: st, logger: logger, timing: timing, metrics: instruments,
 		registry: registry.New(st, logger).WithInstanceID(cfg.InstanceID),
 		scheduler: placement.New(placement.Config{
 			Store: st, Logger: logger, NodeTTL: cfg.NodeTTL, Timing: timing, Overcommit: overcommit(cfg),
-			Interval: cfg.SchedulerInterval, InstanceID: cfg.InstanceID,
+			Interval: cfg.SchedulerInterval, InstanceID: cfg.InstanceID, Observer: schedulingObserver,
 		}),
 		reconciler: reconcile.New(reconcile.Config{
 			Store: st, Logger: logger, Interval: cfg.ReconcileInterval, InstanceID: cfg.InstanceID, Timing: timing,
+			Observer: reconcileObserver,
 		}),
 	}
 	m.logs = logstream.NewHub(logstream.HubConfig{
@@ -97,6 +124,49 @@ func (m *Manager) Sessions() []registry.Session {
 	return m.registry.Sessions()
 }
 
+// httpHandler is the administrative API, with the dashboard in front of it when
+// that is enabled. The dashboard reads through the API's own handler, so what
+// it shows is what an API client is allowed to see.
+func (m *Manager) httpHandler() (http.Handler, error) {
+	admin := api.New(api.Config{
+		Store:           m.store,
+		Token:           m.cfg.APIToken,
+		NodeTTL:         m.cfg.NodeTTL,
+		Timing:          m.timing,
+		NodeLease:       m.cfg.NodeLease,
+		Logger:          m.logger,
+		InstanceID:      m.cfg.InstanceID,
+		Overcommit:      overcommit(m.cfg),
+		Metrics:         m.metrics,
+		Logs:            m.logs,
+		LogWriteTimeout: m.cfg.LogWriteTimeout,
+	})
+	if !m.cfg.DashboardEnabled {
+		return admin, nil
+	}
+	dash, err := dashboard.New(dashboard.Config{API: admin, Token: m.cfg.APIToken, Logger: m.logger, Audit: m.auditDashboard})
+	if err != nil {
+		return nil, fmt.Errorf("dashboard: %w", err)
+	}
+	root := http.NewServeMux()
+	root.Handle("/dashboard", dash)
+	root.Handle("/dashboard/", dash)
+	root.Handle("/", admin)
+	return root, nil
+}
+
+// auditDashboard records a login to or a logout from the dashboard in the audit
+// trail. A failure to record it is logged and does not lock the administrator out.
+func (m *Manager) auditDashboard(ctx context.Context, action, message string, details map[string]string) {
+	_, err := m.store.AppendEvent(ctx, store.Event{
+		At: time.Now().UTC(), InstanceID: m.cfg.InstanceID, Actor: "admin", Action: action,
+		ResourceType: "dashboard", ResourceID: "session", Message: message, Details: details,
+	})
+	if err != nil {
+		m.logger.ErrorContext(ctx, "recording a dashboard audit event failed", "action", action, "error", err)
+	}
+}
+
 // Serve runs both servers on the given listeners until ctx is canceled or one
 // of them fails, then shuts both down within cfg.ShutdownTimeout. It takes
 // ownership of the listeners (closing them on every path) and returns nil
@@ -116,30 +186,27 @@ func (m *Manager) Serve(ctx context.Context, apiLn, grpcLn net.Listener) error {
 		}
 	}
 	nodes := protocol.NewNodeServer(m.registry, m.cfg.HeartbeatInterval, m.logger).WithLease(m.cfg.NodeLease).WithLogs(m.logs, 0)
-	grpcSrv, err := protocol.NewGRPCServer(nodes, protocol.ServerOptions{
+	serverOpts := protocol.ServerOptions{
 		TLS:              m.grpcTLS,
 		Token:            m.cfg.AgentToken,
 		HandlerTimeout:   m.cfg.RequestTimeout,
 		MaxConnectionAge: maxConnectionAge,
-	})
+	}
+	if m.metrics != nil {
+		serverOpts.Observe = func(method string, code codes.Code, d time.Duration) { m.metrics.ObserveGRPC(method, code.String(), d) }
+	}
+	grpcSrv, err := protocol.NewGRPCServer(nodes, serverOpts)
+	if err != nil {
+		closeListeners()
+		return err
+	}
+	handler, err := m.httpHandler()
 	if err != nil {
 		closeListeners()
 		return err
 	}
 	httpSrv := &http.Server{
-		Handler: api.New(api.Config{
-			Store:      m.store,
-			Token:      m.cfg.APIToken,
-			NodeTTL:    m.cfg.NodeTTL,
-			Timing:     m.timing,
-			NodeLease:  m.cfg.NodeLease,
-			Logger:     m.logger,
-			InstanceID: m.cfg.InstanceID,
-			Overcommit: overcommit(m.cfg),
-			Logs:       m.logs,
-
-			LogWriteTimeout: m.cfg.LogWriteTimeout,
-		}),
+		Handler:           handler,
 		TLSConfig:         m.apiTLS,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,

@@ -155,7 +155,7 @@ func (s *server) createService(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return err
 		}
-		_, err = tx.AppendEvent(r.Context(), s.event("service.created", "service", id, "", map[string]string{
+		_, err = tx.AppendEvent(r.Context(), s.event(r.Context(), "service.created", "service", id, "", map[string]string{
 			"name": in.name, "replicas": strconv.Itoa(in.replicas), "image": in.spec.Image, "revision": "1",
 		}))
 		return err
@@ -262,7 +262,7 @@ func (s *server) updateService(w http.ResponseWriter, r *http.Request) {
 				return err
 			default:
 				expected = svc.Version
-				_, err = tx.AppendEvent(ctx, s.event("service.rollout_configured", "service", svc.ID, "", map[string]string{
+				_, err = tx.AppendEvent(ctx, s.event(ctx, "service.rollout_configured", "service", svc.ID, "", map[string]string{
 					"name": svc.Name, "max_unavailable": strconv.Itoa(next.MaxUnavailable), "max_surge": strconv.Itoa(next.MaxSurge),
 					"progress_deadline_seconds": strconv.Itoa(next.ProgressDeadlineSeconds),
 				}))
@@ -282,7 +282,7 @@ func (s *server) updateService(w http.ResponseWriter, r *http.Request) {
 				return err
 			default:
 				expected = svc.Version
-				_, err = tx.AppendEvent(ctx, s.event("service.deployed", "service", svc.ID, "", map[string]string{
+				_, err = tx.AppendEvent(ctx, s.event(ctx, "service.deployed", "service", svc.ID, "", map[string]string{
 					"name": svc.Name, "from_revision": strconv.Itoa(cur.Revision), "to_revision": strconv.Itoa(rev.Revision), "image": in.spec.Image,
 				}))
 				if err != nil {
@@ -298,7 +298,7 @@ func (s *server) updateService(w http.ResponseWriter, r *http.Request) {
 			case err != nil:
 				return err
 			default:
-				_, err = tx.AppendEvent(ctx, s.event("service.scaled", "service", svc.ID, "", map[string]string{
+				_, err = tx.AppendEvent(ctx, s.event(ctx, "service.scaled", "service", svc.ID, "", map[string]string{
 					"name": svc.Name, "from_replicas": strconv.Itoa(from), "to_replicas": strconv.Itoa(in.replicas),
 				}))
 				if err != nil {
@@ -339,7 +339,7 @@ func (s *server) deleteService(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		spec = cur.Spec
-		_, err = tx.AppendEvent(r.Context(), s.event("service.deleted", "service", svc.ID, "", map[string]string{"name": svc.Name}))
+		_, err = tx.AppendEvent(r.Context(), s.event(r.Context(), "service.deleted", "service", svc.ID, "", map[string]string{"name": svc.Name}))
 		return err
 	})
 	if err != nil {

@@ -15,6 +15,8 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 | `internal/scheduler` | Placement decisions and their explanations (pure functions, no I/O) ([docs/scheduler.md](docs/scheduler.md)) |
 | `internal/placement` | Carries decisions out: reads the cluster, runs the scheduler, saves assignments and explanations |
 | `internal/reconcile` | Compares services with what agents report; stops replicas that should go, deletes them once their node confirms, records node health and gives up on lost nodes ([docs/reconciliation.md](docs/reconciliation.md), [docs/failure-handling.md](docs/failure-handling.md)) |
+| `internal/metrics`   | Small Prometheus-compatible registry behind `GET /metrics` ([docs/observability.md](docs/observability.md)) |
+| `internal/dashboard` | Read-only server-rendered dashboard under `/dashboard`, built on the API's own responses ([docs/observability.md](docs/observability.md)) |
 | `internal/agent`     | Node logic: register, heartbeat, retry, re-register; the runner that keeps the node's containers in line with its assignments |
 | `internal/store`     | Persistence: repository interfaces, transactions, versioned migrations; PostgreSQL and in-memory implementations ([docs/state.md](docs/state.md)) |
 | `internal/protocol`  | gRPC service, client, versioning, errors, bearer-token auth, TLS helpers |
@@ -30,7 +32,7 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 | `proto/`             | Protobuf definitions (`buf` module)                                     |
 | `deploy/`            | Docker Compose files: development PostgreSQL, and a disposable Docker daemon for the Docker tests |
 | `config/dev.env`     | Development-only configuration                                          |
-| `docs/`              | [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), [Mutual TLS and enrollment](docs/mtls.md), [Docker adapter](docs/docker.md), [Control-plane state](docs/state.md), [Services API](docs/api.md), [Scheduler](docs/scheduler.md), [Reconciliation](docs/reconciliation.md), [Failure handling](docs/failure-handling.md), [Rolling deployments](docs/rollouts.md), [Container logs](docs/logs.md) |
+| `docs/`              | [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), [Mutual TLS and enrollment](docs/mtls.md), [Docker adapter](docs/docker.md), [Control-plane state](docs/state.md), [Services API](docs/api.md), [Scheduler](docs/scheduler.md), [Reconciliation](docs/reconciliation.md), [Failure handling](docs/failure-handling.md), [Rolling deployments](docs/rollouts.md), [Container logs](docs/logs.md), [Metrics, dashboard and audit trail](docs/observability.md) |
 
 ## Prerequisites
 
@@ -95,6 +97,8 @@ Administrators distributing real credentials should read [docs/mtls.md](docs/mtl
 | ------------------------- | ---- | ------------------------------------------------------------------- |
 | `GET /healthz`            | no   | Liveness                                                            |
 | `GET /readyz`             | no   | Readiness (store reachable)                                         |
+| `GET /metrics`            | yes  | Prometheus metrics: node capacity and utilization, healthy and unhealthy nodes, desired and running replicas, deployment failures, scheduling and reconciliation errors, request, agent-call and scheduling latency; see [docs/observability.md](docs/observability.md) |
+| `GET /dashboard`          | login | Read-only server-rendered dashboard (nodes, services, replicas, health, recent events); log in at `/dashboard/login` with the admin token |
 | `GET /v1/nodes`           | yes  | Registered nodes with `ready` / `not_ready` status (and why), allocatable and allocated resources |
 | `GET /v1/nodes/{id}`      | yes  | One node                                                            |
 | `POST /v1/workloads`      | yes  | Choose a node for a workload (desired state `running`); nothing is observed until its agent reports |
@@ -160,6 +164,8 @@ All settings are environment variables. The manager and agent refuse to start on
 | `DOCKFLEET_LOG_WINDOW_KIB`       | manager | `256`                        | Most that is buffered for one log query, `64`-`16384` KiB; agents wait for credit beyond it |
 | `DOCKFLEET_LOG_RECONNECT_WAIT`   | manager | `30s`                        | How long a following log query waits for an agent whose connection dropped |
 | `DOCKFLEET_LOG_WRITE_TIMEOUT`    | manager | `30s`                        | A log response whose client takes no data for this long is closed |
+| `DOCKFLEET_METRICS_ENABLED`      | manager | `true`                       | Serve `GET /metrics` (admin token required) and record request, agent-call and loop metrics; see [docs/observability.md](docs/observability.md) |
+| `DOCKFLEET_DASHBOARD_ENABLED`    | manager | `true`                       | Serve the dashboard under `/dashboard` on the API listener (admin token required) |
 | `DOCKFLEET_REQUEST_TIMEOUT`      | manager | `10s`                        | Deadline for each gRPC call                                |
 | `DOCKFLEET_SHUTDOWN_TIMEOUT`     | manager | `15s`                        | Drain budget before connections are forced closed          |
 | `DOCKFLEET_MANAGER_ADDR`         | agent   | `127.0.0.1:21281`            | Non-loopback requires `DOCKFLEET_TLS_CA_FILE`              |
@@ -190,11 +196,14 @@ Unit tests need no Docker, database or network. `internal/scheduler` has table-d
 
 Container logs are tested in layers: the hub (`internal/logstream`: merging, credit, a slow reader, reconnection), the Docker line reader and the agent's log server against an in-memory engine (credit checked on every send, no gaps or repeats between history and follow), the protocol (validation of every message, session binding, revocation), the API with a real hub and simulated agents on both stores (formats, filters, cursors, 400/404/429/503, a client that does not read), and `internal/integration/logs_test.go` with real agents and a real manager: several containers on several nodes merged and followed, an agent restart, a manager restart resumed from a cursor, cancellation releasing every reader, authentication, revocation and mutual TLS identity binding. A `dockerintegration` test reads a real container's logs.
 
+Metrics, the dashboard and the audit trail are tested in `internal/metrics` (the exposition format, histogram buckets, escaping, bounded series, failing collectors), `internal/api` on both stores (the fleet gauges against what `GET /v1/nodes` and `/v1/services` say, latency labeled by route, the request ID and remote address in every kind of audited change, refusals logged, secrets absent), the loops' observers in `internal/placement` and `internal/reconcile`, the gRPC observer in `internal/protocol`, `internal/dashboard` (access control, sessions, throttling, cross-site requests, security headers, rendering of healthy, suspect and unavailable nodes, failed and unschedulable replicas, escaping of hostile text, event paging) and, over real sockets, in `internal/manager`.
+
 Generated protobuf code is not committed, so run `make generate` after a fresh clone and `make proto` after editing `proto/`.
 
 ## Limitations
 
 - Agents create, start, stop and remove containers, restart them per policy (waits, limits, health checks) and report back, publish ports only on loopback, and offer no mounts or networks beyond the container policy's defaults. Stopping a workload removes its container and its logs. See [docs/reconciliation.md](docs/reconciliation.md#limitations).
+- Utilization in the metrics and the dashboard is what is promised to workloads (their declared limits), not measured use; loop and request metrics are per manager process; a dashboard session lasts until it expires or the admin token is rotated; there is one shared admin token and so one audit actor. See [docs/observability.md](docs/observability.md#limitations).
 - Container logs come from Docker's own `json-file` logs (rotated, 3 × 10 MiB), are not stored by the manager, and a following request ends when the container stops; a query sees only the nodes connected to the manager that serves it. See [docs/logs.md](docs/logs.md#limitations).
 - Failover has limits ([docs/failure-handling.md](docs/failure-handling.md#limitations)): a crashed agent process cannot stop its own containers, so a replica started elsewhere runs beside them until it returns; with fencing on (the default) a manager outage longer than the lease stops every container in the fleet until the manager is back; a replica whose container failed beyond its restart limit is not moved to another node; standalone workloads are not moved.
 - Sessions are held in manager memory: an agent talks to one manager at a time and registers again if that manager forgets it. Two agents configured with the same node ID will keep superseding each other.

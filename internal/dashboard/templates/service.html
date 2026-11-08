@@ -1,0 +1,64 @@
+{{define "content"}}
+<p><a href="/dashboard">&larr; Overview</a></p>
+{{with .Service}}
+<h2>{{.Name}} <span class="badge {{badge .Status.Scaling.State}}">{{.Status.Scaling.State}}</span></h2>
+<dl>
+<dt>Image</dt><dd><code>{{.Spec.Image}}</code> (revision {{.Revision}})</dd>
+<dt>Per replica</dt><dd>{{cpu .Spec.CPUMillis}}, {{mem .Spec.MemoryBytes}}</dd>
+<dt>Replicas</dt><dd>{{.Status.Scaling.Ready}} running of {{.Replicas}} wanted</dd>
+<dt>Scaling</dt><dd>{{.Status.Scaling.Message}}</dd>
+<dt>Rollout</dt>
+<dd>
+<span class="badge {{badge .Status.Rollout.State}}">{{.Status.Rollout.State}}</span>
+{{.Status.Rollout.Message}}{{if .Status.Rollout.Reason}} <small>({{.Status.Rollout.Reason}})</small>{{end}}
+<br><small>{{.Status.Rollout.Updated}} of the new revision, {{.Status.Rollout.Ready}} ready, {{.Status.Rollout.Outdated}} of an older one; {{.Status.Rollout.Surge}} extra, {{.Status.Rollout.Unavailable}} missing{{if .Status.Rollout.Paused}}; paused{{end}}.</small>
+{{if .Status.Rollout.DeadlineAt}}<br><small>No progress by <time datetime="{{stamp (deref .Status.Rollout.DeadlineAt)}}">{{stamp (deref .Status.Rollout.DeadlineAt)}}</time> fails the rollout.</small>{{end}}
+</dd>
+</dl>
+
+<h3>Replicas</h3>
+{{if .Status.Replicas}}
+<table>
+<thead><tr><th>Revision</th><th>#</th><th>Node</th><th>Wanted</th><th>State</th><th>Health</th><th>Restarts</th><th>Exit</th><th>Message</th></tr></thead>
+<tbody>
+{{range .Status.Replicas}}
+<tr>
+<td>{{.Revision}}</td>
+<td>{{.Index}}</td>
+<td><a href="/dashboard/nodes/{{.NodeID}}">{{.NodeID}}</a>{{if and .NodeHealth (ne .NodeHealth "healthy")}} <span class="badge {{badge .NodeHealth}}">{{.NodeHealth}}</span>{{end}}</td>
+<td>{{.DesiredState}}</td>
+<td><span class="badge {{badge .Phase}}">{{.Phase}}</span></td>
+<td>{{if .Health}}<span class="badge {{badge .Health}}">{{.Health}}</span>{{else}}-{{end}}</td>
+<td>{{.RestartCount}}</td>
+<td>{{if .ExitCode}}{{deref .ExitCode}}{{else}}-{{end}}</td>
+<td>{{.Message}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{else}}
+<p class="empty">No replica has been assigned to a node.</p>
+{{end}}
+
+{{if .Status.Unschedulable}}
+<h3>Waiting for a node</h3>
+<table>
+<thead><tr><th>Revision</th><th>#</th><th>Why</th><th>Since</th><th>Node by node</th></tr></thead>
+<tbody>
+{{range .Status.Unschedulable}}
+<tr>
+<td>{{.Revision}}</td>
+<td>{{.ReplicaIndex}}</td>
+<td><span class="badge warn">{{.Code}}</span> {{.Message}}</td>
+<td><time datetime="{{stamp .Since}}">{{stamp .Since}}</time></td>
+<td>{{range .Nodes}}<code>{{.NodeID}}: {{.Message}}</code><br>{{end}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{end}}
+{{end}}
+
+<h3>Events</h3>
+{{template "eventTable" .Events}}
+{{end}}

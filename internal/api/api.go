@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dockfleet/dockfleet/internal/metrics"
 	"github.com/dockfleet/dockfleet/internal/placement"
 	"github.com/dockfleet/dockfleet/internal/scheduler"
 	"github.com/dockfleet/dockfleet/internal/store"
@@ -40,6 +41,9 @@ type Config struct {
 	// Overcommit is how far nodes may be promised beyond their capacity when a
 	// workload is placed; the zero value is none.
 	Overcommit scheduler.Overcommit
+	// Metrics, when set, serves GET /metrics (admin token required) and records
+	// request latency. Nil turns both off.
+	Metrics *metrics.Metrics
 	// Logs serves container logs; nil turns the log endpoints off.
 	Logs LogSource
 	// LogWriteTimeout is how long a log response waits for its client to take
@@ -64,6 +68,8 @@ type server struct {
 	// client that takes no data for logWriteTimeout.
 	logs            LogSource
 	logWriteTimeout time.Duration
+
+	metrics *metrics.Metrics
 }
 
 // New returns the administrative HTTP handler. /healthz and /readyz are open;
@@ -83,7 +89,7 @@ func New(cfg Config) http.Handler {
 	if s.now == nil {
 		s.now = time.Now
 	}
-	s.logs, s.logWriteTimeout = cfg.Logs, cfg.LogWriteTimeout
+	s.logs, s.logWriteTimeout, s.metrics = cfg.Logs, cfg.LogWriteTimeout, cfg.Metrics
 	if s.logWriteTimeout <= 0 {
 		s.logWriteTimeout = defaultLogWriteTimeout
 	}
@@ -101,6 +107,10 @@ func New(cfg Config) http.Handler {
 	mux.Handle("GET /v1/workloads/{id}", s.auth(s.getWorkload))
 	mux.Handle("GET /v1/workloads/{id}/logs", s.auth(s.workloadLogs))
 	mux.Handle("GET /v1/services/{name}/logs", s.auth(s.serviceLogs))
+	if s.metrics != nil {
+		s.metrics.Registry.AddCollector("fleet", s.collectFleet)
+		mux.Handle("GET /metrics", s.auth(s.serveMetrics))
+	}
 	mux.Handle("POST /v1/enrollments", s.auth(s.createEnrollment))
 	mux.Handle("GET /v1/enrollments", s.auth(s.listEnrollments))
 	mux.Handle("GET /v1/enrollments/{id}", s.auth(s.getEnrollment))
@@ -126,12 +136,22 @@ func New(cfg Config) http.Handler {
 // replace this.
 const adminActor = "admin"
 
-// event builds an audit event for an administrative action.
-func (s *server) event(action, resourceType, resourceID, message string, details map[string]string) store.Event {
-	return store.Event{
+// event builds an audit event for an administrative action. When ctx is a
+// request's, the event also says which request it came from and from where, so
+// a change in the trail can be tied to the log lines of that request.
+func (s *server) event(ctx context.Context, action, resourceType, resourceID, message string, details map[string]string) store.Event {
+	e := store.Event{
 		At: s.now().UTC(), InstanceID: s.instanceID, Actor: adminActor, Action: action,
 		ResourceType: resourceType, ResourceID: resourceID, Message: message, Details: details,
 	}
+	if info := infoFrom(ctx); info != nil {
+		e.Details = make(map[string]string, len(details)+2)
+		for k, v := range details {
+			e.Details[k] = v
+		}
+		e.Details[detailRequestID], e.Details[detailRemote] = info.ID, info.Remote
+	}
+	return e
 }
 
 type statusRecorder struct {
@@ -148,13 +168,27 @@ func (r *statusRecorder) WriteHeader(code int) {
 // responses need to flush and to set deadlines on.
 func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
+// logRequests gives every request an ID and a place in the audit context, logs
+// it, records its latency, and logs the outcome of every request that can change
+// something (see audit.go).
 func (s *server) logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := s.now()
+		start, began := s.now(), time.Now()
+		info := newRequestInfo(r)
+		// The mux records the matching pattern on the request it is given, so it
+		// is read from this one.
+		r = r.WithContext(context.WithValue(r.Context(), auditKey{}, info))
+		w.Header().Set("X-Request-ID", info.ID)
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
 		s.logger.InfoContext(r.Context(), "http request",
-			"method", r.Method, "path", r.URL.Path, "status", rec.status, "duration", s.now().Sub(start))
+			"method", r.Method, "path", r.URL.Path, "status", rec.status, "duration", s.now().Sub(start), "request_id", info.ID)
+		if s.metrics != nil {
+			s.metrics.ObserveHTTP(r.Method, routeOf(r), rec.status, time.Since(began))
+		}
+		if changesState(r.Method) {
+			s.logAudit(r, info, rec.status)
+		}
 	})
 }
 
@@ -166,6 +200,9 @@ func (s *server) auth(next http.HandlerFunc) http.Handler {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			writeError(w, http.StatusUnauthorized, "invalid or missing credentials")
 			return
+		}
+		if info := infoFrom(r.Context()); info != nil {
+			info.Actor = adminActor
 		}
 		next(w, r)
 	})
@@ -382,7 +419,7 @@ func (s *server) createWorkload(w http.ResponseWriter, r *http.Request) {
 		}); err != nil {
 			return err
 		}
-		_, err = tx.AppendEvent(ctx, s.event("workload.created", "workload", id, "", map[string]string{"name": req.Name, "node_id": decision.NodeID, "image": req.Image}))
+		_, err = tx.AppendEvent(ctx, s.event(ctx, "workload.created", "workload", id, "", map[string]string{"name": req.Name, "node_id": decision.NodeID, "image": req.Image}))
 		return err
 	})
 	var unschedulable *unschedulableError
@@ -428,7 +465,7 @@ func (s *server) createEnrollment(w http.ResponseWriter, r *http.Request) {
 		if created, err = tx.CreateEnrollment(r.Context(), store.Enrollment{NodeID: req.NodeID, Description: req.Description, CreatedAt: s.now().UTC()}); err != nil {
 			return err
 		}
-		_, err = tx.AppendEvent(r.Context(), s.event("enrollment.created", "node", req.NodeID, req.Description, nil))
+		_, err = tx.AppendEvent(r.Context(), s.event(r.Context(), "enrollment.created", "node", req.NodeID, req.Description, nil))
 		return err
 	})
 	switch {
@@ -480,7 +517,7 @@ func (s *server) revokeEnrollment(w http.ResponseWriter, r *http.Request) {
 		if e, err = tx.RevokeEnrollment(ctx, id, s.now().UTC()); err != nil {
 			return err
 		}
-		_, err = tx.AppendEvent(ctx, s.event("enrollment.revoked", "node", id, "", nil))
+		_, err = tx.AppendEvent(ctx, s.event(ctx, "enrollment.revoked", "node", id, "", nil))
 		return err
 	})
 	switch {

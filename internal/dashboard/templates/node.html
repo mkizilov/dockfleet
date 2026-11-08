@@ -1,0 +1,42 @@
+{{define "content"}}
+<p><a href="/dashboard">&larr; Overview</a></p>
+{{with .Node}}
+<h2>{{.ID}} <span class="badge {{badge .Health}}">{{.Health}}</span></h2>
+<dl>
+<dt>Name</dt><dd>{{.Name}}</dd>
+<dt>Status</dt><dd>{{.Status}}{{if .StatusReason}} <small>({{.StatusReason}})</small>{{end}}</dd>
+{{if .HealthReason}}<dt>Health</dt><dd>{{.HealthReason}}</dd>{{end}}
+<dt>Last heartbeat</dt><dd><time datetime="{{stamp .LastHeartbeat}}">{{stamp .LastHeartbeat}}</time> ({{ago .LastHeartbeat}})</dd>
+<dt>Registered</dt><dd><time datetime="{{stamp .RegisteredAt}}">{{stamp .RegisteredAt}}</time></dd>
+{{if .LeaseExpiresAt}}<dt>Lease runs out</dt><dd><time datetime="{{stamp (deref .LeaseExpiresAt)}}">{{stamp (deref .LeaseExpiresAt)}}</time></dd>{{end}}
+<dt>Agent</dt><dd>{{.AgentVersion}}</dd>
+<dt>Labels</dt><dd>{{range kv .Labels}}<code>{{.}}</code> {{else}}none{{end}}</dd>
+<dt>CPU</dt><dd>{{cpu .Allocated.CPUMillis}} allocated of {{cpu .Allocatable.CPUMillis}} allocatable ({{cpu .CPUMillis}} declared){{if gt .Allocatable.CPUMillis 0}} <progress value="{{.Allocated.CPUMillis}}" max="{{.Allocatable.CPUMillis}}"></progress>{{end}}</dd>
+<dt>Memory</dt><dd>{{mem .Allocated.MemoryBytes}} allocated of {{mem .Allocatable.MemoryBytes}} allocatable ({{mem .MemoryBytes}} declared){{if gt .Allocatable.MemoryBytes 0}} <progress value="{{.Allocated.MemoryBytes}}" max="{{.Allocatable.MemoryBytes}}"></progress>{{end}}</dd>
+</dl>
+{{end}}
+
+<h3>Workloads on this node</h3>
+{{if .Workloads}}
+<table>
+<thead><tr><th>Workload</th><th>Service</th><th>Image</th><th>Wanted</th><th>Reported</th><th>Message</th></tr></thead>
+<tbody>
+{{range .Workloads}}
+<tr>
+<td>{{.Name}}</td>
+<td>{{with index $.ServiceNames .ServiceID}}<a href="/dashboard/services/{{.}}">{{.}}</a>{{else}}standalone{{end}}</td>
+<td><code>{{.Image}}</code></td>
+<td>{{.DesiredState}}</td>
+<td>{{if .Observed}}<span class="badge {{badge .Observed.State}}">{{.Observed.State}}</span>{{if .Observed.Health}} <span class="badge {{badge .Observed.Health}}">{{.Observed.Health}}</span>{{end}}{{else}}<small>no report yet</small>{{end}}</td>
+<td>{{if .Observed}}{{.Observed.Message}}{{end}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{else}}
+<p class="empty">No workload is placed on this node.</p>
+{{end}}
+
+<h3>Events</h3>
+{{template "eventTable" .Events}}
+{{end}}

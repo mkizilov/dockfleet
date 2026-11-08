@@ -1,0 +1,11 @@
+{{define "content"}}
+<h2>Events</h2>
+<p>The audit trail: administrative changes and what the manager did about the cluster, newest first.</p>
+<form method="get" action="/dashboard/events" class="filter">
+<label>Resource type <input name="resource_type" value="{{.ResourceType}}" maxlength="32"></label>
+<label>Resource ID <input name="resource_id" value="{{.ResourceID}}" maxlength="64"></label>
+<button type="submit">Filter</button>
+</form>
+{{template "eventTable" .Events}}
+{{if .NextURL}}<p><a href="{{.NextURL}}">Older events &rarr;</a></p>{{end}}
+{{end}}

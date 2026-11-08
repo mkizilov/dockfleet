@@ -244,7 +244,11 @@ The same scheduler serves the other state endpoints:
 
 ## Audit events
 
-Each successful change is recorded in `GET /v1/events` in the same transaction as the change: `service.created`, `service.deployed` (from and to revision, image), `service.scaled` (from and to replicas) and `service.deleted`, with the actor `admin`. Events never contain environment values. Requests that fail validation or change nothing record nothing.
+Each successful change is recorded in `GET /v1/events` in the same transaction as the change: `service.created`, `service.deployed` (from and to revision, image), `service.scaled` (from and to replicas) and `service.deleted`, with the actor `admin`. Events never contain environment values. Requests that fail validation or change nothing record nothing. An event also names the request it came from: its details carry `request_id` (the response's `X-Request-ID`; a client may choose it with a request header of the same name, 1-64 characters of `[A-Za-z0-9._-]`) and `remote`, the address of the connection. Every `POST`, `PUT`, `PATCH` and `DELETE` also leaves one structured `audit` record in the manager's log, accepted or not (`outcome`: `accepted`, `rejected`, `denied` or `failed`), with the same `request_id`, so an attempt that was refused and recorded no event can still be traced. See [observability.md](observability.md#the-audit-trail).
+
+## Metrics and the dashboard
+
+`GET /metrics` (Prometheus text format; admin token required; off with `DOCKFLEET_METRICS_ENABLED=false`) exports node capacity and utilization, healthy and unhealthy nodes, desired and running replicas, deployment failures, scheduling and reconciliation passes and errors, and request, agent-call and scheduling latency. `/dashboard` is a read-only, server-rendered view of the nodes, services, replicas, health and recent events, built on the API's own responses (log in with the admin token; off with `DOCKFLEET_DASHBOARD_ENABLED=false`). Neither is part of `/v1`, and neither changes anything. See [observability.md](observability.md).
 
 ## Container logs
 

@@ -182,8 +182,17 @@ type Config struct {
 	Interval time.Duration
 	// InstanceID names this manager in the audit trail.
 	InstanceID string
+	// Observer, when set, is told how each pass of Run went.
+	Observer Observer
 	// Now defaults to time.Now; tests set it.
 	Now func() time.Time
+}
+
+// Observer is told how the scheduler is doing; the manager turns it into metrics.
+type Observer interface {
+	// SchedulingPass is called after every pass of Run with how long it took and
+	// why it failed, if it did. A pass cut short by shutdown is not reported.
+	SchedulingPass(d time.Duration, report Report, err error)
 }
 
 // Scheduler places the replicas that are waiting for a node.
@@ -342,7 +351,11 @@ func (s *Scheduler) Run(ctx context.Context) {
 func (s *Scheduler) pass(ctx context.Context) {
 	passCtx, cancel := context.WithTimeout(ctx, max(s.cfg.Interval, maxPassDuration))
 	defer cancel()
+	began := time.Now()
 	report, err := s.RunOnce(passCtx)
+	if s.cfg.Observer != nil && (err == nil || ctx.Err() == nil) {
+		s.cfg.Observer.SchedulingPass(time.Since(began), report, err)
+	}
 	switch {
 	case err != nil && ctx.Err() != nil:
 		// Shutting down; nothing was saved.

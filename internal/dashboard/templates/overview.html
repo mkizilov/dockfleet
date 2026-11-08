@@ -1,0 +1,69 @@
+{{define "content"}}
+<section class="cards">
+<div class="card">
+<h3>Nodes</h3>
+<p><span class="badge ok">{{.Summary.NodesHealthy}} healthy</span> <span class="badge warn">{{.Summary.NodesSuspect}} suspect</span> <span class="badge bad">{{.Summary.NodesUnavailable}} unavailable</span></p>
+</div>
+<div class="card">
+<h3>Replicas</h3>
+<p>{{.Summary.ReplicasRunning}} running of {{.Summary.ReplicasDesired}} desired</p>
+<p>{{if .Summary.ReplicasProblem}}<span class="badge bad">{{.Summary.ReplicasProblem}} with problems</span>{{else}}<span class="badge ok">no problems</span>{{end}}</p>
+</div>
+<div class="card">
+<h3>Services</h3>
+<p>{{.Summary.Services}} in all{{if .Summary.RolloutsFailed}} <span class="badge bad">{{.Summary.RolloutsFailed}} failed rollout</span>{{end}}</p>
+</div>
+<div class="card">
+<h3>Allocated</h3>
+<p>{{cpu .Summary.CPUAllocated}} of {{cpu .Summary.CPUAllocatable}}{{if gt .Summary.CPUAllocatable 0}} <progress value="{{.Summary.CPUAllocated}}" max="{{.Summary.CPUAllocatable}}"></progress>{{end}}</p>
+<p>{{mem .Summary.MemAllocated}} of {{mem .Summary.MemAllocatable}}{{if gt .Summary.MemAllocatable 0}} <progress value="{{.Summary.MemAllocated}}" max="{{.Summary.MemAllocatable}}"></progress>{{end}}</p>
+<p><small>Declared limits promised to workloads, not measured use.</small></p>
+</div>
+</section>
+
+<h2>Nodes</h2>
+{{if .Nodes}}
+<table>
+<thead><tr><th>Node</th><th>Health</th><th>Last heartbeat</th><th>CPU allocated</th><th>Memory allocated</th><th>Workloads</th></tr></thead>
+<tbody>
+{{range .Nodes}}
+<tr>
+<td><a href="/dashboard/nodes/{{.ID}}">{{.ID}}</a>{{if ne .Name .ID}} <small>{{.Name}}</small>{{end}}</td>
+<td><span class="badge {{badge .Health}}">{{.Health}}</span>{{if .HealthReason}} <small>{{.HealthReason}}</small>{{end}}</td>
+<td><time datetime="{{stamp .LastHeartbeat}}" title="{{stamp .LastHeartbeat}}">{{ago .LastHeartbeat}}</time></td>
+<td>{{cpu .Allocated.CPUMillis}} of {{cpu .Allocatable.CPUMillis}}{{if gt .Allocatable.CPUMillis 0}} <progress value="{{.Allocated.CPUMillis}}" max="{{.Allocatable.CPUMillis}}"></progress>{{end}}</td>
+<td>{{mem .Allocated.MemoryBytes}} of {{mem .Allocatable.MemoryBytes}}{{if gt .Allocatable.MemoryBytes 0}} <progress value="{{.Allocated.MemoryBytes}}" max="{{.Allocatable.MemoryBytes}}"></progress>{{end}}</td>
+<td>{{.Allocated.Workloads}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{else}}
+<p class="empty">No node has registered yet.</p>
+{{end}}
+
+<h2>Services</h2>
+{{if .Services}}
+<table>
+<thead><tr><th>Service</th><th>Image</th><th>Running</th><th>Scaling</th><th>Rollout</th><th>Problems</th></tr></thead>
+<tbody>
+{{range .Services}}
+<tr>
+<td><a href="/dashboard/services/{{.Name}}">{{.Name}}</a></td>
+<td><code>{{.Spec.Image}}</code> <small>revision {{.Revision}}</small></td>
+<td>{{.Status.Scaling.Ready}} of {{.Replicas}}</td>
+<td><span class="badge {{badge .Status.Scaling.State}}">{{.Status.Scaling.State}}</span></td>
+<td><span class="badge {{badge .Status.Rollout.State}}">{{.Status.Rollout.State}}</span></td>
+<td>{{with .Status}}{{if .FailedReplicas}}<span class="badge bad">{{.FailedReplicas}} failed</span> {{end}}{{if .UnhealthyReplicas}}<span class="badge bad">{{.UnhealthyReplicas}} unhealthy</span> {{end}}{{if .LostReplicas}}<span class="badge bad">{{.LostReplicas}} lost</span> {{end}}{{if .UnschedulableReplicas}}<span class="badge warn">{{.UnschedulableReplicas}} unschedulable</span>{{end}}{{end}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+{{else}}
+<p class="empty">No service is defined.</p>
+{{end}}
+
+<h2>Recent events</h2>
+{{template "eventTable" .Events}}
+<p><a href="/dashboard/events">All events</a></p>
+{{end}}

@@ -316,6 +316,8 @@ var reconcileTests = []reconcileTest{
 	{"repeating a pass changes nothing", testPassesAreIdempotent},
 	{"a failed pass saves nothing", testFailedPassIsRolledBack},
 	{"the loop retires replicas and stops", testRunLoop},
+	{"the observer is told of a failed rollout once it is saved", testObserverIsToldOfAFailedRolloutOnceItIsSaved},
+	{"the observer sees every pass of the loop", testObserverSeesEveryPassOfTheLoop},
 }
 
 func runReconcileTests(t *testing.T, newStore func(t *testing.T) store.Store) {
