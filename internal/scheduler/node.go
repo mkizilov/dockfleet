@@ -90,6 +90,15 @@ func (t Timing) HealthReason(state string) string {
 	return ""
 }
 
+// States is every node's health at now, by node ID.
+func (t Timing) States(nodes []store.Node, now time.Time) map[string]string {
+	out := make(map[string]string, len(nodes))
+	for _, n := range nodes {
+		out[n.ID] = t.Health(n, now)
+	}
+	return out
+}
+
 // Lost returns the IDs of the nodes that are unavailable at now.
 func (t Timing) Lost(nodes []store.Node, now time.Time) map[string]bool {
 	lost := map[string]bool{}

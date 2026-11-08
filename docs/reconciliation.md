@@ -85,10 +85,21 @@ Stopping the agent does not stop containers. They keep running, and the next age
 
 The **reconciler** (`internal/reconcile`) runs every `DOCKFLEET_RECONCILE_INTERVAL` (default 5 s) in one transaction under the placement lock, so it never interleaves with a scheduling pass. `Plan` is a pure function of the services, the workloads with their observations, and the scheduler's explanations:
 
-1. **Scale down.** A workload whose replica index is above its service's replica count is told to stop. So is every workload of a deleted service, whatever its revision.
-2. **Rollout.** A workload of an older revision is told to stop once the same replica of the *current* revision is up: its agent has acknowledged the latest instruction and reports it running (or finished successfully). Replicas are replaced one by one and there is never a replica without a running container; if the new one never starts, the old one stays and `status` says why.
+1. **Scale down.** A service that has more workloads of its current revision meant to run than it wants has the surplus told to stop, and so is every workload of a deleted service, whatever its revision. Which ones is decided as described under [Scaling](#scaling).
+2. **Rollout.** A workload of an older revision is told to stop for each replica of the *current* revision that is up: its agent has acknowledged the latest instruction and reports it running (or finished successfully). The old revision keeps as many replicas as the new one still lacks, so the number of running replicas never drops below the wanted count; if the new replicas never start, the old ones stay and `status` says why.
 3. **Fixed host ports.** If the new replica cannot be placed because the old one holds a fixed host port that the new one needs as well (a host port allows one container per node), the old one is stopped to free it. This is the one case with a gap.
 4. **Removal.** A stopped workload is deleted when its node has confirmed that the container is gone: a report made after it received the stop, phase `STOPPED`, no container. Deleting frees the replica slot, and the scheduler fills it with a new workload if the service still wants a replica there.
+
+### Scaling
+
+A service wants a *number* of replicas, not particular ones, so scaling is a comparison of two counts and never moves or restarts what stays:
+
+- **Up.** The scheduler counts the workloads of the current revision that are meant to run. The service lacks the difference, and each missing replica gets a new workload (new ID) in the lowest replica number that is free, on a node chosen by the usual rules, or an explanation of why there is none. Nothing that runs is looked at again.
+- **Down.** The reconciler picks the surplus one at a time, so each choice sees what the earlier ones left: the replica doing the least good first (failed, then unhealthy, then on a `suspect` node, then not running yet), then from the node that carries most replicas of the service, then the one restarted most, then the newest, then the highest number, then the highest ID. The order depends only on what is stored, so any manager makes the same choice. A replica on a node that has been given up on is not counted among those the service has: it is replaced by the failover, and a healthy replica never pays for it.
+- **A replica that was stopped is a replica the service lacks.** Scaling down and then up again therefore creates a new workload at once, even if the old node has not yet confirmed that its container is gone (it may never): the old workload keeps its number until it is deleted, and the new one takes the next free number. The database allows one workload meant to run per number.
+- **Repeating** the same count, in the API or by the loops, changes nothing: the comparison finds nothing to do.
+
+The progress is `scaling` in the API ([api.md](api.md#scaling)).
 
 Stopping is `SetWorkloadDesiredState(stopped)`, which bumps the generation; a workload that is already stopped is skipped (`ErrUnchanged`). Deleting a workload that is already gone is skipped too. A pass either applies its changes and records an audit event for each (`replica.stopped`, `replica.removed`, actor `reconciler`) or, if anything fails, none.
 
@@ -112,7 +123,8 @@ A node that goes quiet is a different case from any of these: after a suspect pe
 
 - `GET /v1/services/{name}`: `status` lists every replica with its node, `desired_state`, `generation`, `acknowledged`, `phase`, message and container, and the count of running replicas.
 - `GET /v1/workloads`: the assignments and the agents' observations, side by side.
-- `GET /v1/events`: `replica.scheduled`, `replica.stopped` and `replica.removed` with their reason.
+- `GET /v1/events`: `replica.scheduled`, `replica.stopped` (with its `reason` and, when there was a choice, `why`) and `replica.removed`.
+- `GET /v1/services/{name}/scale`: the wanted count and the progress towards it (`scaling_up`, `scaling_down`, `blocked`, `stable`, ...).
 - Agent logs: `workload assigned`, `workload status` (when a report changes), `pulling image`, orphan warnings.
 
 ## Settings
@@ -126,9 +138,9 @@ The agent's timings (resync 2 s, orphan grace 2 min, stop grace 10 s, restart ba
 
 ## Tests
 
-- `internal/reconcile`: `Plan` as a table (scale down, deleted services, rollouts, failed rollouts, stale reports, port handover, ordering), then the whole control loop on the in-memory store (and PostgreSQL under the `integration` tag, with two managers at once): deploy, repeat passes, scale down, scale up with new IDs, roll out with the invariant that every replica always runs, delete.
+- `internal/reconcile`: `Plan` as a table (scale down, which replicas are chosen and why, deleted services, rollouts, failed rollouts, stale reports, port handover, lost nodes, ordering), then the whole control loop on the in-memory store (and PostgreSQL under the `integration` tag, with two managers at once): deploy, repeat passes, scale down keeping the healthy replicas, scale up with new IDs, scaling back and forth with exact counts of placements and stops, scaling while a node is unavailable or quiet, more replicas than fit, roll out with the invariant that the wanted number of replicas always runs, delete.
 - `internal/agent`: the runner against an in-memory Docker engine that behaves like the adapter: creation, adoption after restart, stopping and removal, bystanders, orphans and the grace period, image pulls, backoff, restart policies, policy rejections, unreachable Docker.
-- `internal/integration`: real agents and a real manager over gRPC, with the control loops: a service deployed, a manager restart, a crashed container found by a restarted agent, scale down, rollout and deletion with exact counts of creates and removes; a removal that waits for an absent node; retried failures.
+- `internal/integration`: real agents and a real manager over gRPC, with the control loops: a service deployed, a manager restart, a crashed container found by a restarted agent, scale down, rollout and deletion with exact counts of creates and removes; a removal that waits for an absent node; retried failures; and `scale_test.go`, which changes the replica count through the REST API: scale-up creating only what is missing, scale-down removing a failed replica first and leaving the rest alone, more replicas than a node holds (reported as blocked, completed when a node joins), repeated requests, and a scaling while a node is cut off.
 - `internal/integration/docker_test.go` (tag `dockerintegration`): the same flow against a real Docker daemon, with another node's container as bystander. **It is not run by `make test`.** Run it against a disposable daemon: `make docker-test-up`, then `DOCKFLEET_TEST_DOCKER_HOST=tcp://127.0.0.1:21297 make test-docker`, then `make docker-test-down`.
 
 ## Limitations

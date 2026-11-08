@@ -66,7 +66,7 @@ The text never contains a node's age or a timestamp, so an explanation that has 
 
 ## Placement passes
 
-A replica slot is replica `i` (1 to `replicas`) of a service's current revision. A slot with no workload is waiting; a slot with a workload in any state is not. `placement.Scheduler.RunOnce` makes one pass:
+A replica slot is replica number `i` of a service's current revision. A service wants `replicas` replicas and lacks as many as it has fewer workloads of its current revision *meant to run*; each lacking replica takes the lowest slot that is free, so the numbers in use are 1 to `replicas` unless a scale-down left gaps (it stops the replicas that do the least good, not the highest numbered; see [reconciliation.md](reconciliation.md#scaling)). `placement.Scheduler.RunOnce` makes one pass:
 
 1. Takes the cluster-wide placement lock (`Tx.LockPlacement`; a PostgreSQL advisory lock), so passes on several managers queue up and each sees the previous one's work.
 2. Reads nodes, enrollments, workloads and live service definitions in the same transaction.
@@ -76,9 +76,9 @@ A replica slot is replica `i` (1 to `replicas`) of a service's current revision.
 
 If any step fails nothing is saved and the next pass starts over. A pass is idempotent: with nothing waiting it writes nothing. The manager runs one every `DOCKFLEET_SCHEDULER_INTERVAL` (default `5s`) until it shuts down.
 
-A slot with a stopped workload on it is not waiting while the container may still be there, with one exception: when the workload's node has been given up on (silent for `DOCKFLEET_NODE_UNAVAILABLE_AFTER`, see [failure-handling.md](failure-handling.md)), the reconciler has stopped the workload and the node cannot be asked to remove the container, so the slot is waiting again and the replica is placed on another node at once. The database allows only one workload *meant to run* per slot, so the old and new workloads never both claim it.
+A stopped workload is not a replica: if the service lacks one, it is created at once, whatever state the old workload's node is in. What differs is the number it gets. A stopped workload keeps its slot while its container may still be there, so the new workload takes the next free number; but when the workload's node has been given up on (silent for `DOCKFLEET_NODE_UNAVAILABLE_AFTER`, see [failure-handling.md](failure-handling.md)) the reconciler has stopped it and the node cannot be asked to remove the container, so the slot is free again and the replica takes the same number on another node. The database allows only one workload *meant to run* per slot, so the old and new workloads never both claim it. The stopped workload still reserves nothing: the scheduler treats a workload as freed the moment it is told to stop.
 
-Deliberately not done by a pass: removing workloads (scaling down, retiring the replicas of an older revision, stopping the workloads of a lost node), and starting containers. A deployment of a new revision therefore places the new revision's replicas beside the old ones, and needs room for both until the reconciler ([reconciliation.md](reconciliation.md)) retires the old ones, one replica at a time, as the new ones come up. The scheduler treats a workload as freed the moment it is told to stop, even though its container takes a moment to go.
+Deliberately not done by a pass: removing workloads (scaling down, retiring the replicas of an older revision, stopping the workloads of a lost node), and starting containers. A deployment of a new revision therefore places the new revision's replicas beside the old ones, and needs room for both until the reconciler ([reconciliation.md](reconciliation.md)) retires the old ones, one for each new replica that comes up. A scale-up places only the replicas that are missing and never looks at the ones that run; the scheduler treats a workload as freed the moment it is told to stop, even though its container takes a moment to go.
 
 Standalone workloads (`POST /v1/workloads`) use the same scheduler and the same rules, so what a service's replicas reserve counts against them and the other way round.
 

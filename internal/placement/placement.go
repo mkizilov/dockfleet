@@ -10,14 +10,16 @@
 // and each sees the previous one's work.
 //
 // The unit of work is a replica slot: replica i of a service's current
-// revision. A slot with no workload is waiting. Placing it creates a workload
-// for that slot, and the database allows only one that is meant to run per
-// slot. What a pass does not do is remove anything: scaling a service down,
-// retiring the replicas of an older revision and stopping the workloads of a
-// node that was given up on belong to the reconciler (internal/reconcile). A
-// slot whose only workload was stopped on such a lost node is waiting again, so
-// that the replica is started on another node at once instead of when the lost
-// node returns.
+// revision. A service that wants N replicas and has fewer workloads meant to run
+// lacks some; each lacking replica goes into the lowest slot that is free, and
+// workload that is meant to run per slot.
+//
+// What a pass does not do is remove anything: scaling a service down, retiring
+// the replicas of an older revision and stopping the workloads of a node that
+// was given up on belong to the reconciler (internal/reconcile). A slot whose
+// only workload was stopped on such a lost node is free again, so that the
+// replica is started on another node at once instead of when the lost node
+// returns.
 package placement
 
 import (
@@ -100,13 +102,6 @@ func ReadCluster(ctx context.Context, r Reader, now time.Time, ttl time.Duration
 	return c, nil
 }
 
-// slot is one replica of one revision of a service.
-type slot struct {
-	serviceID string
-	revision  int
-	index     int
-}
-
 // waiting is a replica that needs a node, with the service it belongs to and
 // the ID its workload will have. The ID is chosen before the decision, so the
 // workload has its final name while the scheduler is still explaining things.
@@ -123,25 +118,42 @@ type replicaKey struct {
 	index int
 }
 
-// findWaiting lists the replicas that have no workload: for each live service,
-// replicas 1 to N of its current revision. A slot that already has a workload
-// is not waiting, whatever state the workload is in, except that a workload
-// that was stopped on a lost node no longer holds its slot: that node cannot
-// be asked to remove the container, and the replica must not wait for it.
+// findWaiting lists the replicas that need a node: for each live service, as
+// many replicas of its current revision as it lacks, each in the lowest slot
+// (replica index) that is free. A service that wants 3 and has 2 workloads
+// meant to run lacks one, whichever slots the two hold: scaling down stops the
+// replicas that are doing the least good, not the highest numbered, so the slots
+// in use need not be 1 to N. A slot that has a workload is not free, whatever
+// state the workload is in, except that a workload that was stopped on a lost
+// node no longer holds its slot: that node cannot be asked to remove the
+// container, and the replica must not wait for it.
 func findWaiting(defs []store.Definition, workloads []store.Workload, lost map[string]bool) []waiting {
-	taken := make(map[slot]bool, len(workloads))
+	byService := make(map[string][]store.Workload, len(defs))
 	for _, w := range workloads {
-		if w.ServiceID != "" && !(w.DesiredState == store.DesiredStopped && lost[w.NodeID]) {
-			taken[slot{w.ServiceID, w.ServiceRevision, w.ReplicaIndex}] = true
+		if w.ServiceID != "" {
+			byService[w.ServiceID] = append(byService[w.ServiceID], w)
 		}
 	}
 	var out []waiting
 	for _, d := range defs {
 		svc, spec := d.Service, d.Revision.Spec
-		for i := 1; i <= svc.Replicas; i++ {
-			if taken[slot{svc.ID, svc.CurrentRevision, i}] {
+		taken, active := map[int]bool{}, 0
+		for _, w := range byService[svc.ID] {
+			if w.ServiceRevision != svc.CurrentRevision {
 				continue
 			}
+			if w.DesiredState == store.DesiredRunning {
+				active++
+			}
+			if !(w.DesiredState == store.DesiredStopped && lost[w.NodeID]) {
+				taken[w.ReplicaIndex] = true
+			}
+		}
+		for i, lacking := 1, svc.Replicas-active; lacking > 0; i++ {
+			if taken[i] {
+				continue
+			}
+			lacking--
 			id := store.NewID()
 			out = append(out, waiting{id: id, def: d, replica: scheduler.Replica{
 				Service: svc.Name, Group: svc.ID, Index: i, Name: replicaName(svc.Name, svc.CurrentRevision, i, id),

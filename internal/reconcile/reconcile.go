@@ -82,7 +82,7 @@ func (r *Reconciler) nodeEvent(at time.Time, c NodeChange, reason string) store.
 
 func (r *Reconciler) event(at time.Time, action string, a Action, message string) store.Event {
 	w := a.Workload
-	return store.Event{
+	e := store.Event{
 		At: at, InstanceID: r.cfg.InstanceID, Actor: Actor, Action: action,
 		ResourceType: "workload", ResourceID: w.ID, Message: message,
 		Details: map[string]string{
@@ -90,6 +90,10 @@ func (r *Reconciler) event(at time.Time, action string, a Action, message string
 			"node_id": w.NodeID, "reason": a.Reason,
 		},
 	}
+	if a.Why != "" {
+		e.Details["why"] = a.Why
+	}
+	return e
 }
 
 // RunOnce makes one pass in a single transaction under the placement lock, so
@@ -130,7 +134,7 @@ func (r *Reconciler) RunOnce(ctx context.Context) (Report, error) {
 			}
 			report.NodeChanges++
 		}
-		for _, a := range Plan(defs, workloads, waiting, r.cfg.Timing.Lost(nodes, now)) {
+		for _, a := range Plan(defs, workloads, waiting, r.cfg.Timing.States(nodes, now)) {
 			w := a.Workload
 			label := fmt.Sprintf("%s (revision %d, replica %d)", w.Name, w.ServiceRevision, w.ReplicaIndex)
 			switch a.Kind {
@@ -145,6 +149,9 @@ func (r *Reconciler) RunOnce(ctx context.Context) (Report, error) {
 				message := fmt.Sprintf("%s on node %s will be stopped: %s", label, w.NodeID, a.Reason)
 				if a.Reason == ReasonNodeLost {
 					message = fmt.Sprintf("%s was given up on: node %s is unavailable, so the replica is started on another node and the node is told to remove the container if it returns", label, w.NodeID)
+				}
+				if a.Why != "" {
+					message += " (" + a.Why + ")"
 				}
 				if _, err := tx.AppendEvent(ctx, r.event(now, "replica.stopped", a, message)); err != nil {
 					return err

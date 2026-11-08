@@ -152,6 +152,7 @@ var placementTests = []placementTest{
 	{"a second pass changes nothing", eachStore(testPassesAreIdempotent)},
 	{"scaling up places only the new replicas", eachStore(testScalingUp)},
 	{"scaling down removes nothing", eachStore(testScalingDownRemovesNothing)},
+	{"scaling up fills the lowest free slots", eachStore(testScalingFillsTheLowestFreeSlots)},
 	{"unschedulable replicas are explained once", eachStore(testUnschedulableAreExplained)},
 	{"offline and revoked nodes get nothing", eachStore(testUnavailableNodes)},
 	{"host port conflicts", eachStore(testHostPorts)},
@@ -688,10 +689,14 @@ func testWorkloadsCarryHowToRun(t *testing.T, e *env) {
 	}
 }
 
-// A workload that was stopped on a node that has been given up on no longer
-// holds its replica slot, so the replica starts on another node at once. On a
-// node that is merely quiet, or when nodes are never given up on, the slot stays
-// taken until the node confirms that the container is gone.
+// A replica whose workload was stopped is a replica the service lacks, so it is
+// started on another node at once, whatever state the old node is in. Which
+// slot (replica index) it takes differs: on a node that has been given up on the
+// stopped workload no longer holds its slot, because that node cannot be asked
+// to remove the container, and the new workload takes the same index. On a node
+// that is merely quiet, or when nodes are never given up on, the slot stays
+// taken until the node confirms that the container is gone, and the new
+// workload takes the next free one.
 func testLostNodesFreeTheirSlots(t *testing.T, newStore func(t *testing.T) store.Store) {
 	timing := scheduler.Timing{SuspectAfter: ttl, UnavailableAfter: 2 * time.Minute}
 	stopOnVictim := func(e *env) (victim store.Workload, otherNode string) {
@@ -712,38 +717,28 @@ func testLostNodesFreeTheirSlots(t *testing.T, newStore func(t *testing.T) store
 		}
 		return victim, otherNode
 	}
-	replicas := func(e *env) (running, stopped []store.Workload) {
+	replicas := func(e *env) (running map[int]store.Workload, stopped []store.Workload) {
 		ws, err := e.st.ListWorkloadsForService(e.ctx(), "svc-web")
 		e.must(err)
+		running = map[int]store.Workload{}
 		for _, w := range ws {
 			if w.DesiredState == store.DesiredRunning {
-				running = append(running, w)
+				running[w.ReplicaIndex] = w
 			} else {
 				stopped = append(stopped, w)
 			}
 		}
 		return running, stopped
 	}
-
-	t.Run("the node is given up on", func(t *testing.T) {
-		e := newEnv(t, newStore(t), func(c *Config) { c.Timing = timing })
-		victim, other := stopOnVictim(e)
-
-		// The node is only quiet: the old container may still be there.
-		e.clock = e.clock.Add(90 * time.Second)
-		e.nodeBeat(other, e.clock, 4000, 8*gib)
-		if report := e.run(); report.Placed != 0 {
-			t.Fatalf("a suspect node's slot was refilled: %+v", report)
-		}
-
-		e.clock = e.clock.Add(90 * time.Second)
-		e.nodeBeat(other, e.clock, 4000, 8*gib)
-		if report := e.run(); report.Placed != 1 {
-			t.Fatalf("the lost node's slot was not refilled: %+v", report)
-		}
+	// replaced checks that exactly one replacement was made, on the node that answers, in the slot wanted.
+	replaced := func(t *testing.T, e *env, victim store.Workload, other string, slot int) {
+		t.Helper()
 		running, stopped := replicas(e)
 		if len(running) != 2 || len(stopped) != 1 || stopped[0].ID != victim.ID {
 			t.Fatalf("running %+v, stopped %+v", running, stopped)
+		}
+		if w, ok := running[slot]; !ok || w.NodeID != other || w.ID == victim.ID {
+			t.Fatalf("the replacement should be replica %d on %s: %+v", slot, other, running)
 		}
 		for _, w := range running {
 			if w.NodeID != other {
@@ -753,17 +748,75 @@ func testLostNodesFreeTheirSlots(t *testing.T, newStore func(t *testing.T) store
 		if report := e.run(); report.Placed != 0 || e.workloadCount() != 3 {
 			t.Fatalf("a second pass: %+v, %d workloads", report, e.workloadCount())
 		}
+	}
+
+	t.Run("the node is only quiet", func(t *testing.T) {
+		e := newEnv(t, newStore(t), func(c *Config) { c.Timing = timing })
+		victim, other := stopOnVictim(e)
+		e.clock = e.clock.Add(90 * time.Second)
+		e.nodeBeat(other, e.clock, 4000, 8*gib)
+		if report := e.run(); report.Placed != 1 {
+			t.Fatalf("the replica was not replaced: %+v", report)
+		}
+		replaced(t, e, victim, other, 3) // the victim's slot is still taken
+	})
+
+	t.Run("the node is given up on", func(t *testing.T) {
+		e := newEnv(t, newStore(t), func(c *Config) { c.Timing = timing })
+		victim, other := stopOnVictim(e)
+		e.clock = e.clock.Add(180 * time.Second)
+		e.nodeBeat(other, e.clock, 4000, 8*gib)
+		if report := e.run(); report.Placed != 1 {
+			t.Fatalf("the replica was not replaced: %+v", report)
+		}
+		replaced(t, e, victim, other, victim.ReplicaIndex) // the victim's slot is free again
 	})
 
 	t.Run("nodes are never given up on", func(t *testing.T) {
 		e := newEnv(t, newStore(t))
-		_, other := stopOnVictim(e)
+		victim, other := stopOnVictim(e)
 		e.clock = e.clock.Add(24 * time.Hour)
 		e.nodeBeat(other, e.clock, 4000, 8*gib)
-		if report := e.run(); report.Placed != 0 {
-			t.Fatalf("%+v; without a limit the stopped workload keeps its slot", report)
+		if report := e.run(); report.Placed != 1 {
+			t.Fatalf("the replica was not replaced: %+v", report)
 		}
+		replaced(t, e, victim, other, 3)
 	})
+}
+
+// Scaling down stops the replicas that serve least, not the highest numbered, so
+// the slots in use are not 1 to N. Scaling up again fills the lowest free ones
+// and never creates more than the service lacks.
+func testScalingFillsTheLowestFreeSlots(t *testing.T, e *env) {
+	e.node("n1", 8000, 8*gib)
+	svc := e.service("web", 4, spec(500))
+	e.run()
+	all, err := e.st.ListWorkloadsForService(e.ctx(), svc.ID)
+	e.must(err)
+
+	// Replicas 1 and 3 were stopped (the reconciler's choice, here made by hand) and are gone.
+	for _, w := range []store.Workload{all[0], all[2]} {
+		_, err := e.st.SetWorkloadDesiredState(e.ctx(), w.ID, store.DesiredStopped, e.clock)
+		e.must(err)
+		e.must(e.st.DeleteWorkload(e.ctx(), w.ID))
+	}
+	_, err = e.st.ScaleService(e.ctx(), svc.ID, 2, 0, t0)
+	e.must(err)
+	if report := e.run(); report != (Report{}) {
+		t.Fatalf("report = %+v; two replicas run and two are wanted", report)
+	}
+
+	_, err = e.st.ScaleService(e.ctx(), svc.ID, 5, 0, t0)
+	e.must(err)
+	if report := e.run(); report.Placed != 3 {
+		t.Fatalf("report = %+v, want the three missing replicas placed", report)
+	}
+	if got := e.placed("web"); !reflect.DeepEqual(got, map[int]string{1: "n1", 2: "n1", 3: "n1", 4: "n1", 5: "n1"}) {
+		t.Fatalf("slots in use = %v, want 1 to 5 (the freed 1 and 3 refilled, then 5)", got)
+	}
+	if report := e.run(); report != (Report{}) {
+		t.Fatalf("a second pass: %+v", report)
+	}
 }
 
 func testOvercommit(t *testing.T, newStore func(t *testing.T) store.Store) {

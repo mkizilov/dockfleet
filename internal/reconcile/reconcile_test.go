@@ -35,11 +35,14 @@ type env struct {
 	timing scheduler.Timing
 	// down are the nodes whose agents say nothing: no heartbeat, no reports.
 	down map[string]bool
+	// failed and unhealthy are the workloads whose containers their agents
+	// report failed, or running but failing their health check.
+	failed, unhealthy map[string]bool
 }
 
 func newEnv(t *testing.T, st store.Store) *env {
 	t.Helper()
-	e := &env{t: t, st: st, clock: t0, obsAt: t0, down: map[string]bool{}}
+	e := &env{t: t, st: st, clock: t0, obsAt: t0, down: map[string]bool{}, failed: map[string]bool{}, unhealthy: map[string]bool{}}
 	e.timing = scheduler.Timing{SuspectAfter: 30 * time.Second, UnavailableAfter: 2 * time.Minute}
 	e.startManager()
 	return e
@@ -100,7 +103,9 @@ func (e *env) scale(name string, replicas int) {
 	svc, err := e.st.GetServiceByName(e.ctx(), name)
 	e.must(err)
 	_, err = e.st.ScaleService(e.ctx(), svc.ID, replicas, 0, e.clock)
-	e.must(err)
+	if !errors.Is(err, store.ErrUnchanged) { // asking for the count it already has is not an error
+		e.must(err)
+	}
 }
 
 func (e *env) deploy(name, image string) {
@@ -143,6 +148,10 @@ func (e *env) agents() {
 				o.State = store.WorkloadStopped
 			case e.holdBack != nil && e.holdBack(w):
 				o.State = store.WorkloadPending
+			case e.failed[w.ID]:
+				o.State, o.ContainerID, o.Message = store.WorkloadFailed, "container-"+w.ID, "exited with code 1"
+			case e.unhealthy[w.ID]:
+				o.State, o.ContainerID, o.Health = store.WorkloadRunning, "container-"+w.ID, store.HealthUnhealthy
 			default:
 				o.State, o.ContainerID = store.WorkloadRunning, "container-"+w.ID
 			}
@@ -248,19 +257,18 @@ func (e *env) wantReplicas(name string, revision, n int, image string) []store.W
 	return list
 }
 
-// everyReplicaRuns is the rollout invariant: at no point is a replica without a running workload.
+// everyReplicaRuns is the rollout invariant: at no point do fewer than n
+// workloads of the service run, whichever revision they belong to.
 func (e *env) everyReplicaRuns(name string, n int) {
 	e.t.Helper()
-	runs := map[int]bool{}
+	running := 0
 	for _, w := range e.workloads(name) {
 		if w.DesiredState == store.DesiredRunning && w.Observed != nil && w.Observed.State == store.WorkloadRunning {
-			runs[w.ReplicaIndex] = true
+			running++
 		}
 	}
-	for i := 1; i <= n; i++ {
-		if !runs[i] {
-			e.t.Fatalf("replica %d of %s is not running:\n%s", i, name, e.describe())
-		}
+	if running < n {
+		e.t.Fatalf("%d replicas of %s run, want at least %d:\n%s", running, name, n, e.describe())
 	}
 }
 
@@ -279,6 +287,11 @@ var reconcileTests = []reconcileTest{
 	{"an agent that left cleanly is given up on after the same time", testDepartedNodeIsGivenUpOnLater},
 	{"the only node is lost: the replica waits, then starts when it returns", testLostOnlyNode},
 	{"workloads that belong to no service stay where they were put", testStandaloneWorkloadsAreNotMoved},
+	{"scaling down stops the worst replicas and keeps the healthy ones as they were", testScaleDownKeepsHealthyReplicas},
+	{"scaling up and down again and again restarts nothing that stays", testScalingBackAndForth},
+	{"scaling up while a node is unavailable uses the others", testScaleUpWithANodeUnavailable},
+	{"scaling down while a node is quiet removes its replica first", testScaleDownWithANodeQuiet},
+	{"scaling up beyond the cluster places what fits and waits for the rest", testScaleUpBeyondCapacity},
 	{"repeating a pass changes nothing", testPassesAreIdempotent},
 	{"a failed pass saves nothing", testFailedPassIsRolledBack},
 	{"the loop retires replicas and stops", testRunLoop},
@@ -710,6 +723,280 @@ func testStandaloneWorkloadsAreNotMoved(t *testing.T, newStore func(t *testing.T
 	}
 	if e.health("n2") != store.NodeUnavailable {
 		t.Fatalf("n2 is %s, but the node's state is shown anyway", e.health("n2"))
+	}
+}
+
+// stoppedEvents are the replica.stopped events of the workload, newest first.
+func (e *env) stoppedEvents(workloadID string) []store.Event {
+	e.t.Helper()
+	all, err := e.st.ListEvents(e.ctx(), store.EventFilter{ResourceType: "workload", ResourceID: workloadID, Limit: store.MaxEventLimit})
+	e.must(err)
+	var out []store.Event
+	for _, ev := range all {
+		if ev.Action == "replica.stopped" {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+func testScaleDownKeepsHealthyReplicas(t *testing.T, newStore func(t *testing.T) store.Store) {
+	e := newEnv(t, newStore(t))
+	e.node("n1")
+	e.node("n2")
+	e.service("web", 4, "nginx:1.0")
+	e.settle()
+	first := e.wantReplicas("web", 1, 4, "nginx:1.0")
+
+	// Replica 2 fails and replica 3 runs but fails its health check. Neither is a reason to act.
+	e.failed[first[1].ID], e.unhealthy[first[2].ID] = true, true
+	e.settle()
+	if e.events("replica.stopped") != 0 {
+		t.Fatalf("a failing replica was stopped although the count is right:\n%s", e.describe())
+	}
+
+	// Two fewer are wanted: the failing ones go, the healthy ones, replicas 1 and 4, stay untouched.
+	e.scale("web", 2)
+	e.settle()
+	left := e.meantToRun("web")
+	if len(left) != 2 || left[0].ID != first[0].ID || left[1].ID != first[3].ID {
+		t.Fatalf("the replicas left are not the healthy ones:\n%s", e.describe())
+	}
+	for _, w := range left {
+		if w.Generation != 1 || w.Observed == nil || w.Observed.State != store.WorkloadRunning || w.Observed.ContainerID != "container-"+w.ID {
+			t.Fatalf("a replica that stays was touched: %+v (observed %+v)", w, w.Observed)
+		}
+	}
+	if got := e.stoppedEvents(first[1].ID); len(got) != 1 || got[0].Details["why"] != WhyFailed || got[0].Details["reason"] != ReasonScaledDown {
+		t.Fatalf("the failed replica's stop = %+v", got)
+	}
+	if got := e.stoppedEvents(first[2].ID); len(got) != 1 || got[0].Details["why"] != WhyUnhealthy {
+		t.Fatalf("the unhealthy replica's stop = %+v", got)
+	}
+	if e.events("replica.stopped") != 2 || e.events("replica.removed") != 2 || len(e.workloads("web")) != 2 {
+		t.Fatalf("%d stopped, %d removed, %d records left:\n%s", e.events("replica.stopped"), e.events("replica.removed"), len(e.workloads("web")), e.describe())
+	}
+
+	// Scaling up again fills the freed slots with new workloads; the survivors are not touched either.
+	e.scale("web", 4)
+	e.settle()
+	grown := e.meantToRun("web")
+	if len(grown) != 4 {
+		t.Fatalf("after scaling up:\n%s", e.describe())
+	}
+	for i, w := range grown {
+		if w.ReplicaIndex != i+1 {
+			t.Fatalf("replica %d has index %d; the lowest free slots are used:\n%s", i+1, w.ReplicaIndex, e.describe())
+		}
+	}
+	if grown[0].ID != first[0].ID || grown[3].ID != first[3].ID || e.events("replica.scheduled") != 6 {
+		t.Fatalf("after scaling up:\n%s", e.describe())
+	}
+}
+
+// Many scalings in a row: whatever stays is never restarted, nothing is created
+// that was not needed, and asking again for the same count changes nothing.
+func testScalingBackAndForth(t *testing.T, newStore func(t *testing.T) store.Store) {
+	e := newEnv(t, newStore(t))
+	for _, id := range []string{"n1", "n2", "n3"} {
+		e.node(id)
+	}
+	e.service("web", 2, "nginx:1.0")
+	e.settle()
+
+	seen := map[string]bool{} // every workload ID that ever ran
+	current := map[string]bool{}
+	for _, w := range e.meantToRun("web") {
+		seen[w.ID], current[w.ID] = true, true
+	}
+	for _, n := range []int{5, 5, 3, 3, 6, 0, 0, 2, 2, 1} {
+		scheduled, stopped := e.events("replica.scheduled"), e.events("replica.stopped")
+		was := len(current)
+		e.scale("web", n)
+		e.settle()
+
+		now := e.meantToRun("web")
+		if len(now) != n || len(e.workloads("web")) != n {
+			t.Fatalf("scaled to %d:\n%s", n, e.describe())
+		}
+		after := map[string]bool{}
+		for _, w := range now {
+			after[w.ID] = true
+			switch {
+			case current[w.ID]:
+				// It was there before: not restarted, not replaced.
+				if w.Generation != 1 || w.Observed == nil || w.Observed.ContainerID != "container-"+w.ID {
+					t.Fatalf("scaled to %d: replica %s that stays was touched: %+v", n, w.Name, w)
+				}
+			case seen[w.ID]:
+				t.Fatalf("scaled to %d: workload %s ran before and came back", n, w.Name)
+			}
+			seen[w.ID] = true
+		}
+		switch {
+		case n > was:
+			for id := range current {
+				if !after[id] {
+					t.Fatalf("scaled up to %d: replica %s was removed", n, id)
+				}
+			}
+			if got := e.events("replica.scheduled") - scheduled; got != n-was || e.events("replica.stopped") != stopped {
+				t.Fatalf("scaled up from %d to %d: %d placements, %d stops", was, n, got, e.events("replica.stopped")-stopped)
+			}
+		case n < was:
+			for id := range after {
+				if !current[id] {
+					t.Fatalf("scaled down to %d: replica %s is new", n, id)
+				}
+			}
+			if got := e.events("replica.stopped") - stopped; got != was-n || e.events("replica.scheduled") != scheduled {
+				t.Fatalf("scaled down from %d to %d: %d stops, %d placements", was, n, got, e.events("replica.scheduled")-scheduled)
+			}
+		default:
+			// The same count again: nothing at all happens.
+			if e.events("replica.scheduled") != scheduled || e.events("replica.stopped") != stopped {
+				t.Fatalf("asking again for %d changed something", n)
+			}
+		}
+		current = after
+	}
+}
+
+func testScaleUpWithANodeUnavailable(t *testing.T, newStore func(t *testing.T) store.Store) {
+	e := newEnv(t, newStore(t))
+	e.node("n1")
+	e.node("n2")
+	e.service("web", 2, "nginx:1.0")
+	e.settle()
+
+	// n2 stops answering and is given up on; its replica starts on n1.
+	e.down["n2"] = true
+	e.elapse(130 * time.Second)
+	e.settle()
+	if e.health("n2") != store.NodeUnavailable {
+		t.Fatalf("n2 is %s", e.health("n2"))
+	}
+	before := e.wantOneEach("web", 2)
+	if len(before["n1"]) != 2 {
+		t.Fatalf("both replicas belong on n1 now:\n%s", e.describe())
+	}
+
+	// More replicas are wanted while n2 is away: they go where there is room and an answer.
+	e.scale("web", 5)
+	e.settle()
+	after := e.wantOneEach("web", 5)
+	if len(after["n1"]) != 5 || len(after["n2"]) != 0 {
+		t.Fatalf("replicas per node = n1 %d, n2 %d:\n%s", len(after["n1"]), len(after["n2"]), e.describe())
+	}
+	for _, w := range before["n1"] {
+		if got, err := e.st.GetWorkload(e.ctx(), w.ID); err != nil || got.Generation != 1 || got.DesiredState != store.DesiredRunning {
+			t.Fatalf("a replica that was running changed: %+v, %v", got, err)
+		}
+	}
+
+	// The node returns and the next replicas spread to it.
+	delete(e.down, "n2")
+	e.settle()
+	e.scale("web", 7)
+	e.settle()
+	final := e.wantOneEach("web", 7)
+	if len(final["n2"]) != 2 || len(final["n1"]) != 5 {
+		t.Fatalf("replicas per node = n1 %d, n2 %d; the new ones belong on the node that has none:\n%s", len(final["n1"]), len(final["n2"]), e.describe())
+	}
+}
+
+func testScaleDownWithANodeQuiet(t *testing.T, newStore func(t *testing.T) store.Store) {
+	e := newEnv(t, newStore(t))
+	for _, id := range []string{"n1", "n2", "n3"} {
+		e.node(id)
+	}
+	e.service("web", 3, "nginx:1.0")
+	e.settle()
+	before := e.wantOneEach("web", 3)
+	if len(before["n1"]) != 1 || len(before["n2"]) != 1 || len(before["n3"]) != 1 {
+		t.Fatalf("three replicas over three nodes:\n%s", e.describe())
+	}
+	victim := before["n3"][0]
+
+	// n3 goes quiet (not yet given up on) and one replica fewer is wanted: that one goes.
+	e.down["n3"] = true
+	e.elapse(45 * time.Second)
+	e.settle()
+	if e.health("n3") != store.NodeSuspect {
+		t.Fatalf("n3 is %s", e.health("n3"))
+	}
+	e.scale("web", 2)
+	e.settle()
+	left := e.wantOneEach("web", 2)
+	if len(left["n1"]) != 1 || len(left["n2"]) != 1 || left["n1"][0].ID != before["n1"][0].ID || left["n2"][0].ID != before["n2"][0].ID {
+		t.Fatalf("the replicas that answer were not the ones kept:\n%s", e.describe())
+	}
+	if got := e.stoppedEvents(victim.ID); len(got) != 1 || got[0].Details["why"] != WhySuspectNode {
+		t.Fatalf("the stop of the quiet node's replica = %+v", got)
+	}
+	// n3 cannot confirm, so the record stays; nothing else is created or stopped meanwhile.
+	if got, err := e.st.GetWorkload(e.ctx(), victim.ID); err != nil || got.DesiredState != store.DesiredStopped || got.Generation != 2 {
+		t.Fatalf("the quiet node's workload = %+v, %v", got, err)
+	}
+	if e.events("replica.stopped") != 1 || e.events("replica.scheduled") != 3 {
+		t.Fatalf("%d stops, %d placements", e.events("replica.stopped"), e.events("replica.scheduled"))
+	}
+
+	// When n3 answers again it removes the container and the record goes.
+	delete(e.down, "n3")
+	e.settle()
+	if _, err := e.st.GetWorkload(e.ctx(), victim.ID); !errors.Is(err, store.ErrNotFound) || e.events("replica.removed") != 1 {
+		t.Fatalf("after n3 returned: %v, %d removals", err, e.events("replica.removed"))
+	}
+}
+
+// More replicas are wanted than the cluster can hold: the ones that fit are
+// placed, the others wait with a reason, and nothing is promised twice. A node
+// that joins takes the rest, and scaling down afterwards keeps the nodes even.
+func testScaleUpBeyondCapacity(t *testing.T, newStore func(t *testing.T) store.Store) {
+	e := newEnv(t, newStore(t))
+	e.node("n1") // 4000m: eight replicas of 500m
+	e.service("web", 2, "nginx:1.0")
+	e.settle()
+
+	e.scale("web", 12)
+	e.settle()
+	placed := e.meantToRun("web")
+	if len(placed) != 8 {
+		t.Fatalf("%d replicas placed on a node with room for 8:\n%s", len(placed), e.describe())
+	}
+	waiting, err := e.st.ListUnschedulable(e.ctx(), "svc-web")
+	e.must(err)
+	if len(waiting) != 4 {
+		t.Fatalf("%d replicas waiting, want 4: %+v", len(waiting), waiting)
+	}
+	for i, u := range waiting {
+		if u.Code != "insufficient_resources" || u.ReplicaIndex != 9+i {
+			t.Fatalf("explanation %d = %+v; the replicas that wait take the next free slots", i, u)
+		}
+	}
+
+	// Another node: the rest are placed and the explanations go.
+	e.node("n2")
+	e.settle()
+	byNode := e.wantOneEach("web", 12)
+	if len(byNode["n1"]) != 8 || len(byNode["n2"]) != 4 {
+		t.Fatalf("replicas per node = n1 %d, n2 %d:\n%s", len(byNode["n1"]), len(byNode["n2"]), e.describe())
+	}
+	if waiting, err = e.st.ListUnschedulable(e.ctx(), "svc-web"); err != nil || len(waiting) != 0 {
+		t.Fatalf("explanations left: %+v, %v", waiting, err)
+	}
+
+	// Scaling down takes from the fuller node first, so the nodes end up level.
+	// The replicas left are not numbered 1 to 4: the ones that went were chosen by node, not by number.
+	e.scale("web", 4)
+	e.settle()
+	left := map[string]int{}
+	for _, w := range e.meantToRun("web") {
+		left[w.NodeID]++
+	}
+	if left["n1"] != 2 || left["n2"] != 2 || len(e.workloads("web")) != 4 {
+		t.Fatalf("replicas per node after scaling down = %v:\n%s", left, e.describe())
 	}
 }
 

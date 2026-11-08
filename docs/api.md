@@ -20,6 +20,8 @@ A service definition is **desired state**: it says what an administrator wants, 
 | `PUT /v1/services/{name}` | Replace the definition | `200`, `ETag` |
 | `DELETE /v1/services/{name}` | Delete | `200` with the deleted service |
 | `GET /v1/services/{name}/revisions` | Deployment history, oldest first | `200` |
+| `GET /v1/services/{name}/scale` | The wanted replica count and the progress towards it | `200`, `ETag` |
+| `PUT /v1/services/{name}/scale` | Set the wanted replica count (see [Scaling](#scaling)) | `200`, `ETag` |
 
 Services are addressed by **name**, which is unique among live services. A deleted service's name can be used again by a new service (with a new `id`), so a deleted service is no longer addressable by name; `GET /v1/services?include_deleted=true` still lists it.
 
@@ -105,7 +107,7 @@ The limits are kept at least as strict as the agent's container policy ([docker.
 `PUT` replaces the definition. It must carry `replicas` and a complete `spec` (`name` is optional and must match the URL). Then:
 
 - a changed `spec` becomes a **new deployment revision** (revision numbers only grow; rolling back is a `PUT` of an old spec, which becomes a new revision with the old content);
-- a changed `replicas` is a **scaling** and adds no revision;
+- a changed `replicas` is a **scaling** and adds no revision (`PUT /v1/services/{name}/scale` changes only the count: see [Scaling](#scaling));
 - an identical definition changes nothing: same version, no revision, no event.
 
 `DELETE` marks the service deleted and its desired replicas zero. Its revisions, workloads and events are kept.
@@ -124,6 +126,47 @@ curl -s -H "Authorization: Bearer $TOKEN" $API/v1/services/web/revisions
 curl -s -X DELETE -H "Authorization: Bearer $TOKEN" $API/v1/services/web
 ```
 
+## Scaling
+
+`PUT /v1/services/{name}/scale` sets how many replicas a service wants, and nothing else: the image, the limits and the revision stay as they are, so no replica is replaced. The body is `{"replicas": 5}` (0 to 1000; anything else in it is refused, and so is a missing, negative, fractional or non-numeric count, with `400` and every problem found). `GET` on the same path reads the count and the progress. Both answer with the service's `name`, `revision`, `version` (also the `ETag`), `replicas` and `scaling`; the answer to a `PUT` adds `previous_replicas` and `changed`:
+
+```json
+{
+  "name": "web", "revision": 2, "version": 7, "replicas": 5,
+  "previous_replicas": 3, "changed": true,
+  "scaling": {
+    "state": "scaling_up", "desired": 5, "ready": 3, "starting": 1, "waiting": 0, "surplus": 0, "stopping": 0, "outdated": 0,
+    "message": "3 ready, 5 wanted; 1 to create, 1 starting"
+  }
+}
+```
+
+Like every call of this API it only records intent. The scheduler creates the replicas that are missing, the reconciler stops the ones in surplus, and the agents start and stop the containers ([reconciliation.md](reconciliation.md#scaling)); the answer is how far that had come when it was given, and `GET` shows the rest as it happens.
+
+**Idempotent.** The request says what the count should be, not by how much to change it. Asking for the count a service already has changes nothing: the same version, no event, no container, `"changed": false`, and `200`, even if the request carries an `If-Match` that is out of date (the service already is as the client wants it, so a request whose answer was lost can be sent again). A request that does change the count follows the rules of `PUT /v1/services/{name}`: with `If-Match` it applies only to that version (`412` otherwise); without, to whatever is current. Each change is one `service.scaled` event with the old and the new count.
+
+**`scaling.state`** says where the service is between the count it has and the one it was asked for:
+
+| State | Meaning |
+| --- | --- |
+| `stable` | As many replicas are ready as are wanted, and nothing is on its way out. A service scaled to 0 is `stable` once its last container is gone (`none wanted, none left`). |
+| `scaling_up` | Replicas are still to be created by the scheduler (`message` counts them) or are starting (`starting`). |
+| `scaling_down` | Replicas above the wanted count are still to be stopped (`surplus`) or are being stopped (`stopping`, until their nodes confirm that the containers are gone). A node that is `unavailable` cannot confirm, so a replica on one does not hold the state back. |
+| `updating` | Replicas of an older revision still run (`outdated`): a deployment is rolling out. |
+| `blocked` | Some replicas (`waiting`) cannot be placed. The message carries the scheduler's reason; the full explanation, with a reason for every node, is in `status.unschedulable` of the service. The replicas that fit run regardless, and the service completes by itself when room appears (a node joins, resources are freed) or the count is lowered. |
+| `degraded` | Fewer replicas are ready than wanted and nothing is on its way to fix it: some failed beyond their restart limit, fail their health check, or sit on an unavailable node. See [failure-handling.md](failure-handling.md). |
+
+`ready` counts the replicas of the current revision that run (or finished successfully) on a node that is not unavailable and, if they have a health check, pass it. While a service is scaled down it can be more than `desired`.
+
+**Which replicas go.** A scale-down does not stop the highest numbered replicas but the ones doing the least good: failed ones first, then unhealthy ones, then those on a node that has gone quiet (`suspect`), then those that are not running yet. Among the rest, the node that runs most replicas of the service gives one up, so the replicas stay spread; then the one that was restarted most, then the newest. A healthy replica that has run for a while is the last to go, and a replica that stays is not touched: it keeps its container, its workload and its generation. The choice is recorded in the `replica.stopped` event (`why`: `failed`, `unhealthy`, `suspect_node`, `not_running`, `spread`, `restarts` or `newest`). A scale-up fills the lowest free replica numbers, so after a scale-down the numbers in use need not be 1 to N.
+
+**Capacity and unavailable nodes.** A scale-up places replicas only where there is room (CPU, memory, host ports, node selector) on a node that answers; nothing is oversubscribed unless `DOCKFLEET_SCHEDULER_*_OVERCOMMIT` allows it ([scheduler.md](scheduler.md)). The count can be changed while nodes are away: the others are used, replicas that do not fit wait with a reason that names the unavailable nodes, and when a node returns it removes what it was told to stop and takes what is waiting.
+
+```sh
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" -d '{"replicas":5}' $API/v1/services/web/scale
+curl -s -H "Authorization: Bearer $TOKEN" $API/v1/services/web/scale   # progress
+```
+
 ## Scheduling status
 
 Every service view (`GET /v1/services`, `GET /v1/services/{name}` and the responses of `POST`, `PUT` and `DELETE`) carries what the scheduler has decided:
@@ -137,6 +180,7 @@ Every service view (`GET /v1/services`, `GET /v1/services/{name}` and the respon
   "failed_replicas": 0,
   "unhealthy_replicas": 0,
   "lost_replicas": 0,
+  "scaling": {"state": "scaling_up", "desired": 3, "ready": 1, "starting": 1, "waiting": 1, "surplus": 0, "stopping": 0, "outdated": 0, "message": "..."},
   "replicas": [
     {"revision": 2, "index": 1, "workload_id": "9c1e...", "workload_name": "web-r2-1-3f9a2c",
      "node_id": "worker-1", "desired_state": "running", "generation": 1, "acknowledged": false, "phase": "scheduled",
@@ -158,9 +202,10 @@ Every service view (`GET /v1/services`, `GET /v1/services/{name}` and the respon
 }
 ```
 
-- `scheduled_replicas` counts the wanted replicas of the current revision (index up to `replicas`) that have a workload meant to run; `unschedulable_replicas` those that have none because no node qualifies.
+- `scaling` is the progress towards the wanted count, as described under [Scaling](#scaling).
+- `scheduled_replicas` counts the replicas of the current revision that have a workload meant to run, up to the wanted count; `unschedulable_replicas` those that have none because no node qualifies.
 - `running_replicas` counts the wanted replicas of the current revision whose agent reports the container running and healthy on a node that is not unavailable. The others are counted where they are: `failed_replicas` (the container failed and is not being restarted, or not yet), `unhealthy_replicas` (it runs but fails its health check) and `lost_replicas` (its node is unavailable, so the manager is moving it). A replica that has not reported yet is only `scheduled`. How failures are handled is in [failure-handling.md](failure-handling.md).
-- `replicas` lists the service's workloads, by revision and index, including those of older revisions: they stay until the reconciler has replaced them (a replica of an older revision is stopped once the same replica of the current one runs) and their node has confirmed that the container is gone. `phase` is what the node's agent last reported, or `scheduled` before it has reported anything; `message` and `container_id` are the agent's words and the container it reported; `health` is its health check result (absent without a check), `restart_count` how often the agent restarted it, `exit_code` how it last ended, and `node_health` the state of its node (`healthy`, `suspect`, `unavailable`). The replica that was moved off a lost node stays listed as `stopped` until its node confirms. The decision (`node_id`, `desired_state`, `generation`) and the observation (`phase`, `acknowledged`) are separate facts: `generation` counts the instructions given for the workload, and `acknowledged` says its node has received the latest. See [reconciliation.md](reconciliation.md).
+- `replicas` lists the service's workloads, by revision and index, including those of older revisions: they stay until the reconciler has replaced them (an older revision's replica is stopped for each replica of the current revision that runs) and their node has confirmed that the container is gone. `phase` is what the node's agent last reported, or `scheduled` before it has reported anything; `message` and `container_id` are the agent's words and the container it reported; `health` is its health check result (absent without a check), `restart_count` how often the agent restarted it, `exit_code` how it last ended, and `node_health` the state of its node (`healthy`, `suspect`, `unavailable`). The replica that was moved off a lost node stays listed as `stopped` until its node confirms. The decision (`node_id`, `desired_state`, `generation`) and the observation (`phase`, `acknowledged`) are separate facts: `generation` counts the instructions given for the workload, and `acknowledged` says its node has received the latest. See [reconciliation.md](reconciliation.md).
 - `unschedulable` explains each waiting replica: a `code` (`no_nodes`, `no_available_nodes`, `selector_unsatisfied`, `host_port_conflict`, `insufficient_resources`, `exceeds_capacity`), a `message`, one reason per node, and `since`, when this explanation first applied (it does not move while nothing changes). The codes are described in [scheduler.md](scheduler.md#why-a-replica-cannot-be-placed). Scheduling runs every `DOCKFLEET_SCHEDULER_INTERVAL`, so a new or changed service shows an empty status for up to that long.
 
 The assignments themselves are ordinary workloads: `GET /v1/workloads` lists them with `node_id`, `desired_state`, `service_id`, `service_revision`, `replica_index` and `ports`, and each carries the agent's `observed` report beside the decision. The scheduler's audit events, with the actor `scheduler`, are in `GET /v1/events`: `replica.scheduled` (resource: the workload; details: service, revision, replica, node) and `replica.unschedulable` (resource: the service), the latter only when an explanation is new or changed.
@@ -185,4 +230,4 @@ No pagination of the service list, no partial (`PATCH`) updates, no secret value
 
 ## Tests
 
-`internal/api/services_*_test.go` is one suite run against the in-memory store always and against PostgreSQL under the `integration` build tag (`make test-integration`; every test gets a throwaway database). It covers authentication (missing, malformed and wrong credentials on every route), CRUD, equivalent definitions, optimistic locking, deletion and name reuse, revisions, events, a validation table of over a hundred bad inputs, every unsafe option at every nesting level, request limits, that the handlers never create a workload, and the status after a scheduling pass (assigned, unschedulable with a reason for every node, across revisions, scaling and deletion), the node view and the standalone workload refusals. PostgreSQL-only tests restart the store on the same database and run two managers against one.
+`internal/api/services_*_test.go` is one suite run against the in-memory store always and against PostgreSQL under the `integration` build tag (`make test-integration`; every test gets a throwaway database). It covers authentication (missing, malformed and wrong credentials on every route), CRUD, equivalent definitions, optimistic locking, deletion and name reuse, revisions, events, a validation table of over a hundred bad inputs, every unsafe option at every nesting level, request limits, that the handlers never create a workload, and the status after a scheduling pass (assigned, unschedulable with a reason for every node, across revisions, scaling and deletion), the node view and the standalone workload refusals. The scale endpoint has its own tests in the same suite: reading and setting the count with the progress at each step, repeated and stale requests, fifteen kinds of bad request, a scale-up and scale-down through the scheduler, the reconciler and simulated agents (the replicas that stay are the very same workloads), more replicas than fit, and a scaling while a node is unavailable. PostgreSQL-only tests restart the store on the same database and run two managers against one.

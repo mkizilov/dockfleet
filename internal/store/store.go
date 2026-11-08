@@ -188,6 +188,16 @@ type Workload struct {
 	Observed *Observation `json:"observed"`
 }
 
+// ContainerGone is whether the node has confirmed that a workload that is
+// meant to be stopped no longer has a container: it has received the stop
+// instruction and reports the workload stopped with no container. Only then can
+// the record be deleted.
+func (w Workload) ContainerGone() bool {
+	o := w.Observed
+	return w.DesiredState == DesiredStopped && o != nil && o.AckedGeneration >= w.Generation &&
+		o.State == WorkloadStopped && o.ContainerID == ""
+}
+
 func cloneHealthCheck(h *HealthCheck) *HealthCheck {
 	if h == nil {
 		return nil

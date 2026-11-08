@@ -27,6 +27,11 @@ type serviceEnv struct {
 	h     http.Handler
 	st    store.Store
 	clock time.Time
+
+	// down are the nodes whose agents say nothing, and reports counts the
+	// reports the simulated agents made (see services_scale_test.go).
+	down    map[string]bool
+	reports int
 }
 
 func newServiceEnv(t *testing.T, st store.Store) *serviceEnv {
@@ -150,6 +155,12 @@ var serviceTests = []serviceTest{
 	{"status names the reason for every node", testServiceStatusNamesEveryReason},
 	{"status across revisions, scaling and deletion", testServiceStatusAcrossRevisionsScalingAndDeletion},
 	{"standalone workloads use the same scheduler", testWorkloadsUseTheSameScheduler},
+	{"scale: read and set the replica count", testScaleEndpoint},
+	{"scale: repeated requests", testScaleIsIdempotent},
+	{"scale: bad requests change nothing", testScaleValidation},
+	{"scale: progress to the final state", testScaleReportsProgress},
+	{"scale: more than the cluster can hold", testScaleBeyondCapacity},
+	{"scale: while a node is unavailable", testScaleWithANodeUnavailable},
 	{"the node view explains availability", testNodeViewExplainsAvailability},
 	{"events", testServiceEvents},
 }
@@ -177,6 +188,8 @@ func testServiceAuthentication(t *testing.T, e *serviceEnv) {
 		{http.MethodPut, "/v1/services/web", `{"replicas":9,"spec":{"image":"nginx:2","cpu_millis":1,"memory_bytes":134217728}}`},
 		{http.MethodDelete, "/v1/services/web", ""},
 		{http.MethodGet, "/v1/services/web/revisions", ""},
+		{http.MethodGet, "/v1/services/web/scale", ""},
+		{http.MethodPut, "/v1/services/web/scale", `{"replicas":9}`},
 	}
 	credentials := []string{
 		"",

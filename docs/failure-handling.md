@@ -64,7 +64,7 @@ If the node never returns, its stopped workloads stay on record (visible in `GET
 - **Replicas of services** on an unavailable node move, one new workload per replica, placed by the ordinary scheduler (spread, resources, selectors, ports). If nothing fits, the replica is unschedulable with the usual explanation, and is placed as soon as something does (a node returns, a node is added, resources free up).
 - **Standalone workloads** (`POST /v1/workloads`) are pinned to the node an administrator chose and are not moved. They stay assigned, and the node view shows why they are not running.
 - **Replicas of an older revision** on a lost node are stopped as well; they have already been replaced or will be by the rollout.
-- **A failed container does not move.** A replica whose container failed and ran out of restarts stays failed on its node (see below). Deploying a new revision, or scaling to zero and back, replaces it.
+- **A failed container does not move.** A replica whose container failed and ran out of restarts stays failed on its node (see below). Deploying a new revision replaces it, and so does lowering the replica count by one and raising it again: a scale-down removes the failed replica before any healthy one ([reconciliation.md](reconciliation.md#scaling)), and the scale-up creates a fresh workload.
 - **Nothing moves back.** A returning node takes new replicas like any healthy node; replicas that were moved stay where they are.
 - **A replica is moved once.** The reconciler decides in one transaction under the placement lock, so two managers cannot both move the same replica, and a repeated pass changes nothing.
 

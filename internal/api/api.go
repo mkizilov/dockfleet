@@ -96,6 +96,8 @@ func New(cfg Config) http.Handler {
 	mux.Handle("PUT /v1/services/{name}", s.auth(s.updateService))
 	mux.Handle("DELETE /v1/services/{name}", s.auth(s.deleteService))
 	mux.Handle("GET /v1/services/{name}/revisions", s.auth(s.listServiceRevisions))
+	mux.Handle("GET /v1/services/{name}/scale", s.auth(s.getScale))
+	mux.Handle("PUT /v1/services/{name}/scale", s.auth(s.putScale))
 	return s.logRequests(mux)
 }
 

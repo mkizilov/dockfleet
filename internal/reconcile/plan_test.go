@@ -3,6 +3,7 @@ package reconcile
 import (
 	"fmt"
 	"reflect"
+	"sort"
 	"testing"
 	"time"
 
@@ -76,7 +77,7 @@ func TestPlan(t *testing.T) {
 		{name: "nothing differs",
 			services:  []store.Service{service("web", 2, 1)},
 			workloads: []store.Workload{up(workload("web", 1, 1)), workload("web", 1, 2)}},
-		{name: "scaling down stops the highest replicas",
+		{name: "scaling down stops the ones not running, then the highest numbered",
 			services:  []store.Service{service("web", 1, 1)},
 			workloads: []store.Workload{up(workload("web", 1, 1)), up(workload("web", 1, 2)), workload("web", 1, 3)},
 			want:      []want{{ActionStop, ReasonScaledDown, "web-r1-2"}, {ActionStop, ReasonScaledDown, "web-r1-3"}}},
@@ -89,10 +90,10 @@ func TestPlan(t *testing.T) {
 			workloads: []store.Workload{up(workload("web", 1, 1)), up(workload("web", 2, 1))},
 			want:      []want{{ActionStop, ReasonServiceDeleted, "web-r1-1"}, {ActionStop, ReasonServiceDeleted, "web-r2-1"}}},
 
-		{name: "a deployment retires an old replica when the new one runs",
+		{name: "a deployment retires one old replica for each new one that runs",
 			services:  []store.Service{service("web", 2, 2)},
 			workloads: []store.Workload{up(workload("web", 1, 1)), up(workload("web", 1, 2)), up(workload("web", 2, 1)), workload("web", 2, 2)},
-			want:      []want{{ActionStop, ReasonSuperseded, "web-r1-1"}}},
+			want:      []want{{ActionStop, ReasonSuperseded, "web-r1-2"}}},
 		{name: "a new replica that finished successfully also counts",
 			services:  []store.Service{service("web", 1, 2)},
 			workloads: []store.Workload{up(workload("web", 1, 1)), observed(workload("web", 2, 1), store.WorkloadSucceeded, 1)},
@@ -270,8 +271,9 @@ func TestPlanHandsOverFixedHostPorts(t *testing.T) {
 		{"the old replica does not hold the port", def(port(8080, "tcp")), old(port(9090, "tcp")), blocked(scheduler.CodeHostPortConflict), 0},
 		{"the same number on another protocol", def(port(8080, "udp")), old(port(8080, "tcp")), blocked(scheduler.CodeHostPortConflict), 0},
 		{"a port the node chooses is never in conflict", def(port(0, "tcp")), old(port(0, "tcp")), blocked(scheduler.CodeHostPortConflict), 0},
-		{"the explanation is for another replica", def(port(8080, "tcp")), old(port(8080, "tcp")),
-			[]store.Unschedulable{{ServiceID: "web", Revision: 2, ReplicaIndex: 2, Code: scheduler.CodeHostPortConflict}}, 0},
+		// Any replica of the new revision that is blocked needs an old one to let go; which one is blocked does not matter.
+		{"the explanation is for another replica of the new revision", def(port(8080, "tcp")), old(port(8080, "tcp")),
+			[]store.Unschedulable{{ServiceID: "web", Revision: 2, ReplicaIndex: 2, Code: scheduler.CodeHostPortConflict}}, 1},
 		{"the explanation is for an older revision", def(port(8080, "tcp")), old(port(8080, "tcp")),
 			[]store.Unschedulable{{ServiceID: "web", Revision: 1, ReplicaIndex: 1, Code: scheduler.CodeHostPortConflict}}, 0},
 	}
@@ -303,9 +305,10 @@ func describe(actions []Action) []string {
 
 // A node that has been silent for longer than its lease is given up on, and
 // the replicas on it are told to stop so that the scheduler can start them on
-// other nodes. Anything that has a more specific reason keeps it.
+// other nodes. What is on a lost node is not counted among the replicas a
+// service has, so it never costs a healthy replica its place.
 func TestPlanGivesUpOnLostNodes(t *testing.T) {
-	lost := map[string]bool{"dead": true}
+	lost := map[string]string{"dead": store.NodeUnavailable}
 	tests := []struct {
 		name      string
 		services  []store.Service
@@ -335,14 +338,19 @@ func TestPlanGivesUpOnLostNodes(t *testing.T) {
 			nil,
 			[]store.Workload{standalone(onNode(workload("web", 1, 1), "dead"))},
 			[]string{}},
-		{"a scaled-down replica keeps the more specific reason",
+		// What is on a lost node is gone: it is not counted when choosing what else to stop.
+		{"a replica on a lost node is not counted as one of those wanted",
 			[]store.Service{service("web", 1, 1)},
 			[]store.Workload{up(workload("web", 1, 1)), onNode(workload("web", 1, 2), "dead")},
-			[]string{"stop scaled_down web-r1-2"}},
-		{"an old revision's replica whose successor runs is superseded",
+			[]string{"stop node_unavailable web-r1-2"}},
+		{"so a healthy replica is not stopped for one that is lost",
+			[]store.Service{service("web", 2, 1)},
+			[]store.Workload{up(workload("web", 1, 1)), up(workload("web", 1, 2)), up(onNode(workload("web", 1, 3), "dead"))},
+			[]string{"stop node_unavailable web-r1-3"}},
+		{"an old revision's replica on a lost node goes whether or not the new one runs",
 			[]store.Service{service("web", 1, 2)},
 			[]store.Workload{up(onNode(workload("web", 1, 1), "dead")), up(workload("web", 2, 1))},
-			[]string{"stop superseded web-r1-1"}},
+			[]string{"stop node_unavailable web-r1-1"}},
 		{"an old revision's replica with no successor yet is still given up on",
 			[]store.Service{service("web", 1, 2)},
 			[]store.Workload{up(onNode(workload("web", 1, 1), "dead"))},
@@ -396,5 +404,177 @@ func TestPlanNodesReportsEachChangeOnce(t *testing.T) {
 	}
 	if again := PlanNodes(nodes, at, timing); !reflect.DeepEqual(again, PlanNodes(nodes, at, timing)) {
 		t.Fatal("planning twice from the same snapshot gave different answers")
+	}
+}
+
+func failedW(w store.Workload) store.Workload { return observed(w, store.WorkloadFailed, w.Generation) }
+
+func unhealthyW(w store.Workload) store.Workload {
+	w = up(w)
+	w.Observed.Health = store.HealthUnhealthy
+	return w
+}
+
+func restarted(w store.Workload, n int) store.Workload {
+	w = up(w)
+	w.Observed.RestartCount = n
+	return w
+}
+
+func createdAt(w store.Workload, t time.Time) store.Workload {
+	w.CreatedAt = t
+	return w
+}
+
+func describeWhy(actions []Action) []string {
+	out := []string{}
+	for _, a := range actions {
+		out = append(out, a.Kind+" "+a.Reason+" "+a.Workload.Name+" "+a.Why)
+	}
+	return out
+}
+
+// A service that has more replicas than it wants stops the ones doing the least
+// good, not the highest numbered: failed, then unhealthy, then those on a node
+// that has gone quiet, then those not running yet. Among equals the node that
+// carries most of the service gives one up, then the replica that was restarted
+// most, then the newest, then the highest numbered.
+func TestPlanChoosesWhichReplicasToStop(t *testing.T) {
+	quiet := map[string]string{"slow": store.NodeSuspect}
+	tests := []struct {
+		name      string
+		want      int
+		workloads []store.Workload
+		nodes     map[string]string
+		stops     []string
+	}{
+		{"a failed replica goes before a healthy one with a higher number", 2,
+			[]store.Workload{up(workload("web", 1, 1)), failedW(workload("web", 1, 2)), up(workload("web", 1, 3))}, nil,
+			[]string{"stop scaled_down web-r1-2 failed"}},
+		{"an unhealthy replica goes before a healthy one", 2,
+			[]store.Workload{up(workload("web", 1, 1)), unhealthyW(workload("web", 1, 2)), up(workload("web", 1, 3))}, nil,
+			[]string{"stop scaled_down web-r1-2 unhealthy"}},
+		{"a replica on a node that has gone quiet goes before one that is fine", 2,
+			[]store.Workload{up(workload("web", 1, 1)), up(onNode(workload("web", 1, 2), "slow")), up(workload("web", 1, 3))}, quiet,
+			[]string{"stop scaled_down web-r1-2 suspect_node"}},
+		{"a replica that is not running yet goes before one that is", 2,
+			[]store.Workload{up(workload("web", 1, 1)), workload("web", 1, 2), up(workload("web", 1, 3))}, nil,
+			[]string{"stop scaled_down web-r1-2 not_running"}},
+		{"failed, unhealthy, quiet and starting go in that order, and the one that serves stays", 1,
+			[]store.Workload{
+				failedW(workload("web", 1, 1)), unhealthyW(workload("web", 1, 2)), up(onNode(workload("web", 1, 3), "slow")),
+				workload("web", 1, 4), up(workload("web", 1, 5)),
+			}, quiet,
+			[]string{
+				"stop scaled_down web-r1-1 failed", "stop scaled_down web-r1-2 unhealthy",
+				"stop scaled_down web-r1-3 suspect_node", "stop scaled_down web-r1-4 not_running",
+			}},
+		{"when only some have to go, the worst of them go first", 3,
+			[]store.Workload{failedW(workload("web", 1, 1)), up(workload("web", 1, 2)), workload("web", 1, 3), up(workload("web", 1, 4)), up(workload("web", 1, 5))}, nil,
+			[]string{"stop scaled_down web-r1-1 failed", "stop scaled_down web-r1-3 not_running"}},
+
+		{"the node that carries most gives up a replica", 2,
+			[]store.Workload{up(workload("web", 1, 1)), up(workload("web", 1, 2)), up(onNode(workload("web", 1, 3), "n2"))}, nil,
+			[]string{"stop scaled_down web-r1-2 spread"}},
+		{"each choice sees the loads the one before it left", 1,
+			[]store.Workload{up(workload("web", 1, 1)), up(workload("web", 1, 2)), up(onNode(workload("web", 1, 3), "n2"))}, nil,
+			[]string{"stop scaled_down web-r1-2 spread", "stop scaled_down web-r1-3 newest"}},
+		{"on nodes with the same load, the replica restarted most goes", 1,
+			[]store.Workload{restarted(workload("web", 1, 1), 3), up(onNode(workload("web", 1, 2), "n2"))}, nil,
+			[]string{"stop scaled_down web-r1-1 restarts"}},
+		{"then the newest", 1,
+			[]store.Workload{
+				createdAt(up(workload("web", 1, 1)), at.Add(time.Hour)),
+				createdAt(up(onNode(workload("web", 1, 2), "n2")), at),
+			}, nil,
+			[]string{"stop scaled_down web-r1-1 newest"}},
+		{"then the highest numbered", 1,
+			[]store.Workload{up(workload("web", 1, 1)), up(onNode(workload("web", 1, 2), "n2"))}, nil,
+			[]string{"stop scaled_down web-r1-2 newest"}},
+		{"a bad replica goes before balance is considered", 2,
+			[]store.Workload{up(workload("web", 1, 1)), up(workload("web", 1, 2)), failedW(onNode(workload("web", 1, 3), "n2"))}, nil,
+			[]string{"stop scaled_down web-r1-3 failed"}},
+		{"nothing goes while the count is right", 3,
+			[]store.Workload{failedW(workload("web", 1, 1)), up(workload("web", 1, 2)), up(workload("web", 1, 3))}, nil,
+			[]string{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			services := []store.Service{service("web", tt.want, 1)}
+			got := describeWhy(Plan(definitions(services), tt.workloads, nil, tt.nodes))
+			if !reflect.DeepEqual(got, tt.stops) {
+				t.Fatalf("plan = %v\nwant   %v", got, tt.stops)
+			}
+			// The choice does not depend on the order the workloads are read in.
+			reversed := make([]store.Workload, len(tt.workloads))
+			for i, w := range tt.workloads {
+				reversed[len(tt.workloads)-1-i] = w
+			}
+			if again := describeWhy(Plan(definitions(services), reversed, nil, tt.nodes)); !reflect.DeepEqual(again, tt.stops) {
+				t.Fatalf("plan from the reversed input = %v\nwant %v", again, tt.stops)
+			}
+		})
+	}
+}
+
+// Scaling down while a deployment is going on keeps the replicas that serve:
+// surplus new replicas go first, then old ones as new ones come up.
+func TestPlanScalesDownDuringADeployment(t *testing.T) {
+	// Four were wanted and became two. Three of the four new replicas are up, and two old ones still run.
+	services := []store.Service{service("web", 2, 2)}
+	workloads := []store.Workload{
+		up(workload("web", 1, 1)), up(workload("web", 1, 2)),
+		up(workload("web", 2, 1)), up(workload("web", 2, 2)), up(workload("web", 2, 3)), workload("web", 2, 4),
+	}
+	got := describeWhy(Plan(definitions(services), workloads, nil, nil))
+	want := []string{
+		// Two of the four new replicas are surplus; the one not running goes first, then the highest numbered.
+		"stop scaled_down web-r2-3 newest",
+		"stop scaled_down web-r2-4 not_running",
+		// Two new ones are up, so no old one is needed.
+		"stop superseded web-r1-1 newest",
+		"stop superseded web-r1-2 newest",
+	}
+	sort.Strings(want)
+	sort.Strings(got)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("plan = %v\nwant   %v", got, want)
+	}
+}
+
+// Old replicas that hold a host port the new ones need are let go as many as there are blocked new ones.
+func TestPlanHandsOverAsManyHostPortsAsAreBlocked(t *testing.T) {
+	port := store.ServicePort{ContainerPort: 80, Protocol: "tcp", HostPort: 8080}
+	held := func(w store.Workload) store.Workload {
+		w.Ports = []store.ServicePort{port}
+		return up(w)
+	}
+	defs := []store.Definition{{
+		Service:  service("web", 3, 2),
+		Revision: store.Revision{ServiceID: "web", Revision: 2, Spec: store.ServiceSpec{Ports: []store.ServicePort{port}}},
+	}}
+	old := []store.Workload{held(workload("web", 1, 1)), held(workload("web", 1, 2)), up(workload("web", 1, 3))}
+	blocked := func(n int) []store.Unschedulable {
+		var out []store.Unschedulable
+		for i := 1; i <= n; i++ {
+			out = append(out, store.Unschedulable{ServiceID: "web", Revision: 2, ReplicaIndex: i, Code: scheduler.CodeHostPortConflict})
+		}
+		return out
+	}
+	tests := []struct {
+		blocked int
+		want    []string
+	}{
+		{0, []string{}},
+		{1, []string{"stop port_handover web-r1-2"}},
+		{2, []string{"stop port_handover web-r1-1", "stop port_handover web-r1-2"}},
+		// Only two old replicas hold the port, however many new ones wait for it.
+		{3, []string{"stop port_handover web-r1-1", "stop port_handover web-r1-2"}},
+	}
+	for _, tt := range tests {
+		got := describe(Plan(defs, old, blocked(tt.blocked), nil))
+		if !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("%d blocked: plan = %v, want %v", tt.blocked, got, tt.want)
+		}
 	}
 }
