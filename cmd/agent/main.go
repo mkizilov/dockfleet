@@ -61,7 +61,15 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	engine, err := docker.NewEngine(cfg.DockerHost)
+	// Only the agent talks to its local Docker Engine; the manager never does.
+	policy, err := docker.NewPolicy(docker.PolicyConfig{
+		AllowedBindRoots:    cfg.AllowedBindRoots,
+		AllowedCapabilities: cfg.AllowedCapabilities,
+	})
+	if err != nil {
+		return fmt.Errorf("container policy: %w", err)
+	}
+	engine, err := docker.NewAdapter(docker.AdapterConfig{Host: cfg.DockerHost, NodeID: cfg.NodeID, Policy: policy})
 	if err != nil {
 		return err
 	}

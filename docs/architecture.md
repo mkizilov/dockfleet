@@ -48,12 +48,12 @@ Agents dial the manager; the manager never connects to agents. This keeps nodes 
 - **`cmd/pki`** (`dockfleet-pki`): the CLI over `internal/pki`; writes keys owner-only into a git-ignored directory and never prints them.
 - **`internal/agent`**: the connection loop. It registers with exponential backoff (1s to 30s), heartbeats at the interval the manager returns with a deadline on every call, mirrors assignments into status reports, registers again when the manager reports `NOT_REGISTERED` or `SESSION_SUPERSEDED`, retries transient failures forever, exits with an error on permanent ones (incompatible version, invalid registration, rejected credentials), and deregisters on clean shutdown.
 - **`internal/integration`**: tests only; real agent loops against a real manager over an in-memory gRPC transport.
-- **`internal/docker`**: Docker Engine `GET /_ping` over a unix socket or loopback TCP.
+- **`internal/docker`**: the agent-only Docker Engine adapter built on the Docker Go SDK (confined to `sdk.go`). It lists, creates, starts, stops, removes, inspects, logs and samples DockFleet's containers, identified by stable `io.dockfleet.*` labels and addressed by workload ID, never touching unrelated containers; creation passes a policy that rejects privileged mode, Docker socket and system-path mounts, added capabilities, host namespaces and public ports by default. The manager never imports it (enforced by a test). See [docker.md](docker.md).
 - **`internal/config`, `internal/logging`**: environment configuration with validation; `log/slog` JSON or text.
 
 ### Not implemented
 
-Container create/start/stop, image pulls, reconciliation of desired versus actual state (agents currently report assigned workloads as `pending`), workload deletion or rescheduling when a node dies, node removal, per-node identity, leader election or multiple managers (sessions live in one process's memory), metrics.
+Driving the Docker adapter from assignments (the agent does not start workload containers yet and reports them as `pending`), reconciliation of desired versus actual state, workload deletion or rescheduling when a node dies, node removal, per-node identity, leader election or multiple managers (sessions live in one process's memory), metrics.
 
 ## Data model
 
@@ -89,7 +89,7 @@ If either server fails on its own, the other is shut down the same way and the e
 - **Authorization**: only enrolled node IDs can register, checked at registration and on every heartbeat (`registry`). Admin enrollment endpoints sit behind the admin bearer token, over HTTPS when TLS is configured.
 - **Expiry and rotation**: certificate and CA files are reloaded when they change; the manager ends agent connections after at most 10 minutes so renewals reach quiet connections; both processes log expiry warnings and errors hourly.
 - **Input limits**: node IDs and workload names match `^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`; gRPC messages are capped at 1 MiB and status reports at 1000 per heartbeat; HTTP bodies at 1 MiB; label counts are bounded.
-- **Docker access**: the agent only accepts `unix://` or loopback `tcp://` Docker hosts because the Engine API is unauthenticated. Anyone who can reach it controls the host, so agent-host hardening belongs to the future container work.
+- **Docker access**: only the agent talks to Docker, and only to its local Engine (`unix://` or loopback `tcp://`; the Engine API is unauthenticated and equivalent to root). The manager has no Docker settings and no Docker imports, so it never needs a socket. Containers are always created with the fixed hardening described in [docker.md](docker.md), and never from specs the policy rejects.
 - **Development credentials** live in `config/dev.env`, are labeled as throwaway, and are not accepted by any production-oriented default.
 
 Known gaps: the admin API uses one shared bearer token, there is no CRL/OCSP (revoke by enrollment), the development CA is not a production PKI, no rate limiting, no audit log beyond structured logs of enrollment changes and rejections.
@@ -105,6 +105,6 @@ Known gaps: the admin API uses one shared bearer token, there is no CRL/OCSP (re
 ## Extension points for the next stages
 
 - Assignment delivery and status reporting already ride on `Heartbeat`; if latency matters, add a server-streaming `Watch` RPC next to it and bump the protocol minor version.
-- Extend `docker.Client` with image and container operations; keep `internal/agent` depending on the interface so it stays testable with fakes.
+- Have the agent depend on `docker.Runtime` and drive it from assignments (pull, create, start, stop, remove, report real phases and usage); the adapter and its fakes already exist.
 - Add a reconciler in the agent that drives actual state toward the manager's desired state.
 - Per-user admin authentication (the admin API still uses one shared token), certificate revocation lists, and integration with an external CA.

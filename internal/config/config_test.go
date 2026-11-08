@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -177,6 +178,45 @@ func TestLoadAgentRejectsInvalid(t *testing.T) {
 				t.Fatalf("error = %v, want it to mention %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestLoadAgentContainerPolicy(t *testing.T) {
+	c, err := LoadAgent(getenv(agentEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.AllowedBindRoots) != 0 || len(c.AllowedCapabilities) != 0 {
+		t.Errorf("the default policy allows nothing extra: %+v", c)
+	}
+
+	vars := agentEnv()
+	vars["DOCKFLEET_ALLOWED_BIND_ROOTS"] = "/srv/dockfleet, /mnt/data,"
+	vars["DOCKFLEET_ALLOWED_CAPABILITIES"] = "NET_BIND_SERVICE,CHOWN"
+	c, err = LoadAgent(getenv(vars))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.AllowedBindRoots) != 2 || c.AllowedBindRoots[0] != "/srv/dockfleet" || c.AllowedBindRoots[1] != "/mnt/data" || len(c.AllowedCapabilities) != 2 {
+		t.Errorf("unexpected policy settings: %+v", c)
+	}
+
+	vars["DOCKFLEET_ALLOWED_BIND_ROOTS"] = "relative/dir"
+	if _, err := LoadAgent(getenv(vars)); err == nil || !strings.Contains(err.Error(), "DOCKFLEET_ALLOWED_BIND_ROOTS") {
+		t.Errorf("a relative bind root must be rejected, got %v", err)
+	}
+}
+
+func TestManagerConfigHasNoDockerSettings(t *testing.T) {
+	// The manager must never need Docker access; its configuration must not offer any.
+	vars := managerEnv()
+	vars["DOCKFLEET_DOCKER_HOST"] = "unix:///var/run/docker.sock"
+	c, err := LoadManager(getenv(vars))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.ToLower(fmt.Sprintf("%+v", c)), "docker") {
+		t.Errorf("manager configuration mentions Docker: %+v", c)
 	}
 }
 

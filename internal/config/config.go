@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"runtime"
 	"strconv"
 	"strings"
@@ -64,6 +65,11 @@ type Agent struct {
 	Labels        map[string]string
 	DockerHost    string
 	RPCTimeout    time.Duration
+
+	// Container policy relaxations; empty means the strictest policy. The
+	// docker package validates them (they never allow the always-denied set).
+	AllowedBindRoots    []string
+	AllowedCapabilities []string
 }
 
 // TLSEnabled reports whether the agent connects with mutual TLS. Without it
@@ -185,6 +191,14 @@ func LoadAgent(get Getenv) (Agent, error) {
 	}
 	c.Labels = labels
 
+	c.AllowedBindRoots = splitList(get("DOCKFLEET_ALLOWED_BIND_ROOTS"))
+	for _, root := range c.AllowedBindRoots {
+		if !path.IsAbs(root) {
+			fail("DOCKFLEET_ALLOWED_BIND_ROOTS entry %q must be an absolute path", root)
+		}
+	}
+	c.AllowedCapabilities = splitList(get("DOCKFLEET_ALLOWED_CAPABILITIES"))
+
 	anyTLS := c.TLSCAFile != "" || c.TLSCertFile != "" || c.TLSKeyFile != ""
 	if anyTLS && (c.TLSCAFile == "" || c.TLSCertFile == "" || c.TLSKeyFile == "") {
 		fail("DOCKFLEET_TLS_CA_FILE, DOCKFLEET_TLS_CERT_FILE and DOCKFLEET_TLS_KEY_FILE must be set together: the manager requires mutual TLS")
@@ -235,6 +249,17 @@ func positiveInt(get Getenv, key string, def int64, errs *[]error) int64 {
 		return def
 	}
 	return v
+}
+
+// splitList splits a comma-separated list, dropping blanks.
+func splitList(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func parseLabels(raw string) (map[string]string, error) {

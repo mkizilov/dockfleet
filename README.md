@@ -20,19 +20,19 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 | `internal/pki`       | CA, certificates, node identity, validation, reloading TLS configs      |
 | `internal/netutil`   | Loopback checks behind the plaintext-only-on-loopback rule              |
 | `internal/integration` | Tests running simulated agents against a manager over gRPC           |
-| `internal/docker`    | Docker Engine client (reachability check only for now)                  |
+| `internal/docker`    | Agent-only Docker Engine adapter: managed containers, hardening policy (see [docs/docker.md](docs/docker.md)) |
 | `internal/manager`   | Wires the API, gRPC server and store; owns graceful shutdown            |
 | `internal/config`    | Environment-based configuration with secure-default validation          |
 | `internal/logging`   | Structured logging (`log/slog`, JSON or text)                           |
 | `proto/`             | Protobuf definitions (`buf` module)                                     |
 | `deploy/`            | Docker Compose file for development dependencies                        |
 | `config/dev.env`     | Development-only configuration                                          |
-| `docs/`              | [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), [Mutual TLS and enrollment](docs/mtls.md) |
+| `docs/`              | [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), [Mutual TLS and enrollment](docs/mtls.md), [Docker adapter](docs/docker.md) |
 
 ## Prerequisites
 
 - Go 1.23 or newer
-- Docker with the Compose plugin (only for the PostgreSQL development database and agent reachability checks)
+- Docker with the Compose plugin (the PostgreSQL development database), and a local Docker Engine on every worker running an agent. Only agents use Docker; the manager never does
 - Network access once, to download modules and the pinned code generators
 
 ## Quick start
@@ -136,7 +136,9 @@ All settings are environment variables. The manager and agent refuse to start on
 | `DOCKFLEET_NODE_CPU_MILLIS`      | agent   | CPU count x 1000             | Declared capacity                                          |
 | `DOCKFLEET_NODE_MEMORY_MB`       | agent   | `1024`                       | Declared capacity (placeholder until memory detection exists) |
 | `DOCKFLEET_NODE_LABELS`          | agent   | none                         | `key=value,key=value`, used by `node_selector`             |
-| `DOCKFLEET_DOCKER_HOST`          | agent   | `unix:///var/run/docker.sock` | `unix://` or loopback `tcp://` only                       |
+| `DOCKFLEET_DOCKER_HOST`          | agent   | `unix:///var/run/docker.sock` | `unix://` or loopback `tcp://` only; only the agent talks to Docker |
+| `DOCKFLEET_ALLOWED_BIND_ROOTS`   | agent   | none                         | Host directories containers may bind-mount from (never the Docker socket or system paths) |
+| `DOCKFLEET_ALLOWED_CAPABILITIES` | agent   | none                         | Capabilities containers may add (dangerous ones are always refused) |
 
 ## Testing
 
@@ -144,6 +146,7 @@ All settings are environment variables. The manager and agent refuse to start on
 make test               # unit tests, -race, no external services
 make cover              # per-package coverage
 make test-integration   # PostgreSQL store tests; needs `make compose-up`
+make test-docker        # Docker Engine tests; needs DOCKFLEET_TEST_DOCKER_HOST
 ```
 
 Unit tests need no Docker, database or network. `internal/integration` runs real agent loops against a real manager over gRPC on an in-memory transport (registration, heartbeats, assignments and status reports, manager restart and reconnection, long outages, graceful deregistration, superseded sessions, incompatible protocol versions, bad credentials) and over real TLS handshakes: trusted nodes, untrusted client and server certificates, wrong server names, wrong node identity, expired and not-yet-valid certificates, certificates expiring on an open connection, missing client certificates, unenrolled and revoked nodes, certificate renewal, and the absence of any plaintext fallback. Other network-style tests use `bufconn`, fake HTTP round-trippers, or loopback ports 21290-21295 (`internal/manager`). PostgreSQL tests are behind the `integration` build tag and read `DOCKFLEET_TEST_DATABASE_URL`.
@@ -152,7 +155,7 @@ Generated protobuf code is not committed, so run `make generate` after a fresh c
 
 ## Limitations
 
-- No container lifecycle: assigned workloads are never started, so agents report them `pending`, and nothing reconciles failures.
+- The Docker adapter (create, start, stop, remove, inspect, logs, stats) is implemented and tested, but the agent does not use it to run assigned workloads yet, so agents still report them `pending` and nothing reconciles failures. Workload assignments carry no ports, mounts or environment yet.
 - Sessions are held in manager memory (one manager only); two agents configured with the same node ID will keep superseding each other.
 - Scheduling is a single-manager spread strategy; a lock serializes placement in one process only.
 - Node capacity is declared by the agent, not measured.

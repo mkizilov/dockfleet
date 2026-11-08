@@ -56,3 +56,19 @@ jobs:
       - run: make tidy
       - name: PostgreSQL integration tests
         run: go test -race -count=1 -tags integration ./internal/store/...
+
+  docker:
+    runs-on: ubuntu-latest
+    env:
+      DOCKFLEET_TEST_DOCKER_HOST: unix:///var/run/docker.sock
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: make tools
+      - run: make proto
+      - run: make tidy
+      - name: Docker Engine integration tests
+        run: make test-docker
