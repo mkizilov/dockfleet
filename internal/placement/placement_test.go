@@ -813,7 +813,7 @@ func testScalingFillsTheLowestFreeSlots(t *testing.T, e *env) {
 	all, err := e.st.ListWorkloadsForService(e.ctx(), svc.ID)
 	e.must(err)
 
-	// Replicas 1 and 3 were stopped (the reconciler's choice, here made by hand) and are gone.
+	// Replicas 1 and 3 were stopped (the reconciler's choice, here applied directly to the store) and are gone.
 	for _, w := range []store.Workload{all[0], all[2]} {
 		_, err := e.st.SetWorkloadDesiredState(e.ctx(), w.ID, store.DesiredStopped, e.clock)
 		e.must(err)

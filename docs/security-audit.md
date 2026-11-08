@@ -1,6 +1,6 @@
 # Security and robustness audit
 
-An audit of six areas, done as part of preparing DockFleet for self-hosted deployment. For each: what was examined and how, what was found, what was changed, and what remains. It is a review by the people who wrote the code, backed by tests and tools, not an independent assessment: have one done before you expose a fleet that matters.
+An audit of six areas, done as part of preparing DockFleet for self-hosted deployment. For each: what was examined and how, what was found, what was changed, and what remains. It is an internal review, backed by tests and tools, and not an independent assessment: have one done before you expose a fleet that matters.
 
 How to read the status: **fixed** = changed in the commit that added this document, with a test that fails without the change (each was checked by disabling the fix); **ok** = examined, nothing to change, pinned by a test; **limitation** = a real gap that is documented rather than closed, with the reason.
 
