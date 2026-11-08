@@ -1,0 +1,62 @@
+# /etc/systemd/system/dockfleet-manager.service
+#
+# The manager as a hardened service. Credentials are systemd credentials: the
+# files named in LoadCredential= are handed to the service in a private, memory
+# backed directory ($CREDENTIALS_DIRECTORY, %d below) that only it can read, and
+# never appear in its environment. TLS material is read from /etc/dockfleet/tls so
+# that a renewed certificate is picked up without a restart.
+# Needs systemd 250 or newer (credentials, and the %d specifier in Environment=).
+# Under systemd, leave DOCKFLEET_API_TOKEN_FILE and DOCKFLEET_DATABASE_URL_FILE out
+# of manager.env: the unit sets them to the credentials, and an EnvironmentFile
+# would take precedence over it.
+[Unit]
+Description=DockFleet manager
+Documentation=https://github.com/dockfleet/dockfleet/blob/main/docs/deployment.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=dockfleet
+Group=dockfleet
+EnvironmentFile=/etc/dockfleet/manager.env
+Environment=DOCKFLEET_API_TOKEN_FILE=%d/api-token
+Environment=DOCKFLEET_DATABASE_URL_FILE=%d/database-url
+LoadCredential=api-token:/etc/dockfleet/secrets/api-token
+LoadCredential=database-url:/etc/dockfleet/secrets/database-url
+ExecStart=/usr/local/bin/dockfleet-manager
+Restart=on-failure
+RestartSec=2s
+# DOCKFLEET_SHUTDOWN_TIMEOUT (15s) plus a margin; systemd sends SIGTERM first.
+TimeoutStopSec=25s
+
+# Sandbox
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# A call the filter blocks fails with EPERM instead of killing the process.
+SystemCallErrorNumber=EPERM
+UMask=0077
+ReadOnlyPaths=/etc/dockfleet
+
+[Install]
+WantedBy=multi-user.target

@@ -50,6 +50,7 @@ type view struct {
 	fence     *settableFence
 	lis       *bufconn.Listener
 	registers atomic.Int64
+	beats     atomic.Int64
 }
 
 func newView(t *testing.T, name string) *view {
@@ -63,8 +64,11 @@ func newView(t *testing.T, name string) *view {
 	srv, err := protocol.NewGRPCServer(node, protocol.ServerOptions{
 		Token: agentToken, HandlerTimeout: 2 * time.Second,
 		Observe: func(method string, _ codes.Code, _ time.Duration) {
-			if strings.HasSuffix(method, "/RegisterNode") {
+			switch {
+			case strings.HasSuffix(method, "/RegisterNode"):
 				v.registers.Add(1)
+			case strings.HasSuffix(method, "/Heartbeat"):
+				v.beats.Add(1)
 			}
 		},
 	})
@@ -188,12 +192,32 @@ func TestAgentsIgnoreInstructionsFromAControlPlaneThatWasReplaced(t *testing.T) 
 		t.Fatalf("calls = %v", engine.Calls())
 	}
 
-	// 5. A control plane of a higher epoch is obeyed even when it is a: its
-	// instruction (w1 runs) is now the newest there is.
+	// 5. a is elected again, under epoch 3. Its epoch is higher, so the agent listens
+	// to it, but its picture of w1 is still the old one (generation 1): an instruction
+	// older than the one in force is not obeyed, whoever sends it, so nothing starts.
 	b.fence.follow()
 	a.fence.lead(3)
-	waitLong(t, "the agent to obey epoch 3", func() bool { return running() == 1 })
+	waitLong(t, "the agent to listen to epoch 3", func() bool { return client.Epoch() == 3 })
+	beaten := a.beats.Load()
+	waitLong(t, "the agent to heartbeat with a again and again", func() bool { return a.beats.Load() >= beaten+5 })
+	if running() != 0 || engine.Count("create") != 1 {
+		t.Fatalf("an instruction older than the one in force was obeyed: %v", engine.Calls())
+	}
+
+	// 6. a's picture moves on: w1 is stopped and then wanted again, which makes generation
+	// 3. That is newer than anything the agent holds, and from the newest epoch: obeyed.
+	a.setDesired(t, store.DesiredStopped)
+	a.setDesired(t, store.DesiredRunning)
+	waitLong(t, "the agent to obey a newer instruction from epoch 3", func() bool { return running() == 1 })
 	if client.Epoch() != 3 || engine.Count("create") != 2 {
 		t.Fatalf("epoch %d, calls %v", client.Epoch(), engine.Calls())
+	}
+}
+
+// setDesired changes what this view wants of w1, which raises its generation.
+func (v *view) setDesired(t *testing.T, desired string) {
+	t.Helper()
+	if _, err := v.store.SetWorkloadDesiredState(context.Background(), "w1", desired, time.Now()); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -2,9 +2,13 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -458,4 +462,100 @@ func TestDeregisterFailureDoesNotFailShutdown(t *testing.T) {
 	if len(m.deregistrations()) != 1 {
 		t.Errorf("deregistrations = %v, want one attempt", m.deregistrations())
 	}
+}
+
+// get asks the agent's health endpoint.
+func getHealth(t *testing.T, a *Agent, path string) (int, Readiness, string) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	a.HealthHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	var got Readiness
+	_ = json.Unmarshal(rec.Body.Bytes(), &got)
+	return rec.Code, got, rec.Body.String()
+}
+
+func TestHealthEndpointsFollowTheConnectionToTheManager(t *testing.T) {
+	m := &fakeManager{interval: 2 * time.Millisecond}
+	engine := dockerfake.New("node-1")
+	a := newTestAgent(m, engine)
+
+	// Before the agent has registered it is alive and not ready.
+	if code, _, body := getHealth(t, a, "/healthz"); code != http.StatusOK || !strings.Contains(body, "ok") {
+		t.Fatalf("/healthz before registering = %d %s", code, body)
+	}
+	if code, got, _ := getHealth(t, a, "/readyz"); code != http.StatusServiceUnavailable || got.Ready || got.Registered || got.Reason == "" || got.NodeID != "node-1" {
+		t.Fatalf("/readyz before registering = %d %+v", code, got)
+	}
+
+	start(t, a)
+	waitFor(t, "the agent to become ready", func() bool {
+		code, got, _ := getHealth(t, a, "/readyz")
+		return code == http.StatusOK && got.Ready && got.Registered && got.Reason == ""
+	})
+
+	// A container engine that does not answer makes it unready, and says so.
+	engine.FailNext("ping", errors.New("daemon down"), 1)
+	code, got, _ := getHealth(t, a, "/readyz")
+	if code != http.StatusServiceUnavailable || got.Ready || !strings.Contains(got.Reason, "container engine") {
+		t.Fatalf("/readyz with the engine down = %d %+v", code, got)
+	}
+	waitFor(t, "the engine to answer again", func() bool { c, _, _ := getHealth(t, a, "/readyz"); return c == http.StatusOK })
+
+	// Other paths and methods are not served.
+	rec := httptest.NewRecorder()
+	a.HealthHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/nodes", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("GET /v1/nodes = %d, want 404", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	a.HealthHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/readyz", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST /readyz = %d, want 405", rec.Code)
+	}
+}
+
+// A manager that stops accepting heartbeats makes the agent unready after a few
+// intervals, not at the first loss; when it accepts them again the agent is ready.
+func TestReadinessNeedsRecentHeartbeats(t *testing.T) {
+	clock := &fakeClock{now: time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)}
+	a := New(Config{Node: protocol.NodeInfo{ID: "node-1"}, Manager: &fakeManager{}, Docker: dockerfake.New("node-1"), Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), RPCTimeout: time.Second, Now: clock.Now})
+
+	a.health.registered(clock.Now(), 10*time.Second)
+	if got := a.Readiness(context.Background()); !got.Ready {
+		t.Fatalf("just registered: %+v", got)
+	}
+	clock.advance(30 * time.Second) // three intervals: the last heartbeat is exactly as old as tolerated, less the call
+	if got := a.Readiness(context.Background()); !got.Ready || got.LastHeartbeatAgeMS != 30000 {
+		t.Fatalf("a heartbeat missed or two: %+v", got)
+	}
+	clock.advance(2 * time.Second) // past 3 x 10 s + the 1 s call
+	got := a.Readiness(context.Background())
+	if got.Ready || !strings.Contains(got.Reason, "no heartbeat") || got.LastHeartbeatAgeMS != 32000 {
+		t.Fatalf("a manager silent for 32 s: %+v", got)
+	}
+	a.health.beat(clock.Now())
+	if got := a.Readiness(context.Background()); !got.Ready {
+		t.Fatalf("heartbeats again: %+v", got)
+	}
+	a.health.down()
+	if got := a.Readiness(context.Background()); got.Ready || got.Registered {
+		t.Fatalf("session lost: %+v", got)
+	}
+}
+
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
 }

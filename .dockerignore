@@ -1,0 +1,18 @@
+# Only what the build needs goes into the build context. In particular nothing
+# of the development environment: credentials, toolchains, state.
+*
+!go.mod
+!go.sum
+!buf.gen.yaml
+!proto/**
+!cmd/**
+!internal/**
+
+# Never, even inside the directories above
+**/*_test.go
+internal/protocol/dockfleet
+**/.dev-pki
+**/*.key
+**/*.csr
+**/*.pem
+**/*.env

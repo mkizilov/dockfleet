@@ -3,7 +3,11 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -13,6 +17,7 @@ import (
 	"github.com/dockfleet/dockfleet/internal/agent"
 	"github.com/dockfleet/dockfleet/internal/config"
 	"github.com/dockfleet/dockfleet/internal/docker"
+	"github.com/dockfleet/dockfleet/internal/healthcheck"
 	"github.com/dockfleet/dockfleet/internal/logging"
 	"github.com/dockfleet/dockfleet/internal/pki"
 	"github.com/dockfleet/dockfleet/internal/protocol"
@@ -21,11 +26,42 @@ import (
 
 const certCheckInterval = time.Hour
 
+// engine is the node's container runtime and the means to let go of it.
+type engine interface {
+	docker.Runtime
+	Close() error
+}
+
 func main() {
+	if len(os.Args) > 1 {
+		if os.Args[1] == "healthcheck" && len(os.Args) == 2 {
+			if err := probeHealth(); err != nil {
+				fmt.Fprintln(os.Stderr, "dockfleet-agent: unhealthy:", err)
+				os.Exit(1)
+			}
+			return
+		}
+		fmt.Fprintln(os.Stderr, "usage: dockfleet-agent [healthcheck]")
+		os.Exit(2)
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "dockfleet-agent:", err)
 		os.Exit(1)
 	}
+}
+
+// probeHealth is `dockfleet-agent healthcheck`, the HEALTHCHECK of the image: it
+// asks the agent's own health endpoint whether the agent is ready.
+func probeHealth() error {
+	addr := config.AgentHealthAddr(os.Getenv)
+	if addr == "" {
+		return errors.New("the health endpoint is turned off (DOCKFLEET_HEALTH_ADDR=off)")
+	}
+	url, err := healthcheck.URLFor(addr, false, "/readyz")
+	if err != nil {
+		return err
+	}
+	return healthcheck.Probe{URL: url}.Run(context.Background())
 }
 
 // checkIdentity refuses to start with a certificate that is unusable right
@@ -61,15 +97,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Only the agent talks to its local Docker Engine; the manager never does.
-	policy, err := docker.NewPolicy(docker.PolicyConfig{
-		AllowedBindRoots:    cfg.AllowedBindRoots,
-		AllowedCapabilities: cfg.AllowedCapabilities,
-	})
-	if err != nil {
-		return fmt.Errorf("container policy: %w", err)
-	}
-	engine, err := docker.NewAdapter(docker.AdapterConfig{Host: cfg.DockerHost, NodeID: cfg.NodeID, Policy: policy})
+	engine, err := newEngine(cfg, logger)
 	if err != nil {
 		return err
 	}
@@ -127,7 +155,7 @@ func run() error {
 	if logRequests == 0 {
 		logRequests = -1
 	}
-	return agent.New(agent.Config{
+	a := agent.New(agent.Config{
 		Node:             node,
 		Manager:          client,
 		Docker:           engine,
@@ -135,5 +163,37 @@ func run() error {
 		RPCTimeout:       cfg.RPCTimeout,
 		FenceOnLeaseLoss: cfg.FenceOnLeaseLoss,
 		LogRequests:      logRequests,
-	}).Run(ctx)
+	})
+	if cfg.HealthAddr != "" {
+		stopHealth, err := serveHealth(cfg.HealthAddr, a, logger)
+		if err != nil {
+			return err
+		}
+		defer stopHealth()
+	}
+	return a.Run(ctx)
+}
+
+// serveHealth serves the agent's health endpoint on a loopback address and
+// returns the function that stops it.
+func serveHealth(addr string, a *agent.Agent, logger *slog.Logger) (stop func(), err error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("listen on the health address: %w", err)
+	}
+	srv := &http.Server{Handler: a.HealthHandler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("the health endpoint stopped", "error", err)
+		}
+	}()
+	logger.Info("health endpoint", "addr", ln.Addr().String())
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		<-done
+	}, nil
 }

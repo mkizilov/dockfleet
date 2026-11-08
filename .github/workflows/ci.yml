@@ -1,5 +1,19 @@
 name: ci
 
+# Every kind of check the repository has is a job here:
+#
+#   lint             formatting, vet, secrets, go.mod, protobuf lint
+#   unit             unit tests with the race detector, on Linux and macOS
+#   cross-build      the released platforms compile (static binaries)
+#   integration      PostgreSQL: store, API, scheduling, reconciliation, multi-manager
+#   etcd             the election client and the managers' election against a real etcd
+#   e2e              the real binaries over mutual TLS, with PostgreSQL and etcd, failures injected
+#   docker           the Docker Engine adapter against a real daemon
+#   images           the container images build, run as non-root, become healthy and stop cleanly
+#   vulnerabilities  known vulnerabilities in code the binaries reach
+#
+# Nothing here needs a secret, so nothing runs with one.
+
 on:
   push:
     branches: [main]
@@ -8,27 +22,69 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOFLAGS: -p=2
+
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: false
-      - name: Install pinned generators, lint and generate protobuf code
+      - name: Pinned generators; lint and generate protobuf code
         run: make generate
-      # go.sum is committed; this keeps it and go.mod complete.
-      - name: Resolve modules
-        run: make tidy
-      - name: Format, vet and unit tests
+      - name: go.mod and go.sum are tidy
+        run: make tidy-check
+      - name: Formatting
+        run: make fmt-check
+      - name: Vet
+        run: make vet
+      - name: No key material in the repository
+        run: make check-secrets
+
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: make generate
+      - name: Format, vet, secret scan and unit tests (race detector)
         run: make check
       - name: Build
         run: make build
 
+  cross-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: make generate
+      - name: Compile for every released platform
+        run: make cross-build
+
   integration:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:16.4-alpine
@@ -51,14 +107,15 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - run: make tools
-      - run: make proto
-      - run: make tidy
-      - name: PostgreSQL integration tests
-        run: go test -race -count=1 -tags integration ./internal/store/... ./internal/api/... ./internal/placement/... ./internal/reconcile/... ./internal/integration/...
+      - run: make generate
+      - name: PostgreSQL integration tests (store, migrations, API, scheduling, reconciliation, several managers)
+        run: |
+          go test -race -count=1 -tags integration \
+            ./internal/store/... ./internal/api/... ./internal/placement/... ./internal/reconcile/... ./internal/integration/...
 
   etcd:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       DOCKFLEET_TEST_ETCD_ENDPOINTS: http://127.0.0.1:21234
     steps:
@@ -67,9 +124,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - run: make tools
-      - run: make proto
-      - run: make tidy
+      - run: make generate
       - name: Start etcd
         run: make etcd-test-up
       - name: etcd integration tests
@@ -78,8 +133,31 @@ jobs:
         if: always()
         run: make etcd-test-down
 
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: make generate
+      # The tests start (and crash, and stop) their own PostgreSQL and etcd, so that they can
+      # inject the failures of the database and of etcd. The servers come from the distribution's
+      # packages, which apt verifies; any etcd from 3.4 on will do.
+      - name: PostgreSQL and etcd server binaries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql etcd-server
+          echo "DOCKFLEET_E2E_POSTGRES_BIN=$(ls -d /usr/lib/postgresql/*/bin | sort -V | tail -1)/postgres" >> "$GITHUB_ENV"
+          echo "DOCKFLEET_E2E_ETCD_BIN=$(command -v etcd)" >> "$GITHUB_ENV"
+      - name: End-to-end tests
+        run: make test-e2e
+
   docker:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       DOCKFLEET_TEST_DOCKER_HOST: unix:///var/run/docker.sock
     steps:
@@ -88,8 +166,61 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - run: make tools
-      - run: make proto
-      - run: make tidy
+      - run: make generate
       - name: Docker Engine integration tests
         run: make test-docker
+
+  images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build both images
+        run: make docker-build VERSION=ci
+      - name: Both images run as a numeric non-root user
+        run: |
+          for image in dockfleet-manager dockfleet-agent; do
+            user=$(docker image inspect --format '{{.Config.User}}' "${image}:ci")
+            echo "${image}: user ${user}"
+            case "${user}" in 65532:65532) ;; *) echo "unexpected user"; exit 1 ;; esac
+          done
+      - name: The manager image refuses to start without TLS on a public address
+        run: |
+          set +e
+          out=$(docker run --rm -e DOCKFLEET_API_TOKEN=ci-api-token-0123456789 -e DOCKFLEET_STORE=memory \
+                 -e DOCKFLEET_AGENT_TOKEN=ci-agent-token-0123456789 dockfleet-manager:ci 2>&1)
+          code=$?
+          echo "${out}"
+          [ "${code}" -ne 0 ] && echo "${out}" | grep -q "not a loopback address"
+      - name: The manager image becomes healthy and stops on SIGTERM with exit 0
+        run: |
+          docker run -d --name manager-smoke \
+            -e DOCKFLEET_API_ADDR=127.0.0.1:21280 -e DOCKFLEET_GRPC_ADDR=127.0.0.1:21281 \
+            -e DOCKFLEET_STORE=memory -e DOCKFLEET_API_TOKEN=ci-api-token-0123456789 \
+            -e DOCKFLEET_AGENT_TOKEN=ci-agent-token-0123456789 \
+            --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+            dockfleet-manager:ci
+          for i in $(seq 1 60); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' manager-smoke)
+            [ "${status}" = healthy ] && break
+            sleep 2
+          done
+          docker logs manager-smoke | tail -5
+          [ "${status}" = healthy ]
+          docker stop --time 20 manager-smoke
+          code=$(docker inspect --format '{{.State.ExitCode}}' manager-smoke)
+          docker rm manager-smoke
+          [ "${code}" = 0 ]
+
+  vulnerabilities:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: make generate
+      - name: govulncheck (reports only vulnerabilities in code the binaries call)
+        run: make vuln

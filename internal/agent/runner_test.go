@@ -525,6 +525,44 @@ func TestStatusesAreOrderedAndAcknowledgmentsNeverGoBack(t *testing.T) {
 	}
 }
 
+// An instruction that was overtaken is not obeyed. Generations only grow, so a
+// lower one can only come from a manager that knows less than the last one did.
+func TestAnAssignmentOlderThanTheOneInForceIsIgnored(t *testing.T) {
+	r, engine, _ := newTestRunner(t)
+	r.Assign([]*dockfleetv1.WorkloadAssignment{assigned("w1", 1, wantRunning)})
+	r.pass()
+	r.pass()
+	wantStatus(t, r, "w1", phaseRunning, "running")
+	r.Assign([]*dockfleetv1.WorkloadAssignment{assigned("w1", 2, wantStopped)})
+	r.pass()
+	r.pass()
+	wantStatus(t, r, "w1", phaseStopped, "removed")
+	creates := engine.Count("create")
+
+	// The older instruction (generation 1, run it) arrives after the newer one.
+	r.Assign([]*dockfleetv1.WorkloadAssignment{assigned("w1", 1, wantRunning)})
+	r.pass()
+	r.pass()
+	if engine.Count("create") != creates || len(engine.Managed()) != 0 {
+		t.Fatalf("an overtaken instruction was obeyed: %v", engine.Calls())
+	}
+	st := wantStatus(t, r, "w1", phaseStopped, "removed")
+	if st.GetAcknowledgedGeneration() != 2 {
+		t.Fatalf("the acknowledgment went back to %d", st.GetAcknowledgedGeneration())
+	}
+
+	// The same generation, and a higher one, are obeyed as always; so is a workload
+	// the stale set mentions for the first time.
+	r.Assign([]*dockfleetv1.WorkloadAssignment{assigned("w1", 2, wantStopped), assigned("w3", 1, wantRunning)})
+	r.pass()
+	r.pass()
+	wantStatus(t, r, "w3", phaseRunning, "running")
+	r.Assign([]*dockfleetv1.WorkloadAssignment{assigned("w1", 3, wantRunning)})
+	r.pass()
+	r.pass()
+	wantStatus(t, r, "w1", phaseRunning, "running")
+}
+
 func TestLongMessagesAreClippedToValidText(t *testing.T) {
 	for name, msg := range map[string]string{
 		"a rune cut in half": "a" + strings.Repeat("é", 400),

@@ -18,6 +18,10 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 | `internal/metrics`   | Small Prometheus-compatible registry behind `GET /metrics` ([docs/observability.md](docs/observability.md)) |
 | `internal/election`  | Optional high availability: the leader elector, the fencing contract the loops, the protocol and the API use ([docs/high-availability.md](docs/high-availability.md)) |
 | `internal/etcd`      | The election's backend: a small client of etcd's JSON gateway (leases, an atomic create-if-absent); `internal/etcdfake` is an in-memory etcd for tests |
+| `internal/outage`    | Remembers when the manager's store last failed, so that silence it could not have heard is not held against nodes |
+| `internal/healthcheck` | The `healthcheck` subcommand's probe: asks a process's own `/readyz`, trusting only its own certificate |
+| `internal/testnet`   | Test servers on the project's loopback port range                       |
+| `internal/e2e`       | End-to-end tests (build tag `e2e`): the real binaries over mutual TLS with PostgreSQL and etcd, failures injected |
 | `internal/dashboard` | Read-only server-rendered dashboard under `/dashboard`, built on the API's own responses ([docs/observability.md](docs/observability.md)) |
 | `internal/agent`     | Node logic: register, heartbeat, retry, re-register; the runner that keeps the node's containers in line with its assignments |
 | `internal/store`     | Persistence: repository interfaces, transactions, versioned migrations; PostgreSQL and in-memory implementations ([docs/state.md](docs/state.md)) |
@@ -32,13 +36,14 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 | `internal/config`    | Environment-based configuration with secure-default validation          |
 | `internal/logging`   | Structured logging (`log/slog`, JSON or text)                           |
 | `proto/`             | Protobuf definitions (`buf` module)                                     |
-| `deploy/`            | Docker Compose files: development PostgreSQL, and a disposable Docker daemon for the Docker tests |
+| `Dockerfile`         | Two images, `manager` and `agent` targets: one static binary each, non-root, with a built-in health check ([docs/deployment.md](docs/deployment.md)) |
+| `deploy/`            | Docker Compose files: development PostgreSQL, a disposable Docker daemon and a disposable etcd for tests; `deploy/examples/` holds example manager and worker configuration, Compose files and systemd units |
 | `config/dev.env`     | Development-only configuration                                          |
-| `docs/`              | [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), [Mutual TLS and enrollment](docs/mtls.md), [Docker adapter](docs/docker.md), [Control-plane state](docs/state.md), [Services API](docs/api.md), [Scheduler](docs/scheduler.md), [Reconciliation](docs/reconciliation.md), [Failure handling](docs/failure-handling.md), [Rolling deployments](docs/rollouts.md), [Container logs](docs/logs.md), [Metrics, dashboard and audit trail](docs/observability.md), [High availability](docs/high-availability.md) |
+| `docs/`              | [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), [Mutual TLS and enrollment](docs/mtls.md), [Docker adapter](docs/docker.md), [Control-plane state](docs/state.md), [Services API](docs/api.md), [Scheduler](docs/scheduler.md), [Reconciliation](docs/reconciliation.md), [Failure handling](docs/failure-handling.md), [Rolling deployments](docs/rollouts.md), [Container logs](docs/logs.md), [Metrics, dashboard and audit trail](docs/observability.md), [High availability](docs/high-availability.md), [Deployment guide](docs/deployment.md), [Credentials](docs/credentials.md), [Security audit](docs/security-audit.md), [Limitations and differences from Kubernetes](docs/limitations.md) |
 
 ## Prerequisites
 
-- Go 1.23 or newer
+- Go 1.26.10 (the release `go.mod` names; it carries the standard-library security fixes the binaries need). `make` uses the toolchain under `.tools/go` if you put it on `PATH`
 - Docker with the Compose plugin (the PostgreSQL development database), and a local Docker Engine on every worker running an agent. Only agents use Docker; the manager never does
 - Network access once, to download modules and the pinned code generators
 
@@ -92,6 +97,10 @@ make run-agent-mtls
 ```
 
 Administrators distributing real credentials should read [docs/mtls.md](docs/mtls.md).
+
+## Deploying
+
+The quick start above is a development setup on one machine. For several machines, [docs/deployment.md](docs/deployment.md) is the guide: PostgreSQL, certificates with `dockfleet-pki`, credentials as files ([docs/credentials.md](docs/credentials.md)), the manager and the workers (systemd units and a hardened Compose file under `deploy/examples/`, a `Dockerfile` with `manager` and `agent` targets), optional high availability, health checks, upgrades and backups. [docs/limitations.md](docs/limitations.md) says what DockFleet is not, and how it differs from Kubernetes; [docs/security-audit.md](docs/security-audit.md) is the review of its isolation defaults, authorization, TLS, stale assignments, migrations and shutdown behavior.
 
 ## Administrative API
 
@@ -152,6 +161,9 @@ All settings are environment variables. The manager and agent refuse to start on
 | `DOCKFLEET_GRPC_ADDR`            | manager | `127.0.0.1:21281`            | Non-loopback requires TLS                                  |
 | `DOCKFLEET_API_TOKEN`            | manager | **required**                 | Admin bearer token, at least 16 characters                 |
 | `DOCKFLEET_AGENT_TOKEN`          | both    | required without TLS         | Plaintext loopback development only; at least 16 characters, differs from the API token |
+| `DOCKFLEET_API_TOKEN_FILE`, `DOCKFLEET_AGENT_TOKEN_FILE`, `DOCKFLEET_DATABASE_URL_FILE` | manager (agent: the agent token) | unset | Read the credential from this file instead of the environment (Docker/Compose secrets, systemd credentials); setting both forms is an error ([docs/credentials.md](docs/credentials.md)) |
+| `DOCKFLEET_HEALTH_ADDR`          | agent   | `127.0.0.1:21282`            | Where the agent serves `/healthz` and `/readyz`; loopback only, `off` to disable. `dockfleet-agent healthcheck` asks it |
+| `DOCKFLEET_HEALTHCHECK_SERVER_NAME` | manager (`healthcheck` subcommand) | first DNS name of the certificate | Name `dockfleet-manager healthcheck` expects in the manager's own certificate |
 | `DOCKFLEET_STORE`                | manager | `postgres`                   | `postgres` or `memory` (state lost on exit)                |
 | `DOCKFLEET_DATABASE_URL`         | manager | required for `postgres`      | Migrations run at startup (safe with several managers starting at once) |
 | `DOCKFLEET_INSTANCE_ID`          | manager | `manager-<random>`           | Names this manager in audit events and leases; set it for a stable identity |
@@ -197,6 +209,10 @@ All settings are environment variables. The manager and agent refuse to start on
 make test               # unit tests, -race, no external services
 make cover              # per-package coverage
 make test-integration   # PostgreSQL store, API, scheduling, reconciliation and multi-manager tests; needs `make compose-up`
+make test-e2e           # the real binaries over mutual TLS with PostgreSQL and etcd, failures injected; builds the binaries, starts its own PostgreSQL and etcd from .tools/ (or DOCKFLEET_E2E_POSTGRES_BIN / DOCKFLEET_E2E_ETCD_BIN) unless DOCKFLEET_TEST_DATABASE_URL / DOCKFLEET_TEST_ETCD_ENDPOINTS name running ones
+make cross-build        # the released platforms compile (static)
+make docker-build       # the two images; needs a Docker daemon
+make vuln               # govulncheck; needs network
 make test-etcd          # the election client and the managers' election against a real etcd; needs DOCKFLEET_TEST_ETCD_ENDPOINTS (`make etcd-test-up` starts a disposable etcd on 127.0.0.1:21234)
 make test-docker        # Docker Engine tests: the adapter and a service deployment; needs DOCKFLEET_TEST_DOCKER_HOST (`make docker-test-up` starts a disposable daemon on 127.0.0.1:21297)
 ```
@@ -209,12 +225,15 @@ Metrics, the dashboard and the audit trail are tested in `internal/metrics` (the
 
 High availability is tested in `internal/election` (every way a term begins and ends, on a manual clock), `internal/etcd` (the backend contract, against the fake always and a real etcd under `make test-etcd`), the store conformance on both stores (epochs handed out one at a time; a term cannot begin while a transaction that checked the epoch is open), the scheduling and reconciliation passes (a replaced leader saves nothing), `internal/protocol` and `internal/api`, and in `internal/integration` with three real managers on loopback ports and real agents: one leader acting alone, leadership transfer, failover after a crash, a partitioned leader that stops before its successor starts, and an agent that is offered instructions by a control plane that was replaced.
 
+End to end (`internal/e2e`, `make test-e2e`) the tests run the manager and agent **binaries** as processes with certificates from `dockfleet-pki`, credentials as files, PostgreSQL and etcd, and an in-memory container engine in the agent (`-tags e2efake`; no release build contains it): deployment, scaling, a rolling update checked against its surge and unavailability limits, rollback, a crashed agent and its recovery, a network partition (the agent stops its containers before its replicas move), a frozen agent, clean restarts, a manager crash, a database crash and an outage of etcd, leader crash and handoff, and the refusals (no token, no certificate, a foreign CA, TLS 1.2, plaintext, another node's certificate, a world-readable key, an unenrolled node, credentials in logs).
+
 Generated protobuf code is not committed, so run `make generate` after a fresh clone and `make proto` after editing `proto/`.
 
 ## Limitations
 
 - Agents create, start, stop and remove containers, restart them per policy (waits, limits, health checks) and report back, publish ports only on loopback, and offer no mounts or networks beyond the container policy's defaults. Stopping a workload removes its container and its logs. See [docs/reconciliation.md](docs/reconciliation.md#limitations).
 - Utilization in the metrics and the dashboard is what is promised to workloads (their declared limits), not measured use; loop and request metrics are per manager process; a dashboard session lasts until it expires or the admin token is rotated; there is one shared admin token and so one audit actor. See [docs/observability.md](docs/observability.md#limitations).
+- The full list of limits, and where DockFleet differs from Kubernetes (no pods, no service discovery or overlay network, declared rather than measured resources, one admin token, Docker only), is in [docs/limitations.md](docs/limitations.md). The container images, Compose files, systemd units and CI workflow have not been run where this was developed ([docs/deployment.md](docs/deployment.md#what-has-and-has-not-been-verified)).
 - High availability is optional and needs etcd; a single manager needs neither. An etcd outage longer than the node lease stops every container of the fleet while agents fence themselves; leadership does not depend on the database being reachable; an agent remembers the highest epoch only while it runs. See [docs/high-availability.md](docs/high-availability.md#remaining-limitations-partitions-included).
 - Container logs come from Docker's own `json-file` logs (rotated, 3 × 10 MiB), are not stored by the manager, and a following request ends when the container stops; a query sees only the nodes connected to the manager that serves it. See [docs/logs.md](docs/logs.md#limitations).
 - Failover has limits ([docs/failure-handling.md](docs/failure-handling.md#limitations)): a crashed agent process cannot stop its own containers, so a replica started elsewhere runs beside them until it returns; with fencing on (the default) a manager outage longer than the lease stops every container in the fleet until the manager is back; a replica whose container failed beyond its restart limit is not moved to another node; standalone workloads are not moved.

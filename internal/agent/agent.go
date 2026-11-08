@@ -78,6 +78,7 @@ type Agent struct {
 	cfg    Config
 	runner *runner
 	logs   *logServer
+	health healthState
 }
 
 func New(cfg Config) *Agent {
@@ -221,6 +222,8 @@ func (a *Agent) register(ctx context.Context) (protocol.Session, time.Time, erro
 func (a *Agent) serve(ctx context.Context, session protocol.Session, registeredAt time.Time) (sessionLost bool, err error) {
 	a.renewLease(registeredAt, session)
 	a.runner.Assign(session.Assignments)
+	a.health.registered(a.runner.now(), session.HeartbeatInterval)
+	defer a.health.down()
 
 	// The manager reads container logs through a stream the agent keeps open
 	// for as long as the session lasts.
@@ -260,6 +263,7 @@ func (a *Agent) serve(ctx context.Context, session protocol.Session, registeredA
 		case hbErr == nil:
 			a.renewLease(sentAt, session)
 			a.runner.Assign(assigned)
+			a.health.beat(a.runner.now())
 		case ctx.Err() != nil:
 			return false, nil
 		case protocol.NeedsRegistration(hbErr):

@@ -1,6 +1,6 @@
 # DockFleet architecture
 
-This document describes what exists today and where the planned orchestration work plugs in. Anything not listed under "Implemented" is not implemented.
+This document describes what exists today and where further work plugs in. Anything not listed under "Implemented" is not implemented. How to deploy it is in [deployment.md](deployment.md); what it deliberately does not do, and how it differs from Kubernetes, is in [limitations.md](limitations.md); what was checked for security, and what was found, is in [security-audit.md](security-audit.md).
 
 ## Overview
 
@@ -82,11 +82,11 @@ Rescheduling a replica whose container failed beyond its restart limit, deleting
 | `events` | `id` | audit | Append-only administrative events |
 | `leases` | `name` | coordination | Named leases with fencing tokens for multi-manager duties |
 
-Migrations (001-011) live in `internal/store/migrations`, are recorded with their checksums in `schema_migrations` and are never edited after release. A workload has no observation until its agent reports (`Workload.Phase()` is then `scheduled`); reports set the phase (`pending`, `running`, `succeeded`, `failed`, `stopped`) in `workload_observations` and never touch `workloads`. Details, multi-manager design and the restart guarantee are in [state.md](state.md).
+Migrations (001-012) live in `internal/store/migrations`, are recorded with their checksums in `schema_migrations` and are never edited after release. A workload has no observation until its agent reports (`Workload.Phase()` is then `scheduled`); reports set the phase (`pending`, `running`, `succeeded`, `failed`, `stopped`) in `workload_observations` and never touch `workloads`. Details, multi-manager design and the restart guarantee are in [state.md](state.md).
 
 ## Node liveness
 
-A node is `ready` when `now - last_heartbeat <= DOCKFLEET_NODE_TTL`. The manager tells each agent its heartbeat interval at registration. Readiness is computed on read; nothing is written when a node goes quiet. A clean agent shutdown deregisters, which backdates the heartbeat so the node leaves scheduling immediately. The scheduler also skips a node whose enrollment was revoked, even while it still heartbeats, and says so.
+A node is `ready` when `now - last_heartbeat <= DOCKFLEET_NODE_TTL`; that is what the scheduler places new replicas by. Its **health** has three states, from how long it has been silent (`scheduler.Timing`, one implementation for the scheduler, the reconciler and the API): `healthy`; `suspect` (silent for more than the TTL, or the agent has left: no new replicas, the ones it has stay); `unavailable` (silent for more than `DOCKFLEET_NODE_UNAVAILABLE_AFTER`: its replicas are started elsewhere). Silence is not counted from before the manager started, from before the current leader's term began, or from before the manager's store last failed. The manager tells each agent its heartbeat interval and its lease at registration, and an agent whose lease runs out stops its own containers, strictly before the manager moves them ([failure-handling.md](failure-handling.md)). A clean agent shutdown deregisters, which makes the node `suspect` at once. The scheduler also skips a node whose enrollment was revoked, even while it still heartbeats, and says so.
 
 ## Lifecycle and cancellation
 
@@ -94,11 +94,15 @@ Both binaries create a root context with `signal.NotifyContext` for `SIGINT` and
 
 Manager shutdown order, bounded by `DOCKFLEET_SHUTDOWN_TIMEOUT`:
 
-1. Stop accepting HTTP connections and wait for in-flight requests (`http.Server.Shutdown`); force-close if the budget runs out.
-2. `grpc.Server.GracefulStop`; force `Stop` if the budget runs out.
-3. Wait for both serve goroutines, then the store is closed by `main`.
+1. With leader election: stop the election first and wait for the leader's duties to return, which gives up the lease, so another manager takes over at once and agents are not left with a leader that is about to go.
+2. End the open log streams (they would hold the servers up until the timeout).
+3. Stop accepting HTTP connections and wait for in-flight requests (`http.Server.Shutdown`); force-close if the budget runs out.
+4. `grpc.Server.GracefulStop`; force `Stop` if the budget runs out.
+5. Wait for the serve goroutines, then the store is closed by `main`.
 
-If either server fails on its own, the other is shut down the same way and the error is returned (exit status 1). A clean, requested shutdown returns nil (exit status 0). The agent stops its loop when the context ends and then deregisters using a fresh, short deadline so shutdown cannot hang on an unreachable manager. gRPC `GracefulStop` waits for in-flight calls, each of which has a deadline.
+A process that is killed instead is recovered from the database: nothing a manager holds in memory is the only copy of anything.
+
+If either server fails on its own, the other is shut down the same way and the error is returned (exit status 1). A clean, requested shutdown returns nil (exit status 0). The agent stops its loop when the context ends and then deregisters using a fresh, short deadline so shutdown cannot hang on an unreachable manager. **It leaves the containers it started running**, so restarting or upgrading an agent restarts no workload and the next agent adopts what it finds. Both binaries have a `healthcheck` subcommand (`dockfleet-manager healthcheck`, `dockfleet-agent healthcheck`) that asks the process's own `/readyz` and exits 0 or 1; it is the image's `HEALTHCHECK`, so the images need no shell or curl. gRPC `GracefulStop` waits for in-flight calls, each of which has a deadline.
 
 ## Security model
 
@@ -111,7 +115,7 @@ If either server fails on its own, the other is shut down the same way and the e
 - **Docker access**: only the agent talks to Docker, and only to its local Engine (`unix://` or loopback `tcp://`; the Engine API is unauthenticated and equivalent to root). The manager has no Docker settings and no Docker imports, so it never needs a socket. Containers are always created with the fixed hardening described in [docker.md](docker.md), and never from specs the policy rejects.
 - **Development credentials** live in `config/dev.env`, are labeled as throwaway, and are not accepted by any production-oriented default.
 
-Known gaps: the admin API uses one shared bearer token, there is no CRL/OCSP (revoke by enrollment), the development CA is not a production PKI, no rate limiting, no audit log beyond structured logs of enrollment changes and rejections.
+Known gaps: the admin API uses one shared bearer token and does not throttle failed attempts with it (the dashboard login is throttled), there is no CRL/OCSP (revoke by enrollment), the development CA is not a production PKI, and environment values in a service spec are stored in plain text. Every change is recorded in the audit trail and the structured `audit` log, with the outcome of refused attempts too. The full review is in [security-audit.md](security-audit.md).
 
 ## Decisions
 
@@ -124,6 +128,16 @@ Known gaps: the admin API uses one shared bearer token, there is no CRL/OCSP (re
 - **A workload is one container's lifetime** (running, stopped, deleted), so its random ID names at most one container ever.
 - **Leader election decides who should lead; the database decides who may write.** etcd is good at leases and bad at being the place state lives, and PostgreSQL already holds all of it. So the winner of the election asks the database for the next epoch and every write of the leader is checked against it in its own transaction. etcd can be wrong, late or partitioned and no replaced leader can write; and nothing is stored in etcd that would have to be recovered.
 - **Deciding is separate from saving, and saving from running.** `internal/scheduler` answers "where?" from a snapshot and nothing else; `internal/placement` saves the answer as desired state; the agent and `internal/docker` are the only code that touches containers. Each can be tested without the others.
+
+## Where DockFleet differs from Kubernetes
+
+The short version; the table and the reasons are in [limitations.md](limitations.md#where-it-differs-from-kubernetes).
+
+- **Smaller on purpose.** One container per replica (no pods), services and standalone workloads (no stateful sets, jobs or operators), no overlay network, service discovery or ingress (ports bind to the node's loopback), no secret or config store, no autoscaling, no affinities or priorities, **declared rather than measured** resources, one shared admin token instead of RBAC, the Docker Engine only.
+- **A different shape of control plane.** PostgreSQL is the store of record and etcd, if used at all, holds only the leadership key; the leader runs two polling loops instead of watch-driven controllers; there is no watch API. Agents dial the manager, and the manager never connects to a node.
+- **A different answer to a partitioned node.** An agent whose lease runs out stops its own containers *before* the manager starts their replicas elsewhere, so a replica does not run twice; Kubernetes lets pods run on a partitioned node while replacements start after the eviction timeout.
+- **A security policy that cannot be loosened per service**: no privileged containers, all capabilities dropped, no host namespaces, no Docker socket or system path mounts, mandatory limits.
+- **Not benchmarked at scale.** The tests use up to three nodes.
 
 ## Extension points for the next stages
 

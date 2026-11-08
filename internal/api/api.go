@@ -244,6 +244,7 @@ func (s *server) readyz(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), readyTimeout)
 	defer cancel()
 	if err := s.store.Ping(ctx); err != nil {
+		s.timing.StoreFailed(s.now())
 		s.logger.WarnContext(r.Context(), "readiness check failed", "error", err)
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return

@@ -357,6 +357,8 @@ func (r *Reconciler) pass(ctx context.Context) {
 	case err != nil && ctx.Err() != nil:
 		// Shutting down; nothing was saved.
 	case err != nil:
+		// Most likely the store: a node's silence while it could not be used is not held against it.
+		r.cfg.Timing.StoreFailed(r.cfg.Now())
 		r.cfg.Logger.Error("reconciliation pass failed", "error", err)
 	case report != (Report{}):
 		r.cfg.Logger.Info("reconciliation pass", "stopped", report.Stopped, "deleted", report.Deleted, "node_changes", report.NodeChanges)

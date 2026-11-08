@@ -10,55 +10,26 @@ package etcdfake
 import (
 	"encoding/base64"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/dockfleet/dockfleet/internal/testnet"
 )
 
 // ClientHeader is the request header that names the caller to Partition and Stall.
 const ClientHeader = "X-Test-Client"
 
-// The loopback ports test servers of the etcd packages use: the project's
-// range is 21200-21299, and these twenty are kept for them.
-const (
-	firstPort = 21240
-	lastPort  = 21259
-)
+// Listen returns a loopback listener on a free port of the project's range for
+// test servers (see internal/testnet).
+func Listen() (net.Listener, error) { return testnet.Listen() }
 
-// Listen returns a loopback listener on a free port of the range above. Tests
-// that need an HTTP(S) server of their own use it instead of httptest's
-// choice of a port, which would leave the project's range.
-func Listen() (net.Listener, error) {
-	for port := firstPort; port <= lastPort; port++ {
-		if ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port)); err == nil {
-			return ln, nil
-		}
-	}
-	return nil, errors.New("etcdfake: no free port in 21240-21259")
-}
-
-// NewServer starts an httptest server on a port of the range; tls says whether
-// it speaks TLS. It panics if no port is free, which only a broken test run can cause.
-func NewServer(h http.Handler, tls bool) *httptest.Server {
-	ln, err := Listen()
-	if err != nil {
-		panic(err)
-	}
-	ts := httptest.NewUnstartedServer(h)
-	_ = ts.Listener.Close()
-	ts.Listener = ln
-	if tls {
-		ts.StartTLS()
-	} else {
-		ts.Start()
-	}
-	return ts
-}
+// NewServer starts an httptest server on a port of that range; useTLS says
+// whether it speaks TLS.
+func NewServer(h http.Handler, useTLS bool) *httptest.Server { return testnet.NewServer(h, useTLS) }
 
 // tagged names the caller of every request to the fake.
 type tagged struct {

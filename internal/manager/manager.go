@@ -21,6 +21,7 @@ import (
 	"github.com/dockfleet/dockfleet/internal/logstream"
 	"github.com/dockfleet/dockfleet/internal/metrics"
 	"github.com/dockfleet/dockfleet/internal/netutil"
+	"github.com/dockfleet/dockfleet/internal/outage"
 	"github.com/dockfleet/dockfleet/internal/pki"
 	"github.com/dockfleet/dockfleet/internal/placement"
 	"github.com/dockfleet/dockfleet/internal/protocol"
@@ -121,7 +122,9 @@ func (l loopMetrics) RolloutFailed(service string) { l.m.DeploymentFailed(servic
 func New(cfg config.Manager, st store.Store, logger *slog.Logger, opts ...Option) (*Manager, error) {
 	// Silence from before this manager started is not counted against a node:
 	// a manager that was down cannot tell a dead node from one it could not hear.
-	timing := scheduler.Timing{SuspectAfter: cfg.NodeTTL, UnavailableAfter: cfg.NodeUnavailableAfter, Since: time.Now()}
+	// Nor is silence while the store could not be used (see package outage): every
+	// loop and the API share one record of it.
+	timing := scheduler.Timing{SuspectAfter: cfg.NodeTTL, UnavailableAfter: cfg.NodeUnavailableAfter, Since: time.Now(), Outages: outage.New()}
 	// With metrics off the observers stay nil interfaces, which the loops skip.
 	var instruments *metrics.Metrics
 	var schedulingObserver placement.Observer

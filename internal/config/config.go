@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/url"
@@ -148,6 +149,11 @@ type Agent struct {
 	// the price of duplicate replicas after a failover.
 	FenceOnLeaseLoss bool
 
+	// HealthAddr is where the agent serves GET /healthz and /readyz, which the
+	// image's HEALTHCHECK asks. It is always a loopback address, because the
+	// endpoint is for the machine (or container) the agent runs in; "" means off.
+	HealthAddr string
+
 	// LogRequests is how many log requests the agent serves at once for the
 	// manager; 0 turns serving container logs off.
 	LogRequests int
@@ -156,6 +162,28 @@ type Agent struct {
 	// docker package validates them (they never allow the always-denied set).
 	AllowedBindRoots    []string
 	AllowedCapabilities []string
+}
+
+// DefaultAPIAddr is where the manager serves its API (and its health
+// endpoints) when DOCKFLEET_API_ADDR is not set.
+const DefaultAPIAddr = "127.0.0.1:21280"
+
+// DefaultAgentHealthAddr is where the agent serves its health endpoint when
+// DOCKFLEET_HEALTH_ADDR is not set.
+const DefaultAgentHealthAddr = "127.0.0.1:21282"
+
+// AgentHealthAddr is the address of the agent's health endpoint, or "" when
+// DOCKFLEET_HEALTH_ADDR is "off". The `healthcheck` subcommand reads it the same
+// way the agent does.
+func AgentHealthAddr(get Getenv) string {
+	switch v := strings.TrimSpace(get("DOCKFLEET_HEALTH_ADDR")); v {
+	case "":
+		return DefaultAgentHealthAddr
+	case "off":
+		return ""
+	default:
+		return v
+	}
 }
 
 // TLSEnabled reports whether the agent connects with mutual TLS. Without it
@@ -180,12 +208,12 @@ func LoadManager(get Getenv) (Manager, error) {
 	}
 	c.LogLevel = env(get, "DOCKFLEET_LOG_LEVEL", "info")
 	c.LogFormat = env(get, "DOCKFLEET_LOG_FORMAT", "json")
-	c.APIAddr = env(get, "DOCKFLEET_API_ADDR", "127.0.0.1:21280")
+	c.APIAddr = env(get, "DOCKFLEET_API_ADDR", DefaultAPIAddr)
 	c.GRPCAddr = env(get, "DOCKFLEET_GRPC_ADDR", "127.0.0.1:21281")
-	c.APIToken = env(get, "DOCKFLEET_API_TOKEN", "")
-	c.AgentToken = env(get, "DOCKFLEET_AGENT_TOKEN", "")
+	c.APIToken = secret(get, "DOCKFLEET_API_TOKEN", &errs)
+	c.AgentToken = secret(get, "DOCKFLEET_AGENT_TOKEN", &errs)
 	c.Store = env(get, "DOCKFLEET_STORE", "postgres")
-	c.DatabaseURL = env(get, "DOCKFLEET_DATABASE_URL", "")
+	c.DatabaseURL = secret(get, "DOCKFLEET_DATABASE_URL", &errs)
 	c.TLSCertFile = env(get, "DOCKFLEET_TLS_CERT_FILE", "")
 	c.TLSKeyFile = env(get, "DOCKFLEET_TLS_KEY_FILE", "")
 	c.TLSClientCAFile = env(get, "DOCKFLEET_TLS_CLIENT_CA_FILE", "")
@@ -355,7 +383,7 @@ func LoadAgent(get Getenv) (Agent, error) {
 	if len(c.ManagerAddrs) == 0 {
 		c.ManagerAddrs = []string{c.ManagerAddr}
 	}
-	c.Token = env(get, "DOCKFLEET_AGENT_TOKEN", "")
+	c.Token = secret(get, "DOCKFLEET_AGENT_TOKEN", &errs)
 	c.TLSCAFile = env(get, "DOCKFLEET_TLS_CA_FILE", "")
 	c.TLSCertFile = env(get, "DOCKFLEET_TLS_CERT_FILE", "")
 	c.TLSKeyFile = env(get, "DOCKFLEET_TLS_KEY_FILE", "")
@@ -363,6 +391,10 @@ func LoadAgent(get Getenv) (Agent, error) {
 	c.DockerHost = env(get, "DOCKFLEET_DOCKER_HOST", "unix:///var/run/docker.sock")
 	c.RPCTimeout = duration(get, "DOCKFLEET_RPC_TIMEOUT", 5*time.Second, &errs)
 	c.FenceOnLeaseLoss = boolean(get, "DOCKFLEET_FENCE_ON_LEASE_LOSS", true, &errs)
+	c.HealthAddr = AgentHealthAddr(get)
+	if c.HealthAddr != "" && !netutil.IsLoopbackAddr(c.HealthAddr) {
+		fail("DOCKFLEET_HEALTH_ADDR=%q is not a loopback address; the health endpoint is for the machine the agent runs on (use \"off\" to turn it off)", c.HealthAddr)
+	}
 	c.LogRequests = intInRange(get, "DOCKFLEET_LOG_MAX_REQUESTS", 16, 0, 256, &errs)
 	c.CPUMillis = positiveInt(get, "DOCKFLEET_NODE_CPU_MILLIS", int64(runtime.NumCPU())*1000, &errs)
 	// Declared capacity, not measured: host memory detection is future work.
@@ -424,6 +456,57 @@ func LoadAgent(get Getenv) (Agent, error) {
 		return Agent{}, err
 	}
 	return c, nil
+}
+
+// maxSecretFile bounds a credential read from a file: a token or a database
+// URL is a few hundred bytes, and a file far larger is not one.
+const maxSecretFile = 8 << 10
+
+// secret reads a credential from the variable NAME, or from the file named by
+// NAME_FILE. A file is how Docker and Kubernetes secrets and systemd credentials
+// are delivered, and keeps the value out of the process environment, where
+// `docker inspect`, /proc/<pid>/environ and crash reports show it. Setting both
+// is an error, because the winner would be a guess. The file is read once, at
+// startup; surrounding whitespace (the newline at the end) is dropped. Errors
+// name the file and never what is in it.
+func secret(get Getenv, name string, errs *[]error) string {
+	direct, file := get(name), get(name+"_FILE")
+	fail := func(format string, args ...any) string {
+		*errs = append(*errs, fmt.Errorf(format, args...))
+		return ""
+	}
+	switch {
+	case file == "":
+		return direct
+	case direct != "":
+		return fail("%s and %s_FILE are both set; set only one", name, name)
+	case !path.IsAbs(file):
+		return fail("%s_FILE=%q must be an absolute path", name, file)
+	}
+	f, err := os.Open(file)
+	if err != nil {
+		return fail("%s_FILE: %v", name, err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return fail("%s_FILE: %v", name, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fail("%s_FILE=%q is not a regular file", name, file)
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, maxSecretFile+1))
+	if err != nil {
+		return fail("%s_FILE: %v", name, err)
+	}
+	if len(raw) > maxSecretFile {
+		return fail("%s_FILE=%q is larger than %d bytes", name, file, maxSecretFile)
+	}
+	value := strings.TrimSpace(string(raw))
+	if value == "" {
+		return fail("%s_FILE=%q is empty", name, file)
+	}
+	return value
 }
 
 func env(get Getenv, key, def string) string {

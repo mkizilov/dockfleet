@@ -15,6 +15,8 @@ PROTOC_GEN_GO_GRPC_VERSION := v1.5.1
 COMPOSE := docker compose --env-file config/dev.env -f deploy/docker-compose.yml
 DOCKER_TEST_COMPOSE := docker compose -f deploy/docker-compose.docker-test.yml
 ETCD_TEST_COMPOSE := docker compose -f deploy/docker-compose.etcd-test.yml
+GOVULNCHECK_VERSION := v1.1.4
+RELEASE_PLATFORMS := linux/amd64 linux/arm64 darwin/arm64
 PKGS    := ./...
 
 # Development credentials live in PKI_DIR, which is git-ignored.
@@ -49,15 +51,16 @@ tidy: ## Resolve dependencies and write go.sum (needs network)
 
 .PHONY: fmt
 fmt: ## Format Go sources
-	gofmt -w cmd internal
+	gofmt -w cmd internal deploy
 
 .PHONY: fmt-check
 fmt-check: ## Fail if any Go source is not gofmt-formatted
-	@out=$$(gofmt -l cmd internal); if [ -n "$$out" ]; then echo "Unformatted files:"; echo "$$out"; exit 1; fi
+	@out=$$(gofmt -l cmd internal deploy); if [ -n "$$out" ]; then echo "Unformatted files:"; echo "$$out"; exit 1; fi
 
 .PHONY: vet
-vet: ## Run go vet
+vet: ## Run go vet, also with the build tags of the PostgreSQL, etcd, Docker and end-to-end tests
 	$(GO) vet $(PKGS)
+	$(GO) vet -tags integration,etcdintegration,dockerintegration,e2e $(PKGS)
 
 .PHONY: build
 build: ## Build manager and agent into bin/
@@ -93,6 +96,10 @@ docker-test-up: ## Start a disposable Docker daemon on 127.0.0.1:21297 for `make
 docker-test-down: ## Stop the disposable Docker daemon and delete its images and containers
 	$(DOCKER_TEST_COMPOSE) down --volumes
 
+.PHONY: test-e2e
+test-e2e: ## End-to-end tests: the real binaries over mutual TLS with PostgreSQL and etcd (uses DOCKFLEET_TEST_DATABASE_URL / DOCKFLEET_TEST_ETCD_ENDPOINTS, or starts the PostgreSQL and etcd under .tools/ or named by DOCKFLEET_E2E_POSTGRES_BIN / DOCKFLEET_E2E_ETCD_BIN)
+	$(GO) test -count=1 -tags e2e -timeout 20m -v ./internal/e2e/
+
 .PHONY: test-etcd
 test-etcd: ## Run the etcd tests: the election client and the managers' election against a real etcd (set DOCKFLEET_TEST_ETCD_ENDPOINTS, e.g. http://127.0.0.1:21234 after `make etcd-test-up`)
 	@test -n "$$DOCKFLEET_TEST_ETCD_ENDPOINTS" || { echo "set DOCKFLEET_TEST_ETCD_ENDPOINTS to an etcd, e.g. http://127.0.0.1:21234 after 'make etcd-test-up'"; exit 1; }
@@ -105,6 +112,27 @@ etcd-test-up: ## Start a disposable single-member etcd on 127.0.0.1:21234 for `m
 .PHONY: etcd-test-down
 etcd-test-down: ## Stop the disposable etcd and delete its data
 	$(ETCD_TEST_COMPOSE) down --volumes
+
+.PHONY: tidy-check
+tidy-check: ## Fail if go.mod or go.sum is not what `go mod tidy` would write
+	$(GO) mod tidy -diff
+
+.PHONY: cross-build
+cross-build: ## Compile the binaries for every released platform (static, CGO off)
+	@set -e; for p in $(RELEASE_PLATFORMS); do \
+		echo "build $$p"; \
+		for c in manager agent pki; do CGO_ENABLED=0 GOOS=$${p%/*} GOARCH=$${p#*/} $(GO) build -trimpath -o /dev/null ./cmd/$$c; done; \
+	done
+
+.PHONY: docker-build
+docker-build: ## Build the manager and agent images (needs a Docker daemon)
+	docker build --target manager --build-arg VERSION=$(VERSION) -t dockfleet-manager:$(VERSION) .
+	docker build --target agent --build-arg VERSION=$(VERSION) -t dockfleet-agent:$(VERSION) .
+
+.PHONY: vuln
+vuln: ## Fail on known vulnerabilities in code the binaries call, except the accepted ones listed in scripts/vuln-check.sh (needs network)
+	GOBIN=$(TOOLS_BIN) $(GO) install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)
+	scripts/vuln-check.sh ./...
 
 .PHONY: check-secrets
 check-secrets: ## Fail if a private key is tracked by git

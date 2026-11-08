@@ -61,6 +61,55 @@ func TestNodeHealthFollowsHowLongTheNodeHasBeenSilent(t *testing.T) {
 	}
 }
 
+type fakeOutages struct{ at time.Time }
+
+func (f *fakeOutages) Since() time.Time  { return f.at }
+func (f *fakeOutages) Mark(at time.Time) { f.at = at }
+
+// Silence the manager could not have heard, because its store was down, is not
+// counted: the node is judged from when the store came back, as it is from when
+// the manager began to watch.
+func TestSilenceDuringAStoreOutageIsNotCounted(t *testing.T) {
+	const suspect, gone = 30 * time.Second, 2 * time.Minute
+	node := store.Node{ID: "n", LastHeartbeat: epoch.Add(-time.Hour), RegisteredAt: epoch.Add(-2 * time.Hour)}
+	timing := func(outageEndedAgo time.Duration) Timing {
+		t := Timing{SuspectAfter: suspect, UnavailableAfter: gone, Outages: &fakeOutages{}}
+		if outageEndedAgo >= 0 {
+			t.Outages.Mark(epoch.Add(-outageEndedAgo))
+		}
+		return t
+	}
+	tests := []struct {
+		name   string
+		timing Timing
+		want   string
+	}{
+		{"no outage was seen: an hour of silence is an hour", timing(-1), store.NodeUnavailable},
+		{"the store failed a second ago", timing(time.Second), store.NodeHealthy},
+		{"and half a minute ago", timing(suspect), store.NodeHealthy},
+		{"and 31 s ago", timing(suspect + time.Second), store.NodeSuspect},
+		{"and two minutes ago", timing(gone), store.NodeSuspect},
+		{"and 121 s ago", timing(gone + time.Second), store.NodeUnavailable},
+		{"an outage that ended before the manager began to watch counts for nothing",
+			Timing{SuspectAfter: suspect, UnavailableAfter: gone, Since: epoch.Add(-time.Second), Outages: &fakeOutages{at: epoch.Add(-time.Hour)}}, store.NodeHealthy},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.timing.Health(node, epoch); got != tt.want {
+				t.Fatalf("Health = %q, want %q", got, tt.want)
+			}
+		})
+	}
+
+	// StoreFailed is how the loops tell the timing, and a timing without a record ignores it.
+	marked := &fakeOutages{}
+	Timing{Outages: marked}.StoreFailed(epoch)
+	if !marked.at.Equal(epoch) {
+		t.Errorf("StoreFailed did not reach the record: %v", marked.at)
+	}
+	Timing{}.StoreFailed(epoch) // must not panic
+}
+
 func TestLostNodesAreTheUnavailableOnes(t *testing.T) {
 	timing := Timing{SuspectAfter: 30 * time.Second, UnavailableAfter: 2 * time.Minute}
 	nodes := []store.Node{

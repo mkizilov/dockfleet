@@ -138,6 +138,18 @@ Restart policy and health check are per service.
 - `internal/registry`, `internal/protocol`, `internal/store`, `internal/api`, `internal/docker`: failure events, the lease and health on the wire, node health in both stores, node and service views, health check policy and Docker config.
 - `internal/integration/failure_test.go`: real agents and a real manager over gRPC with in-memory Docker engines. A crashed agent and the cleanup when it returns; a network partition in which the agent fences itself *before* the replacement is created (checked in one journal across both nodes); a brief partition that changes nothing; a long manager outage and the restart of the same containers; a container restarted up to its limit and then reported failed; an unhealthy container restarted.
 
+## When the manager restarts
+
+Silence from before a manager started is not counted, so a manager that was down or restarted does not mistake a node it could not hear for a dead one. After the restart the agents have to find it again: they retry registration with a wait that doubles from 1 s up to **30 s** (no jitter), so an agent can take up to half a minute to come back. `DOCKFLEET_NODE_UNAVAILABLE_AFTER` must therefore stay well above 30 s; the default of 2 minutes does. (Shorter values are only for tests.) A manager killed for longer than the give-up time and restarted is tested end to end with real agents: nothing is created, stopped or moved.
+
+## When the manager's own store is down
+
+A node is judged by how long it has been silent, and silence is the time since its last heartbeat was *recorded*. While the database is unreachable no heartbeat can be recorded, however many the agents send, so every node looks silent for the length of the outage. Without a remedy, the first pass after the database returned would have seen every node silent for longer than `DOCKFLEET_NODE_UNAVAILABLE_AFTER`, given up on all of them, and stopped and replaced every replica of the fleet.
+
+So the manager remembers when its store last failed (`internal/outage`: every failed scheduling or reconciliation pass, and every failed readiness check, marks the time) and, exactly as it does for the time before it started, **does not count silence from before that moment** (`scheduler.Timing.Outages`; the API, the scheduling pass and the reconciler share one record, so they agree). Agents have until the limit again, counted from the end of the outage, to be heard. A node that really died during the outage is found out after that. Tested at four levels: a table for the timing, a reconciliation test with a control run that shows the mass failover without the record, and an end-to-end test that crashes PostgreSQL under the running binaries for longer than the limit (it fails without the fix and passes with it).
+
+The manager's `/healthz` does not depend on the database, so a supervisor does not restart a manager that is only waiting for it; `/readyz` does, and says `store unavailable`.
+
 ## Limitations
 
 - A node that is gone for good keeps its stopped workloads on record; there is no way to delete the node yet.

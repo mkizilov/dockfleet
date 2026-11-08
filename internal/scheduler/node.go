@@ -38,6 +38,37 @@ type Timing struct {
 	// not counted: a manager that was down cannot tell a dead node from one that
 	// had nobody to talk to. Zero means no limit.
 	Since time.Time
+	// Outages, when set, is told when the manager could not use its store, and
+	// silence from before the latest such time is not counted either: a heartbeat
+	// cannot be recorded while the store is down, so every node would look silent
+	// for the whole outage and the fleet would be failed over when the store came
+	// back. Nil counts all silence after Since.
+	Outages Outages
+}
+
+// Outages remembers when the manager's store last failed. *outage.Tracker
+// implements it.
+type Outages interface {
+	// Since is the time of the latest failure, or the zero time.
+	Since() time.Time
+	// Mark records a failure at the given time.
+	Mark(at time.Time)
+}
+
+// watchedFrom is the moment from which silence counts.
+func (t Timing) watchedFrom() time.Time {
+	if t.Outages == nil {
+		return t.Since
+	}
+	return max2(t.Since, t.Outages.Since())
+}
+
+// StoreFailed tells the timing that the store could not be used at the given
+// time (see Outages). It does nothing without an Outages.
+func (t Timing) StoreFailed(at time.Time) {
+	if t.Outages != nil {
+		t.Outages.Mark(at)
+	}
 }
 
 // lastContact is when the node was last known to be alive: its last heartbeat,
@@ -59,7 +90,7 @@ func (t Timing) Health(n store.Node, now time.Time) string {
 	if t.SuspectAfter <= 0 && t.UnavailableAfter <= 0 {
 		return store.NodeHealthy // the zero value does not track health
 	}
-	silence := now.Sub(max2(lastContact(n), t.Since))
+	silence := now.Sub(max2(lastContact(n), t.watchedFrom()))
 	left := n.LastHeartbeat.IsZero() || n.LastHeartbeat.Year() <= 1
 	switch {
 	case t.UnavailableAfter > 0 && silence > t.UnavailableAfter:

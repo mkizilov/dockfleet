@@ -137,6 +137,8 @@ These hold with the configuration validated above. Each is checked by tests (see
 
 ## Deploying
 
+The full multi-machine guide, with certificates, credentials as files and health checks, is [deployment.md](deployment.md#7-high-availability-optional); in short:
+
 1. Run etcd (three or five members in production; `make etcd-test-up` is a disposable single member for tests only, loopback and plaintext).
 2. Give each manager the same `DOCKFLEET_DATABASE_URL`, `DOCKFLEET_ETCD_ENDPOINTS`, `DOCKFLEET_ETCD_PREFIX` and tokens or certificates, and its own `DOCKFLEET_INSTANCE_ID` and listen addresses. Migrations are applied by whichever manager starts first (migration 012 adds `control_plane`).
 3. Upgrade agents, then set `DOCKFLEET_MANAGER_ADDRS` on them to all manager gRPC addresses.

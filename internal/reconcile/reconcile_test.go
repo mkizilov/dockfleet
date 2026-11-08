@@ -316,6 +316,7 @@ var reconcileTests = []reconcileTest{
 	{"repeating a pass changes nothing", testPassesAreIdempotent},
 	{"a failed pass saves nothing", testFailedPassIsRolledBack},
 	{"a leader that was replaced changes nothing", testReplacedLeaderChangesNothing},
+	{"a store outage is not held against the nodes", testAStoreOutageIsNotHeldAgainstTheNodes},
 	{"the loop retires replicas and stops", testRunLoop},
 	{"the observer is told of a failed rollout once it is saved", testObserverIsToldOfAFailedRolloutOnceItIsSaved},
 	{"the observer sees every pass of the loop", testObserverSeesEveryPassOfTheLoop},

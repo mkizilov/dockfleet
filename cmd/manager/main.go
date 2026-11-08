@@ -12,6 +12,7 @@ import (
 
 	"github.com/dockfleet/dockfleet/internal/config"
 	"github.com/dockfleet/dockfleet/internal/etcd"
+	"github.com/dockfleet/dockfleet/internal/healthcheck"
 	"github.com/dockfleet/dockfleet/internal/logging"
 	"github.com/dockfleet/dockfleet/internal/manager"
 	"github.com/dockfleet/dockfleet/internal/pki"
@@ -20,10 +21,38 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 {
+		if os.Args[1] == "healthcheck" && len(os.Args) == 2 {
+			if err := probeHealth(); err != nil {
+				fmt.Fprintln(os.Stderr, "dockfleet-manager: unhealthy:", err)
+				os.Exit(1)
+			}
+			return
+		}
+		fmt.Fprintln(os.Stderr, "usage: dockfleet-manager [healthcheck]")
+		os.Exit(2)
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "dockfleet-manager:", err)
 		os.Exit(1)
 	}
+}
+
+// probeHealth is `dockfleet-manager healthcheck`, the HEALTHCHECK of the image:
+// it asks the manager's own /readyz, which is ready while the manager can reach
+// its store. Over TLS it trusts the certificate the manager itself serves
+// (DOCKFLEET_TLS_CERT_FILE) and nothing else, and sends no credential.
+func probeHealth() error {
+	addr := os.Getenv("DOCKFLEET_API_ADDR")
+	if addr == "" {
+		addr = config.DefaultAPIAddr
+	}
+	certFile := os.Getenv("DOCKFLEET_TLS_CERT_FILE")
+	url, err := healthcheck.URLFor(addr, certFile != "", "/readyz")
+	if err != nil {
+		return err
+	}
+	return healthcheck.Probe{URL: url, CertFile: certFile, ServerName: os.Getenv("DOCKFLEET_HEALTHCHECK_SERVER_NAME")}.Run(context.Background())
 }
 
 func run() error {

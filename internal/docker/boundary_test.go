@@ -3,6 +3,7 @@ package docker
 import (
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -67,7 +68,7 @@ func isDockerPackage(path string) bool {
 // talks to its local Docker Engine.
 func TestManagerSideNeverImportsDocker(t *testing.T) {
 	root := filepath.Join("..", "..")
-	for _, entry := range []string{"cmd/manager", "internal/manager", "internal/api", "internal/registry", "internal/store", "internal/scheduler", "internal/placement", "internal/reconcile", "internal/rollout", "internal/logstream", "internal/metrics", "internal/dashboard", "internal/election", "internal/etcd", "internal/protocol"} {
+	for _, entry := range []string{"cmd/manager", "internal/manager", "internal/api", "internal/registry", "internal/store", "internal/scheduler", "internal/placement", "internal/reconcile", "internal/rollout", "internal/logstream", "internal/metrics", "internal/dashboard", "internal/election", "internal/etcd", "internal/outage", "internal/healthcheck", "internal/protocol"} {
 		for path, chain := range importChains(t, root, filepath.Join(root, filepath.FromSlash(entry))) {
 			if isDockerPackage(path) {
 				t.Errorf("%s imports %s (via %s): the manager side must not depend on Docker", entry, path, strings.Join(chain, " -> "))
@@ -111,19 +112,50 @@ func TestOnlySDKFileUsesTheDockerSDK(t *testing.T) {
 	}
 }
 
+// The Docker socket is root on the machine it is on. No deployment file hands it
+// to a service: not a Compose file, not an environment file. The only files under
+// deploy/ that may name it are the ones that belong to the agent itself, which is
+// the one process that must talk to the engine: its systemd unit (the agent runs
+// as its own user, in the docker group, in a sandbox) and its example settings
+// (DOCKFLEET_DOCKER_HOST). Test sources are not deployment files.
 func TestDeploymentFilesNeverMountTheDockerSocket(t *testing.T) {
-	root := filepath.Join("..", "..")
-	entries, err := filepath.Glob(filepath.Join(root, "deploy", "*"))
+	root := filepath.Join("..", "..", "deploy")
+	agentOwned := map[string]bool{
+		filepath.Join("examples", "systemd", "dockfleet-agent.service"): true,
+		filepath.Join("examples", "worker.env.example"):                 true,
+		filepath.Join("examples", "README.md"):                          true, // explains why there is no Compose file for the agent
+	}
+	scanned := 0
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(root, path)
+		if d.IsDir() || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		scanned++
+		if strings.Contains(string(data), "docker.sock") && !agentOwned[rel] {
+			t.Errorf("deploy/%s mentions docker.sock; no deployment file may hand the Docker socket to a service", rel)
+		}
+		return nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, file := range entries {
-		data, err := os.ReadFile(file)
-		if err != nil {
-			continue
-		}
-		if strings.Contains(string(data), "docker.sock") {
-			t.Errorf("%s mentions docker.sock; no deployment file may hand the Docker socket to a service", file)
-		}
+	if scanned < 8 {
+		t.Fatalf("scanned only %d deployment files; the test is not looking at deploy/", scanned)
+	}
+	// The files that may name it really are the agent's.
+	manager, err := os.ReadFile(filepath.Join(root, "examples", "compose.manager.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(manager), "docker.sock") {
+		t.Error("the manager's Compose file names the Docker socket")
 	}
 }

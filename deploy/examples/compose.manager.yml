@@ -1,0 +1,59 @@
+name: dockfleet-manager
+
+# One manager. Run one of these on each control-plane host; with etcd configured
+# (see manager.env.example) several of them form a high-availability cluster.
+# PostgreSQL (and etcd, for high availability) are not started here: they are
+# the state of your fleet, and belong on infrastructure you back up and monitor.
+#
+#   docker build --target manager -t dockfleet-manager:local .
+#   mkdir -p secrets && install -m 0400 /dev/null secrets/api_token   # then fill in
+#   docker compose -f deploy/examples/compose.manager.yml up -d
+#
+# Credentials are Compose secrets: files mounted read-only at /run/secrets, named
+# by the *_FILE variables in manager.env. Nothing secret is in this file or in the environment.
+services:
+  manager:
+    image: ${DOCKFLEET_MANAGER_IMAGE:-dockfleet-manager:local}
+    env_file:
+      - ./manager.env
+    # TLS material is read from here and re-read when it is renewed.
+    volumes:
+      - type: bind
+        source: ./tls
+        target: /etc/dockfleet/tls
+        read_only: true
+    secrets:
+      - dockfleet_api_token
+      - dockfleet_database_url
+    ports:
+      # The admin API and the agents' port. Publish them on an address your
+      # administrators and your workers can reach, never on 0.0.0.0 of a
+      # public interface without a firewall; TLS is required either way.
+      - "${DOCKFLEET_PUBLISH_ADDR:-127.0.0.1}:21280:21280"
+      - "${DOCKFLEET_PUBLISH_ADDR:-127.0.0.1}:21281:21281"
+    restart: unless-stopped
+    stop_grace_period: 20s          # DOCKFLEET_SHUTDOWN_TIMEOUT (15s) plus a margin
+    read_only: true
+    user: "65532:65532"
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 512m
+    healthcheck:                    # the same as the image's HEALTHCHECK, so it is visible here
+      test: ["CMD", "/usr/local/bin/dockfleet-manager", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+secrets:
+  dockfleet_api_token:
+    file: ./secrets/api_token
+  dockfleet_database_url:
+    file: ./secrets/database_url

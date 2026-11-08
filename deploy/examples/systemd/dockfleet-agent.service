@@ -1,0 +1,58 @@
+# /etc/systemd/system/dockfleet-agent.service
+#
+# The agent on a worker node. It needs the node's Docker Engine socket, which is
+# what the docker group grants: that is access to the node, so the agent runs as
+# its own user, in that one group, with nothing else. The agent's TLS identity is
+# read from /etc/dockfleet/tls (the private key belongs to the agent's user, mode
+# 0600), so a renewed certificate is picked up without a restart.
+[Unit]
+Description=DockFleet agent
+Documentation=https://github.com/dockfleet/dockfleet/blob/main/docs/deployment.md
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=exec
+User=dockfleet-agent
+Group=dockfleet-agent
+SupplementaryGroups=docker
+EnvironmentFile=/etc/dockfleet/worker.env
+ExecStart=/usr/local/bin/dockfleet-agent
+Restart=on-failure
+RestartSec=2s
+# The agent leaves the containers it started running when it stops, so the next
+# agent adopts them: a restart of the agent does not restart the workloads.
+TimeoutStopSec=20s
+
+# Sandbox. The agent writes nothing to disk; it talks to the managers and to the engine's socket.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# A call the filter blocks fails with EPERM instead of killing the process.
+SystemCallErrorNumber=EPERM
+UMask=0077
+ReadOnlyPaths=/etc/dockfleet
+ReadWritePaths=/var/run/docker.sock
+
+[Install]
+WantedBy=multi-user.target

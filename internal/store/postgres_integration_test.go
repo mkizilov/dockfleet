@@ -476,3 +476,149 @@ func TestPostgresQueriesUseIndexes(t *testing.T) {
 		})
 	}
 }
+
+// schemaOf describes a database's schema in a form that can be compared: every
+// column, index and constraint, in a fixed order. Where a migration ran from
+// (an empty database, or the one before it) must not show in the result.
+func schemaOf(t *testing.T, p *Postgres) string {
+	t.Helper()
+	ctx := context.Background()
+	var b strings.Builder
+	for _, q := range []string{
+		`SELECT table_name || '.' || column_name || ' ' || data_type || ' null=' || is_nullable || ' default=' || coalesce(column_default, '')
+		   FROM information_schema.columns WHERE table_schema = 'public' ORDER BY table_name, column_name`,
+		`SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' ORDER BY indexname`,
+		`SELECT conrelid::regclass::text || ' ' || conname || ' ' || pg_get_constraintdef(oid)
+		   FROM pg_constraint WHERE connamespace = 'public'::regnamespace ORDER BY conrelid::regclass::text, conname`,
+	} {
+		rows, err := p.pool.Query(ctx, q)
+		noErr(t, err)
+		for rows.Next() {
+			var line string
+			noErr(t, rows.Scan(&line))
+			b.WriteString(line + "\n")
+		}
+		noErr(t, rows.Err())
+		rows.Close()
+		b.WriteString("--\n")
+	}
+	return b.String()
+}
+
+// A database reaches the current schema by the same road from wherever it
+// started: from nothing, or from the state after any earlier release's last
+// migration. A migration that only works on an empty database, or only on top of
+// the one before it, fails here.
+func TestPostgresEveryUpgradePathEndsInTheSameSchema(t *testing.T) {
+	ctx := context.Background()
+	all, err := loadMigrations(migrationFS, "migrations")
+	noErr(t, err)
+	if len(all) < 12 {
+		t.Fatalf("only %d migrations; the test is not looking at the real ones", len(all))
+	}
+
+	fresh, _ := migratedStore(t)
+	want := schemaOf(t, fresh)
+	for _, must := range []string{"control_plane.epoch", "rollouts.state", "unschedulable_replicas.code", "workloads.generation", "nodes.health"} {
+		if !strings.Contains(want, must) {
+			t.Fatalf("the schema lacks %s:\n%s", must, want)
+		}
+	}
+
+	for k := 1; k < len(all); k++ {
+		url := newIsolatedDatabase(t)
+		p := openStore(t, url)
+		noErr(t, applyMigrations(ctx, p.pool, all[:k]))
+		noErr(t, p.Migrate(ctx))
+		if got := schemaOf(t, p); got != want {
+			t.Errorf("a database that began at %s differs from a fresh one:\n%s", all[k-1].name, firstDifference(want, got))
+		}
+		// And what upgrading recorded is the same as what a fresh database recorded.
+		var n int
+		noErr(t, p.pool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations`).Scan(&n))
+		if n != len(all) {
+			t.Errorf("from %s: %d migrations recorded, want %d", all[k-1].name, n, len(all))
+		}
+	}
+}
+
+func firstDifference(want, got string) string {
+	w, g := strings.Split(want, "\n"), strings.Split(got, "\n")
+	for i := 0; i < len(w) || i < len(g); i++ {
+		var a, b string
+		if i < len(w) {
+			a = w[i]
+		}
+		if i < len(g) {
+			b = g[i]
+		}
+		if a != b {
+			return "fresh:    " + a + "\nupgraded: " + b
+		}
+	}
+	return ""
+}
+
+// Managers that start together (a rolling restart, a cluster brought up at once)
+// all call Migrate on the same new database; each migration is applied exactly
+// once, nobody fails, and everybody ends up on the same schema.
+func TestPostgresManagersStartingTogetherMigrateOnce(t *testing.T) {
+	ctx := context.Background()
+	url := newIsolatedDatabase(t)
+	all, err := loadMigrations(migrationFS, "migrations")
+	noErr(t, err)
+
+	const managers = 8
+	stores := make([]*Postgres, managers)
+	for i := range stores {
+		stores[i] = openStore(t, url)
+	}
+	var wg sync.WaitGroup
+	errs := make([]error, managers)
+	start := make(chan struct{})
+	for i := range stores {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs[i] = stores[i].Migrate(ctx)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("manager %d: %v", i, err)
+		}
+	}
+	var n, distinct int
+	noErr(t, stores[0].pool.QueryRow(ctx, `SELECT count(*), count(DISTINCT version) FROM schema_migrations`).Scan(&n, &distinct))
+	if n != len(all) || distinct != len(all) {
+		t.Fatalf("%d rows for %d distinct versions after %d managers migrated at once, want %d of each", n, distinct, managers, len(all))
+	}
+	// The schema works: the singleton row of the fencing record exists exactly once.
+	var rows int
+	noErr(t, stores[0].pool.QueryRow(ctx, `SELECT count(*) FROM control_plane`).Scan(&rows))
+	if rows != 1 {
+		t.Fatalf("control_plane has %d rows, want 1", rows)
+	}
+}
+
+// A manager older than the schema must refuse to start rather than run on
+// tables it does not understand, and say what to do.
+func TestPostgresOlderManagerRefusesANewerSchema(t *testing.T) {
+	p, _ := migratedStore(t)
+	ctx := context.Background()
+	_, err := p.pool.Exec(ctx, `INSERT INTO schema_migrations (version, checksum) VALUES ('013_from_a_newer_release.sql', 'x')`)
+	noErr(t, err)
+	err = p.Migrate(ctx)
+	if err == nil || !strings.Contains(err.Error(), "does not know") || !strings.Contains(err.Error(), "upgrade") {
+		t.Fatalf("Migrate against a newer schema = %v; want a refusal that says to upgrade this manager", err)
+	}
+	// Nothing was changed by the refusal.
+	var n int
+	noErr(t, p.pool.QueryRow(ctx, `SELECT count(*) FROM schema_migrations WHERE version = '013_from_a_newer_release.sql'`).Scan(&n))
+	if n != 1 {
+		t.Fatal("the refusal removed the newer migration's record")
+	}
+}

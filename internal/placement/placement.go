@@ -395,6 +395,8 @@ func (s *Scheduler) pass(ctx context.Context) {
 	case err != nil && ctx.Err() != nil:
 		// Shutting down; nothing was saved.
 	case err != nil:
+		// Most likely the store: a node's silence while it could not be used is not held against it.
+		s.cfg.Timing.StoreFailed(s.cfg.Now())
 		s.cfg.Logger.Error("scheduling pass failed", "error", err)
 	case report.Placed > 0 || report.NewReasons > 0:
 		s.cfg.Logger.Info("scheduling pass", "placed", report.Placed, "unschedulable", report.Unschedulable, "new_reasons", report.NewReasons)

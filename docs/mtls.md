@@ -68,6 +68,8 @@ dockfleet-pki inspect pki/manager.pem pki/agents/worker-1/agent.pem
 
 ## Distributing credentials to worker machines
 
+(For production, [credentials.md](credentials.md) covers the whole life of every secret: making them, handing them to the process as files, rotating them, and what to do when one is lost. [deployment.md](deployment.md) puts it in order.)
+
 What each machine needs, and what must never leave the CA host:
 
 | File | Where | Secret? |

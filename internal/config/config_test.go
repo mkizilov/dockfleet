@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -668,5 +670,147 @@ func TestLoadAgentManagerAddresses(t *testing.T) {
 	tls["DOCKFLEET_MANAGER_ADDRS"] = "manager-1.example.com:21281,manager-2.example.com:21281"
 	if c, err := LoadAgent(getenv(tls)); err != nil || len(c.ManagerAddrs) != 2 {
 		t.Errorf("remote managers with mutual TLS = %+v, %v", c.ManagerAddrs, err)
+	}
+}
+
+// writeSecret writes a credential file the way Docker, Kubernetes or systemd
+// would deliver it.
+func writeSecret(t *testing.T, name, content string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(p, []byte(content), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestCredentialsCanComeFromFiles(t *testing.T) {
+	vars := map[string]string{
+		"DOCKFLEET_API_TOKEN_FILE":    writeSecret(t, "api", "api-token-from-a-file-0123\n"),
+		"DOCKFLEET_AGENT_TOKEN_FILE":  writeSecret(t, "agent", "  agent-token-from-a-file-0123 \r\n\n"),
+		"DOCKFLEET_DATABASE_URL_FILE": writeSecret(t, "db", "postgres://u:p@127.0.0.1:5432/db\n"),
+	}
+	c, err := LoadManager(getenv(vars))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.APIToken != "api-token-from-a-file-0123" || c.AgentToken != "agent-token-from-a-file-0123" || c.DatabaseURL != "postgres://u:p@127.0.0.1:5432/db" {
+		t.Fatalf("credentials = %q %q %q; whitespace around a file's content is not part of it", c.APIToken, c.AgentToken, c.DatabaseURL)
+	}
+
+	a, err := LoadAgent(getenv(map[string]string{"DOCKFLEET_AGENT_TOKEN_FILE": vars["DOCKFLEET_AGENT_TOKEN_FILE"], "DOCKFLEET_NODE_ID": "node-1"}))
+	if err != nil || a.Token != "agent-token-from-a-file-0123" {
+		t.Fatalf("agent token = %q, %v", a.Token, err)
+	}
+
+	// The variable alone still works, as before.
+	if c, err := LoadManager(getenv(managerEnv())); err != nil || c.APIToken != "api-token-0123456789" {
+		t.Fatalf("credentials from the environment = %+v, %v", c, err)
+	}
+}
+
+func TestCredentialFilesAreChecked(t *testing.T) {
+	dir := t.TempDir()
+	link := filepath.Join(dir, "link")
+	target := writeSecret(t, "target", "api-token-via-a-symlink-0123")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := LoadManager(getenv(withFiles(managerEnv(), "DOCKFLEET_API_TOKEN", link))); err != nil || c.APIToken != "api-token-via-a-symlink-0123" {
+		t.Fatalf("a symlink to a secret (how Kubernetes mounts them) = %q, %v", c.APIToken, err)
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(map[string]string)
+		wantErr string
+	}{
+		{"both the variable and the file", func(m map[string]string) { m["DOCKFLEET_API_TOKEN_FILE"] = target }, "both set"},
+		{"a relative path", func(m map[string]string) {
+			delete(m, "DOCKFLEET_API_TOKEN")
+			m["DOCKFLEET_API_TOKEN_FILE"] = "secrets/api"
+		}, "absolute"},
+		{"a missing file", func(m map[string]string) {
+			delete(m, "DOCKFLEET_API_TOKEN")
+			m["DOCKFLEET_API_TOKEN_FILE"] = filepath.Join(dir, "missing")
+		}, "DOCKFLEET_API_TOKEN_FILE"},
+		{"a directory", func(m map[string]string) { delete(m, "DOCKFLEET_API_TOKEN"); m["DOCKFLEET_API_TOKEN_FILE"] = dir }, "not a regular file"},
+		{"an empty file", func(m map[string]string) {
+			delete(m, "DOCKFLEET_API_TOKEN")
+			m["DOCKFLEET_API_TOKEN_FILE"] = writeSecret(t, "empty", " \n")
+		}, "is empty"},
+		{"a file too large to be a credential", func(m map[string]string) {
+			delete(m, "DOCKFLEET_API_TOKEN")
+			m["DOCKFLEET_API_TOKEN_FILE"] = writeSecret(t, "big", strings.Repeat("x", maxSecretFile+1))
+		}, "larger than"},
+		{"a token from a file that is too short", func(m map[string]string) {
+			delete(m, "DOCKFLEET_API_TOKEN")
+			m["DOCKFLEET_API_TOKEN_FILE"] = writeSecret(t, "short", "short")
+		}, "at least"},
+		{"the same token for both roles", func(m map[string]string) {
+			delete(m, "DOCKFLEET_API_TOKEN")
+			delete(m, "DOCKFLEET_AGENT_TOKEN")
+			m["DOCKFLEET_API_TOKEN_FILE"] = target
+			m["DOCKFLEET_AGENT_TOKEN_FILE"] = target
+		}, "must differ"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vars := managerEnv()
+			tt.mutate(vars)
+			_, err := LoadManager(getenv(vars))
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want one mentioning %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// The error for a bad credential file names the file and never what it holds.
+func TestCredentialFileErrorsDoNotLeakTheContent(t *testing.T) {
+	const leak = "super-secret-value-must-not-appear-0123456789"
+	vars := managerEnv()
+	delete(vars, "DOCKFLEET_API_TOKEN")
+	vars["DOCKFLEET_API_TOKEN_FILE"] = writeSecret(t, "tooshort", leak[:10])
+	vars["DOCKFLEET_AGENT_TOKEN_FILE"] = writeSecret(t, "agent", leak)
+	delete(vars, "DOCKFLEET_AGENT_TOKEN")
+	vars["DOCKFLEET_AGENT_TOKEN"] = leak // and one in the variable, together with its file
+	_, err := LoadManager(getenv(vars))
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), leak) || strings.Contains(err.Error(), leak[:10]) {
+		t.Fatalf("the error shows a credential: %v", err)
+	}
+}
+
+func withFiles(m map[string]string, name, file string) map[string]string {
+	delete(m, name)
+	m[name+"_FILE"] = file
+	return m
+}
+
+func TestAgentHealthAddress(t *testing.T) {
+	for _, tt := range []struct{ value, want string }{
+		{"", DefaultAgentHealthAddr},
+		{"  ", DefaultAgentHealthAddr},
+		{"127.0.0.1:21290", "127.0.0.1:21290"},
+		{"[::1]:21290", "[::1]:21290"},
+		{"off", ""},
+	} {
+		vars := agentEnv()
+		vars["DOCKFLEET_HEALTH_ADDR"] = tt.value
+		c, err := LoadAgent(getenv(vars))
+		if err != nil || c.HealthAddr != tt.want || AgentHealthAddr(getenv(vars)) != tt.want {
+			t.Errorf("DOCKFLEET_HEALTH_ADDR=%q: HealthAddr = %q, %v; want %q", tt.value, c.HealthAddr, err, tt.want)
+		}
+	}
+	// The endpoint is for the machine the agent runs on: it is never opened to the network.
+	for _, bad := range []string{"0.0.0.0:21282", ":21282", "10.0.0.5:21282", "example.com:21282", "[::]:21282"} {
+		vars := agentEnv()
+		vars["DOCKFLEET_HEALTH_ADDR"] = bad
+		if _, err := LoadAgent(getenv(vars)); err == nil || !strings.Contains(err.Error(), "DOCKFLEET_HEALTH_ADDR") {
+			t.Errorf("DOCKFLEET_HEALTH_ADDR=%q: error = %v, want it refused", bad, err)
+		}
 	}
 }

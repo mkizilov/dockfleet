@@ -207,12 +207,23 @@ func (r *runner) now() time.Time { return r.cfg.Now() }
 // status carries the assignment's generation. Until the first call the runner
 // does nothing at all, so an agent that has not yet heard from the manager
 // never removes a container.
+//
+// An assignment older than the one in force for the same workload is ignored: a
+// workload's generation only grows, so a lower one is an instruction that was
+// overtaken (from a manager that restarted from an older backup of the database,
+// say) and obeying it would undo what was decided since.
 func (r *runner) Assign(assigned []*dockfleetv1.WorkloadAssignment) {
+	r.mu.Lock()
 	desired := make(map[string]*dockfleetv1.WorkloadAssignment, len(assigned))
 	for _, a := range assigned {
-		desired[a.GetWorkloadId()] = a
+		id := a.GetWorkloadId()
+		if cur, ok := r.assigned[id]; ok && cur.GetGeneration() > a.GetGeneration() {
+			r.log.Warn("ignoring an assignment older than the one in force", "workload_id", id, "generation", a.GetGeneration(), "in_force", cur.GetGeneration())
+			desired[id] = cur
+			continue
+		}
+		desired[id] = a
 	}
-	r.mu.Lock()
 	r.assigned, r.heard = desired, true
 	for id, a := range desired {
 		st, known := r.statuses[id]
