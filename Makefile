@@ -48,7 +48,10 @@ proto: ## Generate Go code from proto/ (required before build and test)
 	$(TOOLS_BIN)/buf generate proto
 
 .PHONY: generate
-generate: tools proto-lint proto ## One-shot reproducible bindings: pinned tools, lint, generate
+generate: ## One-shot reproducible bindings: pinned tools, lint, generate (in this order, also under `make -j`)
+	$(MAKE) tools
+	$(MAKE) proto-lint
+	$(MAKE) proto
 
 .PHONY: proto-lint
 proto-lint: ## Lint the protobuf definitions

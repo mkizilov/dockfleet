@@ -35,3 +35,26 @@ func TestRecipesNameInstalledToolsByPath(t *testing.T) {
 		t.Fatalf("looked at only %d recipe lines; the test is not reading the Makefile", seen)
 	}
 }
+
+// Prerequisites of a target may run at the same time under `make -j` (and
+// MAKEFLAGS=-j2 is how a worker limit is usually set), so steps that must happen
+// in order belong in the recipe. `generate` installs the generators, lints and
+// then generates; as three prerequisites, the lint raced the installation.
+func TestGenerateRunsItsStepsInOrderEvenUnderParallelMake(t *testing.T) {
+	text := read(t, "Makefile")
+	rule := regexp.MustCompile(`(?m)^generate:([^\n]*)\n((?:\t[^\n]*\n)+)`).FindStringSubmatch(text)
+	if rule == nil {
+		t.Fatal("the Makefile has no generate target with a recipe")
+	}
+	if prereqs := strings.TrimSpace(strings.SplitN(rule[1], "##", 2)[0]); prereqs != "" {
+		t.Errorf("generate lists prerequisites %q; they run concurrently under `make -j`, so its steps must be in the recipe", prereqs)
+	}
+	var steps []string
+	for _, line := range strings.Split(strings.TrimSpace(rule[2]), "\n") {
+		steps = append(steps, strings.TrimSpace(line))
+	}
+	want := []string{"$(MAKE) tools", "$(MAKE) proto-lint", "$(MAKE) proto"}
+	if strings.Join(steps, "|") != strings.Join(want, "|") {
+		t.Errorf("generate runs %q, want %q in this order", steps, want)
+	}
+}
