@@ -48,6 +48,11 @@ func TestLoadManagerRejectsInsecureOrInvalid(t *testing.T) {
 		{"public bind without tls", func(m map[string]string) { m["DOCKFLEET_API_ADDR"] = "0.0.0.0:8080" }, "loopback"},
 		{"empty host bind without tls", func(m map[string]string) { m["DOCKFLEET_GRPC_ADDR"] = ":9000" }, "loopback"},
 		{"cert without key", func(m map[string]string) { m["DOCKFLEET_TLS_CERT_FILE"] = "c.pem" }, "set together"},
+		{"tls without client ca", func(m map[string]string) {
+			m["DOCKFLEET_TLS_CERT_FILE"], m["DOCKFLEET_TLS_KEY_FILE"] = "c.pem", "k.pem"
+		}, "no mode without client certificates"},
+		{"client ca alone", func(m map[string]string) { m["DOCKFLEET_TLS_CLIENT_CA_FILE"] = "ca.pem" }, "set together"},
+		{"public bind names mutual tls", func(m map[string]string) { m["DOCKFLEET_GRPC_ADDR"] = "0.0.0.0:9000" }, "mutual TLS"},
 		{"bad duration", func(m map[string]string) { m["DOCKFLEET_NODE_TTL"] = "soon" }, "DOCKFLEET_NODE_TTL"},
 		{"ttl too small", func(m map[string]string) { m["DOCKFLEET_NODE_TTL"] = "15s" }, "twice"},
 		{"bad request timeout", func(m map[string]string) { m["DOCKFLEET_REQUEST_TIMEOUT"] = "0s" }, "DOCKFLEET_REQUEST_TIMEOUT"},
@@ -78,15 +83,45 @@ func TestLoadManagerErrorsDoNotLeakSecrets(t *testing.T) {
 	}
 }
 
-func TestLoadManagerAllowsPublicBindWithTLSAndMemoryStore(t *testing.T) {
+func tlsManagerEnv() map[string]string {
 	vars := managerEnv()
 	delete(vars, "DOCKFLEET_DATABASE_URL")
+	delete(vars, "DOCKFLEET_AGENT_TOKEN")
 	vars["DOCKFLEET_STORE"] = "memory"
-	vars["DOCKFLEET_API_ADDR"] = "0.0.0.0:8443"
 	vars["DOCKFLEET_TLS_CERT_FILE"] = "c.pem"
 	vars["DOCKFLEET_TLS_KEY_FILE"] = "k.pem"
-	if _, err := LoadManager(getenv(vars)); err != nil {
+	vars["DOCKFLEET_TLS_CLIENT_CA_FILE"] = "ca.pem"
+	return vars
+}
+
+func TestLoadManagerAllowsPublicBindWithMutualTLS(t *testing.T) {
+	vars := tlsManagerEnv()
+	vars["DOCKFLEET_API_ADDR"] = "0.0.0.0:8443"
+	vars["DOCKFLEET_GRPC_ADDR"] = "0.0.0.0:9443"
+	c, err := LoadManager(getenv(vars))
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !c.TLSEnabled() || c.TLSClientCAFile != "ca.pem" {
+		t.Errorf("unexpected TLS settings: %+v", c)
+	}
+}
+
+func TestLoadManagerStillRequiresTheAdminTokenWithTLS(t *testing.T) {
+	vars := tlsManagerEnv()
+	delete(vars, "DOCKFLEET_API_TOKEN")
+	if _, err := LoadManager(getenv(vars)); err == nil || !strings.Contains(err.Error(), "DOCKFLEET_API_TOKEN") {
+		t.Fatalf("error = %v, want the admin token to stay mandatory", err)
+	}
+}
+
+func TestLoadManagerWithoutTLSIsPlaintextOnLoopback(t *testing.T) {
+	c, err := LoadManager(getenv(managerEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.TLSEnabled() {
+		t.Error("TLS must be off by default")
 	}
 }
 
@@ -145,11 +180,45 @@ func TestLoadAgentRejectsInvalid(t *testing.T) {
 	}
 }
 
-func TestLoadAgentRemoteManagerWithCA(t *testing.T) {
+func TestLoadAgentRemoteManagerWithMutualTLS(t *testing.T) {
 	vars := agentEnv()
+	delete(vars, "DOCKFLEET_AGENT_TOKEN")
 	vars["DOCKFLEET_MANAGER_ADDR"] = "manager.example.com:443"
 	vars["DOCKFLEET_TLS_CA_FILE"] = "ca.pem"
-	if _, err := LoadAgent(getenv(vars)); err != nil {
+	vars["DOCKFLEET_TLS_CERT_FILE"] = "agent.pem"
+	vars["DOCKFLEET_TLS_KEY_FILE"] = "agent.key"
+	vars["DOCKFLEET_TLS_SERVER_NAME"] = "manager.example.com"
+	c, err := LoadAgent(getenv(vars))
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !c.TLSEnabled() || c.TLSCertFile != "agent.pem" || c.TLSKeyFile != "agent.key" || c.TLSServerName != "manager.example.com" {
+		t.Errorf("unexpected TLS settings: %+v", c)
+	}
+}
+
+func TestLoadAgentTLSNeedsAllThreeFiles(t *testing.T) {
+	for _, set := range [][]string{
+		{"DOCKFLEET_TLS_CA_FILE"},
+		{"DOCKFLEET_TLS_CERT_FILE"},
+		{"DOCKFLEET_TLS_CA_FILE", "DOCKFLEET_TLS_CERT_FILE"},
+		{"DOCKFLEET_TLS_CERT_FILE", "DOCKFLEET_TLS_KEY_FILE"},
+	} {
+		vars := agentEnv()
+		for _, k := range set {
+			vars[k] = "x.pem"
+		}
+		if _, err := LoadAgent(getenv(vars)); err == nil || !strings.Contains(err.Error(), "set together") {
+			t.Errorf("%v: error = %v, want a 'set together' error", set, err)
+		}
+	}
+}
+
+func TestLoadAgentRemoteManagerNeverFallsBackToPlaintext(t *testing.T) {
+	vars := agentEnv()
+	vars["DOCKFLEET_MANAGER_ADDR"] = "manager.example.com:443"
+	_, err := LoadAgent(getenv(vars))
+	if err == nil || !strings.Contains(err.Error(), "plaintext is never used") {
+		t.Fatalf("error = %v, want a refusal of plaintext to a remote manager", err)
 	}
 }

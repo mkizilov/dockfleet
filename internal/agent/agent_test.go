@@ -217,6 +217,55 @@ func TestRunStopsOnPermanentRegistrationErrors(t *testing.T) {
 	}
 }
 
+func TestRunRetriesUntilTheNodeIsEnrolled(t *testing.T) {
+	notEnrolled := &protocol.Error{Code: dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_ENROLLED, Message: "ask an administrator"}
+	m := &fakeManager{interval: 2 * time.Millisecond, registerErrs: []error{notEnrolled, notEnrolled, notEnrolled}}
+	r := start(t, newTestAgent(m, fakeDocker{}))
+
+	waitFor(t, "a heartbeat once enrolled", func() bool { return len(m.calls()) >= 1 })
+	if m.registers() != 4 {
+		t.Errorf("registered %d times, want 4 (3 rejections + 1 success)", m.registers())
+	}
+	if err := r.stop(); err != nil {
+		t.Fatalf("Run returned %v, want nil", err)
+	}
+}
+
+func TestRunStopsWhenTheManagerRejectsTheIdentity(t *testing.T) {
+	mismatch := &protocol.Error{Code: dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_IDENTITY_MISMATCH, Message: "certificate is for another node"}
+	m := &fakeManager{registerErrs: []error{mismatch}}
+	r := start(t, newTestAgent(m, fakeDocker{}))
+	if err := r.wait(); !errors.Is(err, mismatch) {
+		t.Fatalf("Run returned %v, want the identity mismatch", err)
+	}
+	if m.registers() != 1 {
+		t.Errorf("an identity mismatch must not be retried, got %d attempts", m.registers())
+	}
+}
+
+func TestRunStopsOnPermanentHeartbeatRejection(t *testing.T) {
+	bad := status.Error(codes.Unauthenticated, "token rotated")
+	m := &fakeManager{interval: 2 * time.Millisecond, heartbeatErrs: []error{bad}}
+	r := start(t, newTestAgent(m, fakeDocker{}))
+	if err := r.wait(); !errors.Is(err, bad) {
+		t.Fatalf("Run returned %v, want the rejection", err)
+	}
+	if len(m.deregistrations()) != 0 {
+		t.Error("a rejected agent must not try to deregister")
+	}
+}
+
+func TestRunKeepsGoingWhenTheCertificateIsRejectedTemporarily(t *testing.T) {
+	expired := &protocol.Error{Code: dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_CERTIFICATE_INVALID, Message: "client certificate has expired"}
+	m := &fakeManager{interval: 2 * time.Millisecond, heartbeatErrs: []error{expired, expired}}
+	start(t, newTestAgent(m, fakeDocker{}))
+
+	waitFor(t, "heartbeats after the certificate errors", func() bool { return len(m.calls()) >= 4 })
+	if m.registers() != 1 {
+		t.Errorf("a certificate error must not trigger re-registration, got %d registrations", m.registers())
+	}
+}
+
 func TestRunRegistersAgainWhenSessionIsLost(t *testing.T) {
 	lost := &protocol.Error{Code: dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_REGISTERED, Message: "restarted"}
 	m := &fakeManager{interval: 2 * time.Millisecond, heartbeatErrs: []error{lost}}

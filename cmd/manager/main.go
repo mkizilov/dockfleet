@@ -35,6 +35,10 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if cfg.TLSEnabled() && cfg.AgentToken != "" {
+		logger.Warn("DOCKFLEET_AGENT_TOKEN is ignored: agents authenticate with their client certificate")
+	}
+
 	var st store.Store
 	switch cfg.Store {
 	case "postgres":

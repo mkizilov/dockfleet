@@ -19,6 +19,11 @@ option go_package = "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/
 //
 // Failures that the agent can act on carry a ProtocolError in the gRPC status
 // details. See docs/protocol.md.
+//
+// Transport: outside loopback development the connection is mutual TLS. The
+// manager derives the caller's identity from the client certificate and
+// requires every node_id in a request to match it. Only enrolled nodes may
+// register.
 service NodeService {
   // RegisterNode is idempotent. Registering a node that already has a session
   // replaces that session; the older session is then SESSION_SUPERSEDED.
@@ -94,6 +99,15 @@ enum ProtocolErrorCode {
   PROTOCOL_ERROR_CODE_SESSION_SUPERSEDED = 3;
   // The request is malformed or violates a limit. Do not retry unchanged.
   PROTOCOL_ERROR_CODE_INVALID_REQUEST = 4;
+  // The node is not enrolled, or its enrollment was revoked. An administrator
+  // must enroll the node; the agent may keep retrying.
+  PROTOCOL_ERROR_CODE_NOT_ENROLLED = 5;
+  // The node_id in the request differs from the identity in the client
+  // certificate. Do not retry unchanged.
+  PROTOCOL_ERROR_CODE_IDENTITY_MISMATCH = 6;
+  // The client certificate is expired, not yet valid, or carries no node
+  // identity. Renew it; a new connection picks up the renewed certificate.
+  PROTOCOL_ERROR_CODE_CERTIFICATE_INVALID = 7;
 }
 
 // ProtocolError is attached to the gRPC status details of failed calls.

@@ -251,6 +251,67 @@ func (p *Postgres) UpdateWorkloadStatus(ctx context.Context, id, nodeID, state, 
 	return nil
 }
 
+const enrollmentColumns = `node_id, description, created_at, revoked_at`
+
+func scanEnrollment(row pgx.Row) (Enrollment, error) {
+	var e Enrollment
+	if err := row.Scan(&e.NodeID, &e.Description, &e.CreatedAt, &e.RevokedAt); err != nil {
+		return Enrollment{}, mapError(err)
+	}
+	e.CreatedAt = e.CreatedAt.UTC()
+	if e.RevokedAt != nil {
+		utc := e.RevokedAt.UTC()
+		e.RevokedAt = &utc
+	}
+	return e, nil
+}
+
+func (p *Postgres) CreateEnrollment(ctx context.Context, e Enrollment) (Enrollment, error) {
+	// The WHERE clause lets only a revoked enrollment be replaced; for an
+	// active one no row comes back, which is reported as a conflict.
+	created, err := scanEnrollment(p.pool.QueryRow(ctx,
+		`INSERT INTO enrollments (node_id, description, created_at)
+		 VALUES ($1, $2, $3)
+		 ON CONFLICT (node_id) DO UPDATE SET
+		   description = EXCLUDED.description,
+		   created_at = EXCLUDED.created_at,
+		   revoked_at = NULL
+		 WHERE enrollments.revoked_at IS NOT NULL
+		 RETURNING `+enrollmentColumns,
+		e.NodeID, e.Description, e.CreatedAt))
+	if errors.Is(err, ErrNotFound) {
+		return Enrollment{}, ErrConflict
+	}
+	return created, err
+}
+
+func (p *Postgres) GetEnrollment(ctx context.Context, nodeID string) (Enrollment, error) {
+	return scanEnrollment(p.pool.QueryRow(ctx, `SELECT `+enrollmentColumns+` FROM enrollments WHERE node_id = $1`, nodeID))
+}
+
+func (p *Postgres) ListEnrollments(ctx context.Context) ([]Enrollment, error) {
+	rows, err := p.pool.Query(ctx, `SELECT `+enrollmentColumns+` FROM enrollments ORDER BY node_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Enrollment{}
+	for rows.Next() {
+		e, err := scanEnrollment(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) RevokeEnrollment(ctx context.Context, nodeID string, at time.Time) (Enrollment, error) {
+	return scanEnrollment(p.pool.QueryRow(ctx,
+		`UPDATE enrollments SET revoked_at = COALESCE(revoked_at, $2) WHERE node_id = $1 RETURNING `+enrollmentColumns,
+		nodeID, at))
+}
+
 func (p *Postgres) Ping(ctx context.Context) error {
 	return p.pool.Ping(ctx)
 }

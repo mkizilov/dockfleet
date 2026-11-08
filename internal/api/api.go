@@ -20,6 +20,7 @@ import (
 const (
 	maxBodyBytes   = 1 << 20
 	maxImageLength = 255
+	maxDescription = 200
 	readyTimeout   = 2 * time.Second
 )
 
@@ -66,6 +67,10 @@ func New(cfg Config) http.Handler {
 	mux.Handle("POST /v1/workloads", s.auth(s.createWorkload))
 	mux.Handle("GET /v1/workloads", s.auth(s.listWorkloads))
 	mux.Handle("GET /v1/workloads/{id}", s.auth(s.getWorkload))
+	mux.Handle("POST /v1/enrollments", s.auth(s.createEnrollment))
+	mux.Handle("GET /v1/enrollments", s.auth(s.listEnrollments))
+	mux.Handle("GET /v1/enrollments/{id}", s.auth(s.getEnrollment))
+	mux.Handle("DELETE /v1/enrollments/{id}", s.auth(s.revokeEnrollment))
 	return s.logRequests(mux)
 }
 
@@ -259,6 +264,78 @@ func (s *server) createWorkload(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.Header().Set("Location", "/v1/workloads/"+created.ID)
 		writeJSON(w, http.StatusCreated, created)
+	}
+}
+
+type createEnrollmentRequest struct {
+	NodeID      string `json:"node_id"`
+	Description string `json:"description"`
+}
+
+// createEnrollment explicitly allows a node ID to register. The node still has
+// to authenticate (its client certificate must carry this ID).
+func (s *server) createEnrollment(w http.ResponseWriter, r *http.Request) {
+	var req createEnrollmentRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "request body must be a valid JSON enrollment")
+		return
+	}
+	if !store.ValidName(req.NodeID) {
+		writeError(w, http.StatusBadRequest, "node_id must be 1-63 characters of [A-Za-z0-9._-] starting with a letter or digit")
+		return
+	}
+	if len(req.Description) > maxDescription {
+		writeError(w, http.StatusBadRequest, "description must be at most 200 characters")
+		return
+	}
+	created, err := s.store.CreateEnrollment(r.Context(), store.Enrollment{NodeID: req.NodeID, Description: req.Description, CreatedAt: s.now().UTC()})
+	switch {
+	case errors.Is(err, store.ErrConflict):
+		writeError(w, http.StatusConflict, "node is already enrolled")
+	case err != nil:
+		s.internalError(w, r, err)
+	default:
+		s.logger.InfoContext(r.Context(), "node enrolled", "node_id", created.NodeID)
+		w.Header().Set("Location", "/v1/enrollments/"+created.NodeID)
+		writeJSON(w, http.StatusCreated, created)
+	}
+}
+
+func (s *server) listEnrollments(w http.ResponseWriter, r *http.Request) {
+	enrollments, err := s.store.ListEnrollments(r.Context())
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"enrollments": enrollments})
+}
+
+func (s *server) getEnrollment(w http.ResponseWriter, r *http.Request) {
+	e, err := s.store.GetEnrollment(r.Context(), r.PathValue("id"))
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, "enrollment not found")
+	case err != nil:
+		s.internalError(w, r, err)
+	default:
+		writeJSON(w, http.StatusOK, e)
+	}
+}
+
+// revokeEnrollment blocks a node from registering. Its running session ends
+// at its next heartbeat. Revoking twice is harmless.
+func (s *server) revokeEnrollment(w http.ResponseWriter, r *http.Request) {
+	e, err := s.store.RevokeEnrollment(r.Context(), r.PathValue("id"), s.now().UTC())
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, "enrollment not found")
+	case err != nil:
+		s.internalError(w, r, err)
+	default:
+		s.logger.InfoContext(r.Context(), "enrollment revoked", "node_id", e.NodeID)
+		writeJSON(w, http.StatusOK, e)
 	}
 }
 

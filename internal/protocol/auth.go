@@ -25,15 +25,14 @@ func UnaryTokenInterceptor(token string) grpc.UnaryServerInterceptor {
 	}
 }
 
-// tokenCredentials attaches the bearer token to every call. gRPC refuses to
-// send it over a plaintext connection when secure is true.
+// tokenCredentials attaches the bearer token to every call. It is only used
+// on plaintext loopback connections; mutual TLS replaces it.
 type tokenCredentials struct {
-	token  string
-	secure bool
+	token string
 }
 
 func (c tokenCredentials) GetRequestMetadata(context.Context, ...string) (map[string]string, error) {
 	return map[string]string{authorizationKey: "Bearer " + c.token}, nil
 }
 
-func (c tokenCredentials) RequireTransportSecurity() bool { return c.secure }
+func (c tokenCredentials) RequireTransportSecurity() bool { return false }

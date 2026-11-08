@@ -40,6 +40,20 @@ type Node struct {
 	LastHeartbeat time.Time         `json:"last_heartbeat"`
 }
 
+// Enrollment is an administrator's explicit permission for a node ID to join
+// the fleet. Only enrolled nodes may register; revoking blocks a node again.
+type Enrollment struct {
+	NodeID      string     `json:"node_id"`
+	Description string     `json:"description"`
+	CreatedAt   time.Time  `json:"created_at"`
+	RevokedAt   *time.Time `json:"revoked_at,omitempty"`
+}
+
+// Active reports whether the enrollment has not been revoked.
+func (e Enrollment) Active() bool {
+	return e.RevokedAt == nil
+}
+
 // Workload is desired state only: a placement decision, nothing is run yet.
 type Workload struct {
 	ID              string     `json:"id"`
@@ -73,6 +87,15 @@ type Store interface {
 	// UpdateWorkloadStatus records an agent-reported state. It returns
 	// ErrNotFound when the workload does not exist or is assigned to another node.
 	UpdateWorkloadStatus(ctx context.Context, id, nodeID, state, message string, at time.Time) error
+
+	// CreateEnrollment enrolls a node ID. It returns ErrConflict while an
+	// active enrollment exists; a revoked one is replaced (re-enrollment).
+	CreateEnrollment(ctx context.Context, e Enrollment) (Enrollment, error)
+	GetEnrollment(ctx context.Context, nodeID string) (Enrollment, error)
+	ListEnrollments(ctx context.Context) ([]Enrollment, error)
+	// RevokeEnrollment sets RevokedAt (keeping an earlier revocation time) and
+	// returns ErrNotFound for a node that was never enrolled.
+	RevokeEnrollment(ctx context.Context, nodeID string, at time.Time) (Enrollment, error)
 
 	Ping(ctx context.Context) error
 	Close()

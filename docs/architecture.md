@@ -42,8 +42,10 @@ Agents dial the manager; the manager never connects to agents. This keeps nodes 
 - **`internal/scheduler`**: pure functions. `Candidates` drops nodes without a recent heartbeat and totals reserved CPU and memory per node; `Place` filters by label selector and free capacity and picks the node with the most free CPU (ties: free memory, then node ID).
 - **`internal/store`**: `Store` interface with PostgreSQL (`pgx` pool, embedded SQL migrations guarded by an advisory lock) and in-memory implementations. Both pass one shared conformance test.
 - **`internal/protocol`**: `NodeService` (`RegisterNode`, `Heartbeat`, `DeregisterNode`) from `proto/dockfleet/v1/fleet.proto`; protocol version rules; `ProtocolError` details surfaced as `protocol.Error`; a unary interceptor enforcing the agent token and another applying a per-call deadline; a client that attaches the token, refuses plaintext to non-loopback addresses and reconnects with backoff. Optional TLS 1.3. Details in [protocol.md](protocol.md).
-- **`internal/registry`**: the manager-side node registry. `Register` persists the node and starts a session (replacing an older one); `Heartbeat` validates the session, refreshes liveness, applies status reports (writing only changes, ignoring workloads not assigned to the reporting node) and returns the node's complete assignment set; `Deregister` ends the session and backdates the heartbeat. Sessions are in memory; everything else is in the store.
+- **`internal/registry`**: the manager-side node registry. `Register` persists the node and starts a session (replacing an older one); `Heartbeat` validates the session, refreshes liveness, applies status reports (writing only changes, ignoring workloads not assigned to the reporting node) and returns the node's complete assignment set; `Deregister` ends the session and backdates the heartbeat. `Register` and every `Heartbeat` also require an active enrollment in the store, so revocation ends a session at its next heartbeat. Sessions are in memory; everything else is in the store.
 - **`internal/netutil`**: `IsLoopbackAddr` and `RequireLoopback`, shared by config validation, the manager and the client.
+- **`internal/pki`**: development CA, manager and node certificates (node identity is the URI SAN `spiffe://dockfleet/node/<id>`), CSR signing, validity checks, expiry reporting, and TLS 1.3 configurations whose certificate files and CA bundles are re-read when they change (a failed reload keeps the previous version). See [mtls.md](mtls.md).
+- **`cmd/pki`** (`dockfleet-pki`): the CLI over `internal/pki`; writes keys owner-only into a git-ignored directory and never prints them.
 - **`internal/agent`**: the connection loop. It registers with exponential backoff (1s to 30s), heartbeats at the interval the manager returns with a deadline on every call, mirrors assignments into status reports, registers again when the manager reports `NOT_REGISTERED` or `SESSION_SUPERSEDED`, retries transient failures forever, exits with an error on permanent ones (incompatible version, invalid registration, rejected credentials), and deregisters on clean shutdown.
 - **`internal/integration`**: tests only; real agent loops against a real manager over an in-memory gRPC transport.
 - **`internal/docker`**: Docker Engine `GET /_ping` over a unix socket or loopback TCP.
@@ -59,6 +61,7 @@ Container create/start/stop, image pulls, reconciliation of desired versus actua
 | ----------- | ---------- | --------------------------------------------------------------------- |
 | `nodes`     | `id`       | Declared CPU (millicores) and memory, labels (`jsonb`), heartbeat time |
 | `workloads` | `id`       | Unique `name`, resources, `node_id` foreign key, `state`              |
+| `enrollments` | `node_id` | Administrator's permission for a node ID to join; `revoked_at` set on revocation (migration 003) |
 
 Migrations live in `internal/store/migrations` and are recorded in `schema_migrations`. A workload starts as `scheduled`; agent reports then set `state` (`pending`, `running`, `succeeded`, `failed`, `stopped`) together with `status_message` and `status_updated_at` (migration 002).
 
@@ -81,12 +84,15 @@ If either server fails on its own, the other is shut down the same way and the e
 ## Security model
 
 - **Secure defaults**: listeners bind to loopback; a non-loopback address requires TLS (manager) or a CA file (agent). Tokens are mandatory, at least 16 characters, and the admin and agent tokens must differ. Configuration errors never echo secret values.
-- **Transport**: TLS 1.3 when configured. Plaintext is loopback-only and enforced in three places: configuration validation, `Manager.Serve` (which refuses non-loopback listeners and closes them) and `protocol.Dial` (`ErrInsecureRemote`). Remote access requires TLS and the bearer token.
+- **Transport**: TLS 1.3 when configured, and TLS always means mutual TLS on the agent listener (`protocol.NewGRPCServer` refuses a TLS configuration that does not require and verify client certificates). Plaintext is loopback-only and enforced in three places: configuration validation, `Manager.Serve` (which refuses non-loopback listeners and closes them) and `protocol.Dial` (`ErrInsecureRemote`). A failed TLS handshake is a failed call; nothing retries in plaintext.
+- **Authentication and identity**: under mutual TLS the client certificate is the credential. `protocol.UnaryIdentityInterceptor` requires a verified chain, re-checks the validity window on every call and extracts the node ID; the handlers require every request's `node_id` to equal it. The agent bearer token exists only for plaintext loopback development.
+- **Authorization**: only enrolled node IDs can register, checked at registration and on every heartbeat (`registry`). Admin enrollment endpoints sit behind the admin bearer token, over HTTPS when TLS is configured.
+- **Expiry and rotation**: certificate and CA files are reloaded when they change; the manager ends agent connections after at most 10 minutes so renewals reach quiet connections; both processes log expiry warnings and errors hourly.
 - **Input limits**: node IDs and workload names match `^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`; gRPC messages are capped at 1 MiB and status reports at 1000 per heartbeat; HTTP bodies at 1 MiB; label counts are bounded.
 - **Docker access**: the agent only accepts `unix://` or loopback `tcp://` Docker hosts because the Engine API is unauthenticated. Anyone who can reach it controls the host, so agent-host hardening belongs to the future container work.
 - **Development credentials** live in `config/dev.env`, are labeled as throwaway, and are not accepted by any production-oriented default.
 
-Known gaps: a shared token per role (a leaked agent token lets any process register nodes), no rate limiting, no audit log.
+Known gaps: the admin API uses one shared bearer token, there is no CRL/OCSP (revoke by enrollment), the development CA is not a production PKI, no rate limiting, no audit log beyond structured logs of enrollment changes and rejections.
 
 ## Decisions
 
@@ -101,4 +107,4 @@ Known gaps: a shared token per role (a leaked agent token lets any process regis
 - Assignment delivery and status reporting already ride on `Heartbeat`; if latency matters, add a server-streaming `Watch` RPC next to it and bump the protocol minor version.
 - Extend `docker.Client` with image and container operations; keep `internal/agent` depending on the interface so it stays testable with fakes.
 - Add a reconciler in the agent that drives actual state toward the manager's desired state.
-- Replace the shared agent token with per-node credentials or mTLS.
+- Per-user admin authentication (the admin API still uses one shared token), certificate revocation lists, and integration with an external CA.

@@ -67,24 +67,50 @@ func IsIncompatibleVersion(err error) bool {
 	return ErrorCode(err) == dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_INCOMPATIBLE_VERSION
 }
 
+// IsNotEnrolled reports that the node has no active enrollment.
+func IsNotEnrolled(err error) bool {
+	return ErrorCode(err) == dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_ENROLLED
+}
+
+// IsIdentityMismatch reports that the request named a node other than the one
+// the client certificate belongs to.
+func IsIdentityMismatch(err error) bool {
+	return ErrorCode(err) == dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_IDENTITY_MISMATCH
+}
+
+// IsCertificateInvalid reports an expired, not yet valid or identity-less
+// client certificate.
+func IsCertificateInvalid(err error) bool {
+	return ErrorCode(err) == dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_CERTIFICATE_INVALID
+}
+
 // NeedsRegistration reports that the manager has no usable session for the
-// node and the agent must register again.
+// node and the agent must register again. For NOT_ENROLLED the registration
+// will keep failing until an administrator enrolls the node again.
 func NeedsRegistration(err error) bool {
 	switch ErrorCode(err) {
 	case dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_REGISTERED,
-		dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_SESSION_SUPERSEDED:
+		dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_SESSION_SUPERSEDED,
+		dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_ENROLLED:
 		return true
 	}
 	return false
 }
 
 // IsPermanent reports failures that retrying the same request cannot fix:
-// version mismatch, invalid request, or rejected credentials.
+// version mismatch, invalid request, a request naming another node than the
+// certificate, or rejected credentials. A missing enrollment and a bad
+// client certificate are not permanent: an administrator can enroll the node
+// and a renewed certificate is used by the next connection.
 func IsPermanent(err error) bool {
 	switch ErrorCode(err) {
 	case dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_INCOMPATIBLE_VERSION,
-		dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_INVALID_REQUEST:
+		dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_INVALID_REQUEST,
+		dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_IDENTITY_MISMATCH:
 		return true
+	case dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_ENROLLED,
+		dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_CERTIFICATE_INVALID:
+		return false
 	}
 	switch status.Code(err) {
 	case codes.Unauthenticated, codes.PermissionDenied:

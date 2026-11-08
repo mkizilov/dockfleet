@@ -34,30 +34,49 @@ type Manager struct {
 	DatabaseURL       string
 	TLSCertFile       string
 	TLSKeyFile        string
+	TLSClientCAFile   string
 	HeartbeatInterval time.Duration
 	NodeTTL           time.Duration
 	RequestTimeout    time.Duration
 	ShutdownTimeout   time.Duration
 }
 
+// TLSEnabled reports whether the manager serves TLS. TLS always means mutual
+// TLS on the gRPC listener; there is no mode without client certificates.
+func (m Manager) TLSEnabled() bool {
+	return m.TLSCertFile != ""
+}
+
 // Agent is the agent process configuration. Token must never be logged.
 type Agent struct {
-	LogLevel    string
-	LogFormat   string
-	ManagerAddr string
-	Token       string
-	TLSCAFile   string
-	NodeID      string
-	NodeName    string
-	CPUMillis   int64
-	MemoryBytes int64
-	Labels      map[string]string
-	DockerHost  string
-	RPCTimeout  time.Duration
+	LogLevel      string
+	LogFormat     string
+	ManagerAddr   string
+	Token         string
+	TLSCAFile     string
+	TLSCertFile   string
+	TLSKeyFile    string
+	TLSServerName string
+	NodeID        string
+	NodeName      string
+	CPUMillis     int64
+	MemoryBytes   int64
+	Labels        map[string]string
+	DockerHost    string
+	RPCTimeout    time.Duration
+}
+
+// TLSEnabled reports whether the agent connects with mutual TLS. Without it
+// the agent only talks to a loopback manager, in plaintext, with Token.
+func (a Agent) TLSEnabled() bool {
+	return a.TLSCAFile != ""
 }
 
 // LoadManager reads and validates manager configuration. Defaults are secure:
-// loopback listeners, mandatory tokens, and TLS required for any other bind address.
+// loopback listeners, a mandatory admin token, and mutual TLS required for any
+// other bind address. Without TLS the agent token authenticates agents, on
+// loopback only; with TLS the client certificate does and the agent token is
+// ignored.
 func LoadManager(get Getenv) (Manager, error) {
 	var errs []error
 	fail := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
@@ -73,6 +92,7 @@ func LoadManager(get Getenv) (Manager, error) {
 	c.DatabaseURL = env(get, "DOCKFLEET_DATABASE_URL", "")
 	c.TLSCertFile = env(get, "DOCKFLEET_TLS_CERT_FILE", "")
 	c.TLSKeyFile = env(get, "DOCKFLEET_TLS_KEY_FILE", "")
+	c.TLSClientCAFile = env(get, "DOCKFLEET_TLS_CLIENT_CA_FILE", "")
 	c.HeartbeatInterval = duration(get, "DOCKFLEET_HEARTBEAT_INTERVAL", 10*time.Second, &errs)
 	c.NodeTTL = duration(get, "DOCKFLEET_NODE_TTL", 30*time.Second, &errs)
 	c.RequestTimeout = duration(get, "DOCKFLEET_REQUEST_TIMEOUT", 10*time.Second, &errs)
@@ -88,28 +108,30 @@ func LoadManager(get Getenv) (Manager, error) {
 		fail("DOCKFLEET_STORE must be postgres or memory, got %q", c.Store)
 	}
 
-	for _, t := range []struct{ name, value string }{
-		{"DOCKFLEET_API_TOKEN", c.APIToken},
-		{"DOCKFLEET_AGENT_TOKEN", c.AgentToken},
-	} {
-		if len(t.value) < minTokenLength {
-			fail("%s must be set to at least %d characters", t.name, minTokenLength)
-		}
-	}
-	if c.APIToken != "" && c.APIToken == c.AgentToken {
-		fail("DOCKFLEET_API_TOKEN and DOCKFLEET_AGENT_TOKEN must differ")
+	anyTLS := c.TLSCertFile != "" || c.TLSKeyFile != "" || c.TLSClientCAFile != ""
+	if anyTLS && (c.TLSCertFile == "" || c.TLSKeyFile == "" || c.TLSClientCAFile == "") {
+		fail("DOCKFLEET_TLS_CERT_FILE, DOCKFLEET_TLS_KEY_FILE and DOCKFLEET_TLS_CLIENT_CA_FILE must be set together: TLS means mutual TLS, there is no mode without client certificates")
 	}
 
-	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
-		fail("DOCKFLEET_TLS_CERT_FILE and DOCKFLEET_TLS_KEY_FILE must be set together")
+	if len(c.APIToken) < minTokenLength {
+		fail("DOCKFLEET_API_TOKEN must be set to at least %d characters", minTokenLength)
 	}
-	if c.TLSCertFile == "" {
+	if !anyTLS {
+		if len(c.AgentToken) < minTokenLength {
+			fail("DOCKFLEET_AGENT_TOKEN must be set to at least %d characters when TLS is not configured", minTokenLength)
+		}
+		if c.APIToken != "" && c.APIToken == c.AgentToken {
+			fail("DOCKFLEET_API_TOKEN and DOCKFLEET_AGENT_TOKEN must differ")
+		}
+	}
+
+	if !anyTLS {
 		for _, a := range []struct{ name, addr string }{
 			{"DOCKFLEET_API_ADDR", c.APIAddr},
 			{"DOCKFLEET_GRPC_ADDR", c.GRPCAddr},
 		} {
 			if !netutil.IsLoopbackAddr(a.addr) {
-				fail("%s=%q is not a loopback address; configure TLS or bind to loopback", a.name, a.addr)
+				fail("%s=%q is not a loopback address; configure mutual TLS (DOCKFLEET_TLS_CERT_FILE, DOCKFLEET_TLS_KEY_FILE, DOCKFLEET_TLS_CLIENT_CA_FILE) or bind to loopback", a.name, a.addr)
 			}
 		}
 	}
@@ -135,6 +157,9 @@ func LoadAgent(get Getenv) (Agent, error) {
 	c.ManagerAddr = env(get, "DOCKFLEET_MANAGER_ADDR", "127.0.0.1:21281")
 	c.Token = env(get, "DOCKFLEET_AGENT_TOKEN", "")
 	c.TLSCAFile = env(get, "DOCKFLEET_TLS_CA_FILE", "")
+	c.TLSCertFile = env(get, "DOCKFLEET_TLS_CERT_FILE", "")
+	c.TLSKeyFile = env(get, "DOCKFLEET_TLS_KEY_FILE", "")
+	c.TLSServerName = env(get, "DOCKFLEET_TLS_SERVER_NAME", "")
 	c.DockerHost = env(get, "DOCKFLEET_DOCKER_HOST", "unix:///var/run/docker.sock")
 	c.RPCTimeout = duration(get, "DOCKFLEET_RPC_TIMEOUT", 5*time.Second, &errs)
 	c.CPUMillis = positiveInt(get, "DOCKFLEET_NODE_CPU_MILLIS", int64(runtime.NumCPU())*1000, &errs)
@@ -160,11 +185,17 @@ func LoadAgent(get Getenv) (Agent, error) {
 	}
 	c.Labels = labels
 
-	if len(c.Token) < minTokenLength {
-		fail("DOCKFLEET_AGENT_TOKEN must be set to at least %d characters", minTokenLength)
+	anyTLS := c.TLSCAFile != "" || c.TLSCertFile != "" || c.TLSKeyFile != ""
+	if anyTLS && (c.TLSCAFile == "" || c.TLSCertFile == "" || c.TLSKeyFile == "") {
+		fail("DOCKFLEET_TLS_CA_FILE, DOCKFLEET_TLS_CERT_FILE and DOCKFLEET_TLS_KEY_FILE must be set together: the manager requires mutual TLS")
 	}
-	if c.TLSCAFile == "" && !netutil.IsLoopbackAddr(c.ManagerAddr) {
-		fail("DOCKFLEET_MANAGER_ADDR=%q is not a loopback address; set DOCKFLEET_TLS_CA_FILE", c.ManagerAddr)
+	if !anyTLS {
+		if len(c.Token) < minTokenLength {
+			fail("DOCKFLEET_AGENT_TOKEN must be set to at least %d characters when TLS is not configured", minTokenLength)
+		}
+		if !netutil.IsLoopbackAddr(c.ManagerAddr) {
+			fail("DOCKFLEET_MANAGER_ADDR=%q is not a loopback address; configure mutual TLS (DOCKFLEET_TLS_CA_FILE, DOCKFLEET_TLS_CERT_FILE, DOCKFLEET_TLS_KEY_FILE): plaintext is never used for remote managers", c.ManagerAddr)
+		}
 	}
 
 	if err := errors.Join(errs...); err != nil {

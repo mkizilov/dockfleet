@@ -9,15 +9,16 @@ import (
 
 // Memory is an in-process Store for tests and local development. State is lost on exit.
 type Memory struct {
-	mu        sync.RWMutex
-	nodes     map[string]Node
-	workloads map[string]Workload
+	mu          sync.RWMutex
+	nodes       map[string]Node
+	workloads   map[string]Workload
+	enrollments map[string]Enrollment
 }
 
 var _ Store = (*Memory)(nil)
 
 func NewMemory() *Memory {
-	return &Memory{nodes: map[string]Node{}, workloads: map[string]Workload{}}
+	return &Memory{nodes: map[string]Node{}, workloads: map[string]Workload{}, enrollments: map[string]Enrollment{}}
 }
 
 func cloneLabels(in map[string]string) map[string]string {
@@ -138,6 +139,60 @@ func (m *Memory) UpdateWorkloadStatus(_ context.Context, id, nodeID, state, mess
 	w.StatusUpdatedAt = &at
 	m.workloads[id] = w
 	return nil
+}
+
+func cloneEnrollment(e Enrollment) Enrollment {
+	if e.RevokedAt != nil {
+		revoked := *e.RevokedAt
+		e.RevokedAt = &revoked
+	}
+	return e
+}
+
+func (m *Memory) CreateEnrollment(_ context.Context, e Enrollment) (Enrollment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.enrollments[e.NodeID]; ok && existing.Active() {
+		return Enrollment{}, ErrConflict
+	}
+	e.RevokedAt = nil
+	m.enrollments[e.NodeID] = e
+	return cloneEnrollment(e), nil
+}
+
+func (m *Memory) GetEnrollment(_ context.Context, nodeID string) (Enrollment, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	e, ok := m.enrollments[nodeID]
+	if !ok {
+		return Enrollment{}, ErrNotFound
+	}
+	return cloneEnrollment(e), nil
+}
+
+func (m *Memory) ListEnrollments(_ context.Context) ([]Enrollment, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]Enrollment, 0, len(m.enrollments))
+	for _, e := range m.enrollments {
+		out = append(out, cloneEnrollment(e))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out, nil
+}
+
+func (m *Memory) RevokeEnrollment(_ context.Context, nodeID string, at time.Time) (Enrollment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e, ok := m.enrollments[nodeID]
+	if !ok {
+		return Enrollment{}, ErrNotFound
+	}
+	if e.RevokedAt == nil {
+		e.RevokedAt = &at
+		m.enrollments[nodeID] = e
+	}
+	return cloneEnrollment(e), nil
 }
 
 func (m *Memory) Ping(context.Context) error { return nil }

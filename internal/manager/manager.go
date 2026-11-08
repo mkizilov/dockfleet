@@ -16,9 +16,19 @@ import (
 	"github.com/dockfleet/dockfleet/internal/api"
 	"github.com/dockfleet/dockfleet/internal/config"
 	"github.com/dockfleet/dockfleet/internal/netutil"
+	"github.com/dockfleet/dockfleet/internal/pki"
 	"github.com/dockfleet/dockfleet/internal/protocol"
 	"github.com/dockfleet/dockfleet/internal/registry"
 	"github.com/dockfleet/dockfleet/internal/store"
+)
+
+const (
+	// maxConnectionAge bounds how long an agent connection lives. Agents
+	// reconnect transparently, so a renewed agent certificate (and a changed
+	// client CA bundle) applies within this time even to a quiet connection.
+	maxConnectionAge = 10 * time.Minute
+
+	certCheckInterval = time.Hour
 )
 
 // Manager is the control plane: the admin HTTP API plus the agent-facing gRPC service.
@@ -27,19 +37,28 @@ type Manager struct {
 	store    store.Store
 	registry *registry.Registry
 	logger   *slog.Logger
-	tls      *tls.Config
+	apiTLS   *tls.Config
+	grpcTLS  *tls.Config
 }
 
 // New prepares the manager. TLS material is loaded eagerly so a bad
-// certificate fails startup instead of the first connection.
+// certificate or CA bundle fails startup instead of the first connection.
+//
+// With TLS configured, the admin API serves HTTPS (authenticated by its bearer
+// token) and the agent gRPC listener requires a client certificate signed by
+// the client CA; the certificate files are re-read when they change.
 func New(cfg config.Manager, st store.Store, logger *slog.Logger) (*Manager, error) {
 	m := &Manager{cfg: cfg, store: st, registry: registry.New(st, logger), logger: logger}
 	if cfg.TLSCertFile != "" {
-		tlsConfig, err := protocol.ServerTLSConfig(cfg.TLSCertFile, cfg.TLSKeyFile)
+		var err error
+		m.apiTLS, err = pki.ServerTLS(pki.ServerConfig{CertFile: cfg.TLSCertFile, KeyFile: cfg.TLSKeyFile, Logger: logger})
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("API TLS: %w", err)
 		}
-		m.tls = tlsConfig
+		m.grpcTLS, err = pki.ServerTLS(pki.ServerConfig{CertFile: cfg.TLSCertFile, KeyFile: cfg.TLSKeyFile, ClientCAFile: cfg.TLSClientCAFile, Logger: logger})
+		if err != nil {
+			return nil, fmt.Errorf("agent TLS: %w", err)
+		}
 	}
 	return m, nil
 }
@@ -51,17 +70,32 @@ func (m *Manager) Sessions() []registry.Session {
 
 // Serve runs both servers on the given listeners until ctx is canceled or one
 // of them fails, then shuts both down within cfg.ShutdownTimeout. It takes
-// ownership of the listeners and returns nil after a clean, requested
-// shutdown. Without TLS both listeners must be loopback: remote access waits
-// for TLS.
+// ownership of the listeners (closing them on every path) and returns nil
+// after a clean, requested shutdown. Without TLS both listeners must be
+// loopback: remote access requires TLS, and the agent listener then requires
+// mutual TLS.
 func (m *Manager) Serve(ctx context.Context, apiLn, grpcLn net.Listener) error {
-	if m.tls == nil {
+	closeListeners := func() {
+		_ = apiLn.Close()
+		_ = grpcLn.Close()
+	}
+	if m.grpcTLS == nil {
 		err := errors.Join(netutil.RequireLoopback("api", apiLn), netutil.RequireLoopback("grpc", grpcLn))
 		if err != nil {
-			_ = apiLn.Close()
-			_ = grpcLn.Close()
+			closeListeners()
 			return err
 		}
+	}
+	nodes := protocol.NewNodeServer(m.registry, m.cfg.HeartbeatInterval, m.logger)
+	grpcSrv, err := protocol.NewGRPCServer(nodes, protocol.ServerOptions{
+		TLS:              m.grpcTLS,
+		Token:            m.cfg.AgentToken,
+		HandlerTimeout:   m.cfg.RequestTimeout,
+		MaxConnectionAge: maxConnectionAge,
+	})
+	if err != nil {
+		closeListeners()
+		return err
 	}
 	httpSrv := &http.Server{
 		Handler: api.New(api.Config{
@@ -70,27 +104,23 @@ func (m *Manager) Serve(ctx context.Context, apiLn, grpcLn net.Listener) error {
 			NodeTTL: m.cfg.NodeTTL,
 			Logger:  m.logger,
 		}),
-		TLSConfig:         m.tls,
+		TLSConfig:         m.apiTLS,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		ErrorLog:          slog.NewLogLogger(m.logger.Handler(), slog.LevelWarn),
 	}
-	nodes := protocol.NewNodeServer(m.registry, m.cfg.HeartbeatInterval, m.logger)
-	grpcSrv := protocol.NewGRPCServer(nodes, protocol.ServerOptions{
-		Token:          m.cfg.AgentToken,
-		TLS:            m.tls,
-		HandlerTimeout: m.cfg.RequestTimeout,
-	})
 
+	watchCtx, stopWatching := context.WithCancel(ctx)
+	defer stopWatching()
 	errCh := make(chan error, 2)
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		var err error
-		if m.tls != nil {
+		if m.apiTLS != nil {
 			err = httpSrv.ServeTLS(apiLn, "", "")
 		} else {
 			err = httpSrv.Serve(apiLn)
@@ -105,7 +135,14 @@ func (m *Manager) Serve(ctx context.Context, apiLn, grpcLn net.Listener) error {
 			errCh <- fmt.Errorf("grpc server: %w", err)
 		}
 	}()
-	m.logger.Info("manager serving", "api_addr", apiLn.Addr().String(), "grpc_addr", grpcLn.Addr().String(), "tls", m.tls != nil)
+	if m.cfg.TLSCertFile != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pki.WatchExpiry(watchCtx, m.logger, "manager", m.cfg.TLSCertFile, pki.DefaultWarnWithin, certCheckInterval)
+		}()
+	}
+	m.logger.Info("manager serving", "api_addr", apiLn.Addr().String(), "grpc_addr", grpcLn.Addr().String(), "mutual_tls", m.grpcTLS != nil)
 
 	var errs []error
 	select {
@@ -136,6 +173,7 @@ func (m *Manager) Serve(ctx context.Context, apiLn, grpcLn net.Listener) error {
 		<-stopped
 	}
 
+	stopWatching()
 	wg.Wait()
 	close(errCh)
 	for err := range errCh {

@@ -10,7 +10,7 @@ import (
 // compatible additions and VersionMajor for breaking changes.
 const (
 	VersionMajor uint32 = 1
-	VersionMinor uint32 = 0
+	VersionMinor uint32 = 1
 )
 
 // CurrentVersion returns a fresh message holding this build's protocol version.

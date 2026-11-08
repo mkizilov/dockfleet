@@ -5,6 +5,11 @@
 _opam/
 .DS_Store
 
+# Development credentials: private keys must never be committed (`make dev-pki`)
+/.dev-pki/
+*.key
+*.csr
+
 # Build output and generated protobuf code (run `make proto`)
 /bin/
 /internal/protocol/dockfleet/

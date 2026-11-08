@@ -18,15 +18,16 @@ Changing the protocol means editing the `.proto`, bumping the version if require
 
 ## Connection model
 
-Agents dial the manager (gRPC, unary calls only). The manager never connects to agents. Every call carries `authorization: Bearer <agent token>`; calls without a valid token fail with `UNAUTHENTICATED` before reaching a handler. Every call has a server-side deadline (`DOCKFLEET_REQUEST_TIMEOUT`, default 10s) and the agent applies its own per-call deadline (`DOCKFLEET_RPC_TIMEOUT`, default 5s).
+Agents dial the manager (gRPC, unary calls only). The manager never connects to agents. Every call has a server-side deadline (`DOCKFLEET_REQUEST_TIMEOUT`, default 10s) and the agent applies its own per-call deadline (`DOCKFLEET_RPC_TIMEOUT`, default 5s).
 
-### Transport security
+### Transport security and authentication
 
-- With TLS configured, both sides use TLS 1.3 and the token is only sent over TLS.
-- Without TLS ("insecure development mode") communication is restricted to loopback:
-  - the manager refuses to serve plaintext on a non-loopback gRPC or API listener (configuration validation and again in `Manager.Serve`);
-  - the agent refuses to dial a non-loopback manager without a CA file (`protocol.ErrInsecureRemote`).
-- Remote access therefore requires TLS plus the bearer token. Per-node identity and mTLS are not part of this protocol version.
+Full details, including credential distribution, are in [mtls.md](mtls.md).
+
+- **Mutual TLS (any non-loopback deployment).** Both sides use TLS 1.3. The manager requires and verifies a client certificate; the agent verifies the manager certificate. The caller's identity is the node ID in the client certificate (URI SAN `spiffe://dockfleet/node/<id>`), and every `node_id` in a request must equal it (`PERMISSION_DENIED` / `IDENTITY_MISMATCH`). The validity window is re-checked on every call. The bearer token is not used.
+- **Plaintext development mode (loopback only).** Calls carry `authorization: Bearer <agent token>`; calls without it fail with `UNAUTHENTICATED`. There is no certificate, so a caller may claim any enrolled node ID.
+- **No plaintext fallback.** The manager refuses plaintext listeners on non-loopback addresses (configuration validation and again in `Manager.Serve`), a TLS server configuration without mandatory client certificates (`protocol.ErrClientAuthRequired`), and an agent refuses to dial a non-loopback manager without TLS (`protocol.ErrInsecureRemote`). A TLS handshake failure is a failed call, never a retry without TLS.
+- **Enrollment.** Whatever the transport, only node IDs an administrator enrolled may register, and enrollment is re-checked on every heartbeat (`PERMISSION_DENIED` / `NOT_ENROLLED`).
 
 ## Session lifecycle
 
@@ -57,7 +58,7 @@ Until a container runtime exists, an agent reports every assigned workload as `W
 
 ## Versioning
 
-`ProtocolVersion {major, minor}` is sent in `RegisterNodeRequest` and returned in `RegisterNodeResponse`. This build speaks `1.0` (`protocol.VersionMajor` / `protocol.VersionMinor`).
+`ProtocolVersion {major, minor}` is sent in `RegisterNodeRequest` and returned in `RegisterNodeResponse`. This build speaks `1.1` (`protocol.VersionMajor` / `protocol.VersionMinor`); 1.1 added the `NOT_ENROLLED`, `IDENTITY_MISMATCH` and `CERTIFICATE_INVALID` error codes.
 
 | Rule | Who checks |
 | ---- | ---------- |
@@ -77,7 +78,11 @@ Failures an agent can act on carry a `ProtocolError` in the gRPC status details 
 | `INVALID_REQUEST` | `INVALID_ARGUMENT` | Malformed request or limit exceeded | Fatal on registration |
 | `NOT_REGISTERED` | `FAILED_PRECONDITION` | No session for this node (e.g. manager restarted) | Register again |
 | `SESSION_SUPERSEDED` | `FAILED_PRECONDITION` | A newer registration replaced this session | Register again |
-| (none) | `UNAUTHENTICATED` | Bad or missing token | Fatal |
+| `NOT_ENROLLED` | `PERMISSION_DENIED` | The node ID has no active enrollment (never enrolled, or revoked) | Keep retrying with backoff and log an error; an administrator enrolls the node |
+| `IDENTITY_MISMATCH` | `PERMISSION_DENIED` | `node_id` differs from the client certificate identity | Fatal |
+| `CERTIFICATE_INVALID` | `UNAUTHENTICATED` | Client certificate expired, not yet valid, or without a node identity (found on an open connection) | Keep running; a renewed certificate is used on reconnect |
+| (none) | `UNAUTHENTICATED` | Bad or missing token (plaintext mode) | Fatal |
+| (none) | `UNAVAILABLE` | Includes TLS handshake failures: untrusted, expired or wrongly named certificates | Retry; the cause is in the error text |
 | (none) | `UNAVAILABLE`, `DEADLINE_EXCEEDED`, `INTERNAL` | Transient | Retry: backoff (1s to 30s) while registering, next tick while heartbeating |
 
 An agent that exits on a fatal error leaves restarting it to its supervisor, which makes version skew and bad credentials loud instead of an endless retry loop.

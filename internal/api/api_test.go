@@ -226,6 +226,80 @@ func TestOversizedBodyRejected(t *testing.T) {
 	}
 }
 
+func TestEnrollmentLifecycle(t *testing.T) {
+	h, st := newTestHandler(t)
+
+	if rec := do(h, http.MethodPost, "/v1/enrollments", `{"node_id":"worker-1"}`, false); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated enrollment = %d, want 401", rec.Code)
+	}
+
+	rec := do(h, http.MethodPost, "/v1/enrollments", `{"node_id":"worker-1","description":"rack 4"}`, true)
+	if rec.Code != http.StatusCreated || rec.Header().Get("Location") != "/v1/enrollments/worker-1" {
+		t.Fatalf("enroll = %d %s (Location %q)", rec.Code, rec.Body.String(), rec.Header().Get("Location"))
+	}
+	var created store.Enrollment
+	decode(t, rec, &created)
+	if created.NodeID != "worker-1" || created.Description != "rack 4" || !created.CreatedAt.Equal(fixedNow) || !created.Active() {
+		t.Fatalf("unexpected enrollment: %+v", created)
+	}
+	if e, err := st.GetEnrollment(context.Background(), "worker-1"); err != nil || !e.Active() {
+		t.Fatalf("enrollment was not stored: %+v, %v", e, err)
+	}
+
+	if rec := do(h, http.MethodPost, "/v1/enrollments", `{"node_id":"worker-1"}`, true); rec.Code != http.StatusConflict {
+		t.Fatalf("duplicate enrollment = %d, want 409", rec.Code)
+	}
+	if rec := do(h, http.MethodGet, "/v1/enrollments/worker-1", "", true); rec.Code != http.StatusOK {
+		t.Fatalf("GET enrollment = %d", rec.Code)
+	}
+	rec = do(h, http.MethodGet, "/v1/enrollments", "", true)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"node_id":"worker-1"`) {
+		t.Fatalf("list enrollments = %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = do(h, http.MethodDelete, "/v1/enrollments/worker-1", "", true)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"revoked_at"`) {
+		t.Fatalf("revoke = %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := do(h, http.MethodDelete, "/v1/enrollments/worker-1", "", true); rec.Code != http.StatusOK {
+		t.Fatalf("revoking twice = %d, want 200", rec.Code)
+	}
+	if e, _ := st.GetEnrollment(context.Background(), "worker-1"); e.Active() {
+		t.Fatalf("enrollment must be revoked: %+v", e)
+	}
+	if rec := do(h, http.MethodPost, "/v1/enrollments", `{"node_id":"worker-1"}`, true); rec.Code != http.StatusCreated {
+		t.Fatalf("re-enrolling a revoked node = %d, want 201", rec.Code)
+	}
+}
+
+func TestEnrollmentValidationAndUnknownNodes(t *testing.T) {
+	h, _ := newTestHandler(t)
+	bodies := map[string]string{
+		"malformed json":     `{`,
+		"unknown field":      `{"node_id":"w","admin":true}`,
+		"missing node id":    `{}`,
+		"bad node id":        `{"node_id":"../etc"}`,
+		"long description":   `{"node_id":"w","description":"` + strings.Repeat("d", 201) + `"}`,
+		"node id with space": `{"node_id":"a b"}`,
+	}
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			if rec := do(h, http.MethodPost, "/v1/enrollments", body, true); rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+	if rec := do(h, http.MethodGet, "/v1/enrollments/ghost", "", true); rec.Code != http.StatusNotFound {
+		t.Fatalf("GET unknown enrollment = %d, want 404", rec.Code)
+	}
+	if rec := do(h, http.MethodDelete, "/v1/enrollments/ghost", "", true); rec.Code != http.StatusNotFound {
+		t.Fatalf("revoking an unknown enrollment = %d, want 404", rec.Code)
+	}
+	if rec := do(h, http.MethodDelete, "/v1/enrollments/ghost", "", false); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated revoke = %d, want 401", rec.Code)
+	}
+}
+
 func TestMethodNotAllowed(t *testing.T) {
 	h, _ := newTestHandler(t)
 	if rec := do(h, http.MethodDelete, "/v1/nodes", "", true); rec.Code != http.StatusMethodNotAllowed {

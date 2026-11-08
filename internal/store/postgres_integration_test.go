@@ -26,7 +26,7 @@ func TestPostgresConformance(t *testing.T) {
 	if err := p.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate must be idempotent: %v", err)
 	}
-	if _, err := p.pool.Exec(ctx, `TRUNCATE workloads, nodes`); err != nil {
+	if _, err := p.pool.Exec(ctx, `TRUNCATE workloads, nodes, enrollments`); err != nil {
 		t.Fatal(err)
 	}
 	runStoreConformance(t, p)

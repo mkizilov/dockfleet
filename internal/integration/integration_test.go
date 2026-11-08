@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"log/slog"
@@ -43,10 +44,14 @@ func discardLogger() *slog.Logger {
 // manager is a restartable in-process manager: node and workload state lives
 // in the store and survives restarts, sessions (the registry) do not.
 type manager struct {
-	t        *testing.T
-	store    *store.Memory
-	version  *dockfleetv1.ProtocolVersion
-	dialsTry atomic.Int64
+	t         *testing.T
+	store     *store.Memory
+	version   *dockfleetv1.ProtocolVersion
+	serverTLS *tls.Config
+	logs      *logCounter
+	dialsTry  atomic.Int64
+	// skew shifts the clock the server uses for per-call certificate checks.
+	skew atomic.Int64
 
 	mu  sync.Mutex
 	lis *bufconn.Listener
@@ -54,23 +59,79 @@ type manager struct {
 	reg *registry.Registry
 }
 
-// newManager returns a stopped manager; call start to bring it up.
+// newManager returns a stopped manager; call start to bring it up. The nodes
+// sim-1, sim-2 and sim-3 are already enrolled.
 func newManager(t *testing.T, version *dockfleetv1.ProtocolVersion) *manager {
 	t.Helper()
 	m := &manager{t: t, store: store.NewMemory(), version: version}
+	m.enroll("sim-1", "sim-2", "sim-3")
 	t.Cleanup(m.stop)
 	return m
 }
 
+func (m *manager) enroll(ids ...string) {
+	m.t.Helper()
+	for _, id := range ids {
+		if _, err := m.store.CreateEnrollment(context.Background(), store.Enrollment{NodeID: id, CreatedAt: time.Now()}); err != nil {
+			m.t.Fatal(err)
+		}
+	}
+}
+
+func (m *manager) now() time.Time {
+	return time.Now().Add(time.Duration(m.skew.Load()))
+}
+
+// logCounter is a slog handler that counts messages, so tests can observe
+// decisions the manager makes (for example rejections) without log parsing.
+type logCounter struct {
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+func (l *logCounter) Enabled(context.Context, slog.Level) bool { return true }
+
+func (l *logCounter) Handle(_ context.Context, r slog.Record) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.counts == nil {
+		l.counts = map[string]int{}
+	}
+	l.counts[r.Message]++
+	return nil
+}
+
+func (l *logCounter) WithAttrs([]slog.Attr) slog.Handler { return l }
+
+func (l *logCounter) WithGroup(string) slog.Handler { return l }
+
+func (l *logCounter) count(msg string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.counts[msg]
+}
+
 func (m *manager) start() {
 	logger := discardLogger()
+	if m.logs != nil {
+		logger = slog.New(m.logs)
+	}
 	reg := registry.New(m.store, logger)
 	node := protocol.NewNodeServer(reg, heartbeatEvery, logger)
 	if m.version != nil {
 		node.WithVersion(m.version)
 	}
 	lis := bufconn.Listen(1 << 20)
-	srv := protocol.NewGRPCServer(node, protocol.ServerOptions{Token: agentToken, HandlerTimeout: 2 * time.Second})
+	opts := protocol.ServerOptions{HandlerTimeout: 2 * time.Second, Now: m.now}
+	if m.serverTLS != nil {
+		opts.TLS = m.serverTLS
+	} else {
+		opts.Token = agentToken
+	}
+	srv, err := protocol.NewGRPCServer(node, opts)
+	if err != nil {
+		m.t.Fatal(err)
+	}
 	go func() { _ = srv.Serve(lis) }()
 
 	m.mu.Lock()

@@ -127,4 +127,53 @@ func runStoreConformance(t *testing.T, s Store) {
 	if err := s.UpdateWorkloadStatus(ctx, "nope", "node-a", WorkloadRunning, "", reported); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("status for unknown workload: error = %v, want ErrNotFound", err)
 	}
+
+	runEnrollmentConformance(t, s)
+}
+
+func runEnrollmentConformance(t *testing.T, s Store) {
+	t.Helper()
+	ctx := context.Background()
+
+	if _, err := s.GetEnrollment(ctx, "worker-1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetEnrollment(unenrolled) error = %v, want ErrNotFound", err)
+	}
+	if _, err := s.RevokeEnrollment(ctx, "worker-1", testTime); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("RevokeEnrollment(unenrolled) error = %v, want ErrNotFound", err)
+	}
+
+	created, err := s.CreateEnrollment(ctx, Enrollment{NodeID: "worker-1", Description: "rack 4", CreatedAt: testTime})
+	if err != nil || !created.Active() || created.Description != "rack 4" || !created.CreatedAt.Equal(testTime) {
+		t.Fatalf("CreateEnrollment = %+v, %v", created, err)
+	}
+	if _, err := s.CreateEnrollment(ctx, Enrollment{NodeID: "worker-1", CreatedAt: testTime}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate active enrollment error = %v, want ErrConflict", err)
+	}
+	if _, err := s.CreateEnrollment(ctx, Enrollment{NodeID: "worker-0", CreatedAt: testTime}); err != nil {
+		t.Fatalf("CreateEnrollment worker-0: %v", err)
+	}
+
+	revokedAt := testTime.Add(time.Hour)
+	revoked, err := s.RevokeEnrollment(ctx, "worker-1", revokedAt)
+	if err != nil || revoked.Active() || !revoked.RevokedAt.Equal(revokedAt) {
+		t.Fatalf("RevokeEnrollment = %+v, %v", revoked, err)
+	}
+	again, err := s.RevokeEnrollment(ctx, "worker-1", revokedAt.Add(time.Hour))
+	if err != nil || !again.RevokedAt.Equal(revokedAt) {
+		t.Fatalf("revoking twice must keep the first revocation time: %+v, %v", again, err)
+	}
+	got, err := s.GetEnrollment(ctx, "worker-1")
+	if err != nil || got.Active() {
+		t.Fatalf("GetEnrollment after revoke = %+v, %v", got, err)
+	}
+
+	reenrolled, err := s.CreateEnrollment(ctx, Enrollment{NodeID: "worker-1", Description: "rack 5", CreatedAt: revokedAt.Add(2 * time.Hour)})
+	if err != nil || !reenrolled.Active() || reenrolled.Description != "rack 5" {
+		t.Fatalf("re-enrollment after revocation = %+v, %v", reenrolled, err)
+	}
+
+	list, err := s.ListEnrollments(ctx)
+	if err != nil || len(list) != 2 || list[0].NodeID != "worker-0" || list[1].NodeID != "worker-1" || !list[1].Active() {
+		t.Fatalf("ListEnrollments = %+v, %v", list, err)
+	}
 }

@@ -2,6 +2,8 @@ package protocol
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"io"
 	"log/slog"
@@ -12,9 +14,12 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
+	"github.com/dockfleet/dockfleet/internal/pki"
 	dockfleetv1 "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/v1"
 	"github.com/dockfleet/dockfleet/internal/registry"
 	"github.com/dockfleet/dockfleet/internal/store"
@@ -35,8 +40,15 @@ func newEnv(t *testing.T, mutate func(*NodeServer)) *testEnv {
 	if mutate != nil {
 		mutate(node)
 	}
+	// node-1 is the only enrolled node.
+	if _, err := st.CreateEnrollment(context.Background(), store.Enrollment{NodeID: "node-1", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
 	lis := bufconn.Listen(1 << 20)
-	srv := NewGRPCServer(node, ServerOptions{Token: serverToken, HandlerTimeout: 2 * time.Second})
+	srv, err := NewGRPCServer(node, ServerOptions{Token: serverToken, HandlerTimeout: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
 	return &testEnv{store: st, lis: lis}
@@ -330,8 +342,199 @@ func TestIsPermanent(t *testing.T) {
 	if IsPermanent(status.Error(codes.Unavailable, "down")) || IsPermanent(context.DeadlineExceeded) || IsPermanent(errors.New("boom")) {
 		t.Error("transient errors must not be permanent")
 	}
-	if !IsPermanent(status.Error(codes.PermissionDenied, "no")) {
-		t.Error("PermissionDenied must be permanent")
+	if !IsPermanent(status.Error(codes.PermissionDenied, "no")) || !IsPermanent(status.Error(codes.Unauthenticated, "no")) {
+		t.Error("plain authentication failures must be permanent")
+	}
+
+	code := func(c dockfleetv1.ProtocolErrorCode) error { return &Error{Code: c, Message: "x"} }
+	permanent := []dockfleetv1.ProtocolErrorCode{
+		dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_INCOMPATIBLE_VERSION,
+		dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_INVALID_REQUEST,
+		dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_IDENTITY_MISMATCH,
+	}
+	for _, c := range permanent {
+		if !IsPermanent(code(c)) {
+			t.Errorf("%v must be permanent", c)
+		}
+	}
+	transient := []dockfleetv1.ProtocolErrorCode{
+		dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_REGISTERED,
+		dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_SESSION_SUPERSEDED,
+		dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_ENROLLED,
+		dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_CERTIFICATE_INVALID,
+	}
+	for _, c := range transient {
+		if IsPermanent(code(c)) {
+			t.Errorf("%v must not be permanent", c)
+		}
+	}
+	// A bad certificate arrives as Unauthenticated but is fixed by renewing it.
+	badCert := &Error{Code: dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_CERTIFICATE_INVALID, cause: status.Error(codes.Unauthenticated, "expired")}
+	if IsPermanent(badCert) {
+		t.Error("an invalid client certificate must not be permanent")
+	}
+	if !NeedsRegistration(code(dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_ENROLLED)) {
+		t.Error("NOT_ENROLLED must send the agent back to registration")
+	}
+}
+
+func TestUnenrolledNodeIsRejected(t *testing.T) {
+	env := newEnv(t, nil)
+	c := env.client(t, serverToken, nil)
+	n := testNode()
+	n.ID = "stranger"
+
+	_, err := c.Register(ctxWithTimeout(t), n)
+	if !IsNotEnrolled(err) || status.Code(err) != codes.PermissionDenied || IsPermanent(err) {
+		t.Fatalf("error = %v (code %v), want a retryable NOT_ENROLLED", err, status.Code(err))
+	}
+	if _, err := env.store.GetNode(context.Background(), "stranger"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("an unenrolled node must not be stored, GetNode error = %v", err)
+	}
+
+	if _, err := env.store.CreateEnrollment(context.Background(), store.Enrollment{NodeID: "stranger", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := c.Register(ctxWithTimeout(t), n)
+	if err != nil {
+		t.Fatalf("register after enrollment: %v", err)
+	}
+
+	if _, err := env.store.RevokeEnrollment(context.Background(), "stranger", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.Heartbeat(ctxWithTimeout(t), "stranger", session.ID, nil)
+	if !IsNotEnrolled(err) {
+		t.Fatalf("heartbeat after revocation error = %v, want NOT_ENROLLED", err)
+	}
+}
+
+// peerContext fakes what grpc puts in the context of a call made over TLS.
+func peerContext(leaf *x509.Certificate, verified bool) context.Context {
+	state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}
+	if verified {
+		state.VerifiedChains = [][]*x509.Certificate{{leaf}}
+	}
+	return peer.NewContext(context.Background(), &peer.Peer{AuthInfo: credentials.TLSInfo{State: state}})
+}
+
+func TestIdentityInterceptor(t *testing.T) {
+	now := time.Now()
+	ca, err := pki.NewCA("Test CA", now.Add(-time.Hour), now.Add(100*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	issue := func(id string, notBefore, notAfter time.Time) *x509.Certificate {
+		issued, err := ca.IssueNode(pki.NodeRequest{NodeID: id, NotBefore: notBefore, NotAfter: notAfter})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return issued.Cert
+	}
+	valid := issue("worker-1", now.Add(-time.Minute), now.Add(time.Hour))
+	expired := issue("worker-1", now.Add(-3*time.Hour), now.Add(-time.Hour))
+	future := issue("worker-1", now.Add(time.Hour), now.Add(2*time.Hour))
+	serverOnly, err := ca.IssueServer(pki.ServerRequest{Name: "m", DNSNames: []string{"m"}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var seen string
+	handler := func(ctx context.Context, _ any) (any, error) {
+		seen, _ = identityFromContext(ctx)
+		return "ok", nil
+	}
+	intercept := UnaryIdentityInterceptor(func() time.Time { return now })
+	call := func(ctx context.Context) error {
+		seen = ""
+		_, err := intercept(ctx, nil, &grpc.UnaryServerInfo{}, handler)
+		return err
+	}
+
+	if err := call(peerContext(valid, true)); err != nil || seen != "worker-1" {
+		t.Fatalf("valid certificate: err=%v identity=%q", err, seen)
+	}
+
+	failures := map[string]struct {
+		ctx  context.Context
+		cert bool
+	}{
+		"expired certificate":     {peerContext(expired, true), true},
+		"not yet valid":           {peerContext(future, true), true},
+		"no node identity":        {peerContext(serverOnly.Cert, true), true},
+		"unverified chain":        {peerContext(valid, false), false},
+		"plaintext connection":    {peer.NewContext(context.Background(), &peer.Peer{AuthInfo: nil}), false},
+		"no peer information":     {context.Background(), false},
+		"TLS without certificate": {peer.NewContext(context.Background(), &peer.Peer{AuthInfo: credentials.TLSInfo{}}), false},
+	}
+	for name, tt := range failures {
+		t.Run(name, func(t *testing.T) {
+			err := call(tt.ctx)
+			if status.Code(err) != codes.Unauthenticated || seen != "" {
+				t.Fatalf("err = %v, identity = %q; want Unauthenticated and no handler call", err, seen)
+			}
+			if tt.cert && !IsCertificateInvalid(decodeError(err)) {
+				t.Errorf("a bad certificate must be reported as CERTIFICATE_INVALID, got %v", err)
+			}
+		})
+	}
+
+	// The same connection becomes invalid once the clock passes the certificate's expiry.
+	later := UnaryIdentityInterceptor(func() time.Time { return now.Add(2 * time.Hour) })
+	if _, err := later(peerContext(valid, true), nil, &grpc.UnaryServerInfo{}, handler); !IsCertificateInvalid(decodeError(err)) {
+		t.Errorf("a certificate that expired mid-connection must be rejected, got %v", err)
+	}
+}
+
+func TestIdentityBindingRejectsOtherNodeIDs(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	node := NewNodeServer(registry.New(store.NewMemory(), logger), time.Second, logger)
+	ctx := context.WithValue(context.Background(), identityKey{}, "worker-1")
+
+	req := &dockfleetv1.RegisterNodeRequest{
+		ProtocolVersion: CurrentVersion(),
+		Identity:        &dockfleetv1.NodeIdentity{NodeId: "worker-2", Name: "n"},
+		Capacity:        &dockfleetv1.NodeCapacity{CpuMillis: 1, MemoryBytes: 1},
+	}
+	_, err := node.RegisterNode(ctx, req)
+	if status.Code(err) != codes.PermissionDenied || !IsIdentityMismatch(decodeError(err)) {
+		t.Errorf("RegisterNode error = %v, want PERMISSION_DENIED / IDENTITY_MISMATCH", err)
+	}
+	_, err = node.Heartbeat(ctx, &dockfleetv1.HeartbeatRequest{NodeId: "worker-2", SessionId: "s"})
+	if !IsIdentityMismatch(decodeError(err)) {
+		t.Errorf("Heartbeat error = %v, want IDENTITY_MISMATCH", err)
+	}
+	_, err = node.DeregisterNode(ctx, &dockfleetv1.DeregisterNodeRequest{NodeId: "worker-2", SessionId: "s"})
+	if !IsIdentityMismatch(decodeError(err)) {
+		t.Errorf("DeregisterNode error = %v, want IDENTITY_MISMATCH", err)
+	}
+}
+
+func TestNewGRPCServerRefusesWeakConfigurations(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	node := NewNodeServer(registry.New(store.NewMemory(), logger), time.Second, logger)
+
+	if _, err := NewGRPCServer(node, ServerOptions{TLS: &tls.Config{MinVersion: tls.VersionTLS13}}); !errors.Is(err, ErrClientAuthRequired) {
+		t.Errorf("TLS without client certificate verification: error = %v, want ErrClientAuthRequired", err)
+	}
+	optional := &tls.Config{ClientAuth: tls.VerifyClientCertIfGiven}
+	if _, err := NewGRPCServer(node, ServerOptions{TLS: optional}); !errors.Is(err, ErrClientAuthRequired) {
+		t.Errorf("optional client certificates: error = %v, want ErrClientAuthRequired", err)
+	}
+	if _, err := NewGRPCServer(node, ServerOptions{}); err == nil {
+		t.Error("a plaintext server without a token must be refused")
+	}
+	mutual := &tls.Config{ClientAuth: tls.RequireAndVerifyClientCert}
+	if srv, err := NewGRPCServer(node, ServerOptions{TLS: mutual, MaxConnectionAge: time.Minute}); err != nil {
+		t.Errorf("mutual TLS must be accepted: %v", err)
+	} else {
+		srv.Stop()
+	}
+}
+
+func TestDialRequiresAClientCertificateWithTLS(t *testing.T) {
+	if _, err := Dial(ClientConfig{Addr: "manager.example.com:21281", TLS: &tls.Config{MinVersion: tls.VersionTLS13}}); !errors.Is(err, ErrNoClientCertificate) {
+		t.Errorf("error = %v, want ErrNoClientCertificate", err)
 	}
 }
 

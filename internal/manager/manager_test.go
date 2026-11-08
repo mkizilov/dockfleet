@@ -2,15 +2,23 @@ package manager
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/dockfleet/dockfleet/internal/config"
+	"github.com/dockfleet/dockfleet/internal/pki"
 	"github.com/dockfleet/dockfleet/internal/protocol"
 	"github.com/dockfleet/dockfleet/internal/store"
 )
@@ -22,6 +30,9 @@ const (
 	// Used only by the non-loopback refusal test, which never serves on them.
 	testRefusedAPIAddr  = "127.0.0.1:21292"
 	testRefusedGRPCAddr = "127.0.0.1:21293"
+	// Used by the mutual TLS test.
+	testTLSAPIAddr  = "127.0.0.1:21294"
+	testTLSGRPCAddr = "127.0.0.1:21295"
 )
 
 func testConfig() config.Manager {
@@ -41,7 +52,11 @@ func discardLogger() *slog.Logger {
 
 func TestServeRegistersNodeAndShutsDownGracefully(t *testing.T) {
 	cfg := testConfig()
-	m, err := New(cfg, store.NewMemory(), discardLogger())
+	st := store.NewMemory()
+	if _, err := st.CreateEnrollment(context.Background(), store.Enrollment{NodeID: "node-1", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	m, err := New(cfg, st, discardLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,6 +162,126 @@ func TestServeRefusesPlaintextOnNonLoopbackListeners(t *testing.T) {
 	if c, err := net.DialTimeout("tcp", testRefusedGRPCAddr, 200*time.Millisecond); err == nil {
 		_ = c.Close()
 		t.Error("gRPC listener was left open")
+	}
+}
+
+func writeIssued(t *testing.T, issued *pki.Issued, dir, name string) (certFile, keyFile string) {
+	t.Helper()
+	certFile, keyFile = filepath.Join(dir, name+".pem"), filepath.Join(dir, name+".key")
+	if err := issued.Save(certFile, keyFile, pki.WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	return certFile, keyFile
+}
+
+func TestServeMutualTLSEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	ca, err := pki.NewCA("Test CA", now.Add(-time.Hour), now.Add(48*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	caFile := filepath.Join(dir, "ca.pem")
+	if err := os.WriteFile(caFile, ca.CertPEM(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server, err := ca.IssueServer(pki.ServerRequest{Name: "manager", DNSNames: []string{"localhost"}, IPs: []net.IP{net.ParseIP("127.0.0.1")}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(24 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentIssued, err := ca.IssueNode(pki.NodeRequest{NodeID: "node-tls", NotBefore: now.Add(-time.Minute), NotAfter: now.Add(24 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverCert, serverKey := writeIssued(t, server, dir, "manager")
+	agentCert, agentKey := writeIssued(t, agentIssued, dir, "agent")
+
+	cfg := testConfig()
+	cfg.AgentToken = ""
+	cfg.TLSCertFile, cfg.TLSKeyFile, cfg.TLSClientCAFile = serverCert, serverKey, caFile
+	m, err := New(cfg, store.NewMemory(), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiLn, err := net.Listen("tcp", testTLSAPIAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grpcLn, err := net.Listen("tcp", testTLSGRPCAddr)
+	if err != nil {
+		_ = apiLn.Close()
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	served := make(chan error, 1)
+	go func() { served <- m.Serve(ctx, apiLn, grpcLn) }()
+
+	clientTLS, err := pki.ClientTLS(pki.ClientConfig{CAFile: caFile, CertFile: agentCert, KeyFile: agentKey, ServerName: "localhost"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := protocol.Dial(protocol.ClientConfig{Addr: testTLSGRPCAddr, TLS: clientTLS})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	callCtx, callCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer callCancel()
+	node := protocol.NodeInfo{ID: "node-tls", Name: "TLS node", CPUMillis: 1000, MemoryBytes: 1 << 30}
+
+	// A valid certificate alone is not enough: the node has to be enrolled.
+	if _, err := client.Register(callCtx, node); !protocol.IsNotEnrolled(err) {
+		t.Fatalf("Register before enrollment: error = %v, want NOT_ENROLLED", err)
+	}
+
+	// The admin API serves HTTPS with the manager certificate and needs no client certificate.
+	roots, err := pki.LoadPool(caFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpClient := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS13}}}
+	defer httpClient.CloseIdleConnections()
+	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, "https://"+testTLSAPIAddr+"/v1/enrollments", strings.NewReader(`{"node_id":"node-tls"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.APIToken)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		t.Fatalf("enroll over HTTPS: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("enrollment status = %d, want 201", resp.StatusCode)
+	}
+
+	session, err := client.Register(callCtx, node)
+	if err != nil {
+		t.Fatalf("Register after enrollment: %v", err)
+	}
+	if sessions := m.Sessions(); len(sessions) != 1 || sessions[0].ID != session.ID {
+		t.Fatalf("Sessions = %+v", sessions)
+	}
+
+	// A plaintext client gets nowhere on the TLS port, even on loopback.
+	plain, err := protocol.Dial(protocol.ClientConfig{Addr: testTLSGRPCAddr, Token: "anything-at-all-0123456789"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plain.Close()
+	if _, err := plain.Heartbeat(callCtx, "node-tls", session.ID, nil); status.Code(err) != codes.Unavailable {
+		t.Fatalf("plaintext heartbeat: error = %v, want Unavailable", err)
+	}
+
+	cancel()
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("Serve returned %v after graceful shutdown", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Serve did not return after context cancellation")
 	}
 }
 

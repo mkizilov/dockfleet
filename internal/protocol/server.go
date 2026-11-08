@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 
 	dockfleetv1 "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/v1"
 	"github.com/dockfleet/dockfleet/internal/registry"
@@ -65,33 +66,63 @@ func (s *NodeServer) WithVersion(v *dockfleetv1.ProtocolVersion) *NodeServer {
 	return s
 }
 
-// ServerOptions configures NewGRPCServer.
+// ErrClientAuthRequired is returned when a TLS configuration would let
+// clients connect without a verified certificate.
+var ErrClientAuthRequired = errors.New("TLS config must require and verify client certificates (mutual TLS)")
+
+// ServerOptions configures NewGRPCServer. It runs in one of two modes:
+//
+//   - Mutual TLS (TLS set): clients are authenticated by their certificate,
+//     which also fixes the node identity they may use. Token is not used.
+//   - Plaintext (TLS nil): development on loopback only. Clients are
+//     authenticated by the shared Token and may claim any node ID. The caller
+//     must bind the listener to loopback (see netutil.RequireLoopback).
 type ServerOptions struct {
-	// Token is the bearer token every call must carry.
-	Token string
-	// TLS enables TLS when non-nil. Without it the caller must bind the
-	// listener to loopback only (see netutil.RequireLoopback).
+	// TLS enables mutual TLS. Its ClientAuth must be RequireAndVerifyClientCert.
 	TLS *tls.Config
+	// Token is the bearer token for plaintext mode; required there.
+	Token string
 	// HandlerTimeout bounds each call; zero means 10 seconds.
 	HandlerTimeout time.Duration
+	// MaxConnectionAge makes the server end connections after this long (zero:
+	// never). Clients reconnect transparently, which makes a renewed client
+	// certificate take effect on connections that would otherwise outlive it.
+	MaxConnectionAge time.Duration
+	// Now overrides the clock used to check certificate validity per call (tests).
+	Now func() time.Time
 }
 
-// NewGRPCServer builds a token-authenticated gRPC server with a per-call deadline.
-func NewGRPCServer(nodes *NodeServer, opts ServerOptions) *grpc.Server {
+// NewGRPCServer builds the agent-facing gRPC server with a per-call deadline.
+func NewGRPCServer(nodes *NodeServer, opts ServerOptions) (*grpc.Server, error) {
 	wait := opts.HandlerTimeout
 	if wait <= 0 {
 		wait = defaultHandlerWait
 	}
-	serverOpts := []grpc.ServerOption{
-		grpc.ChainUnaryInterceptor(UnaryTokenInterceptor(opts.Token), unaryDeadline(wait)),
-		grpc.MaxRecvMsgSize(maxMessageBytes),
-	}
+
+	var auth grpc.UnaryServerInterceptor
+	serverOpts := []grpc.ServerOption{grpc.MaxRecvMsgSize(maxMessageBytes)}
 	if opts.TLS != nil {
+		if opts.TLS.ClientAuth != tls.RequireAndVerifyClientCert {
+			return nil, ErrClientAuthRequired
+		}
+		auth = UnaryIdentityInterceptor(opts.Now)
 		serverOpts = append(serverOpts, grpc.Creds(credentials.NewTLS(opts.TLS)))
+	} else {
+		if opts.Token == "" {
+			return nil, errors.New("a bearer token is required without TLS")
+		}
+		auth = UnaryTokenInterceptor(opts.Token)
+	}
+	serverOpts = append(serverOpts, grpc.ChainUnaryInterceptor(auth, unaryDeadline(wait)))
+	if opts.MaxConnectionAge > 0 {
+		serverOpts = append(serverOpts, grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionAge:      opts.MaxConnectionAge,
+			MaxConnectionAgeGrace: 10 * time.Second,
+		}))
 	}
 	srv := grpc.NewServer(serverOpts...)
 	dockfleetv1.RegisterNodeServiceServer(srv, nodes)
-	return srv
+	return srv, nil
 }
 
 func unaryDeadline(d time.Duration) grpc.UnaryServerInterceptor {
@@ -111,9 +142,28 @@ func (s *NodeServer) internal(ctx context.Context, what string, err error) error
 	return newStatusError(codes.Internal, dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_UNSPECIFIED, what+" failed", s.version)
 }
 
+// checkIdentity binds a request to the caller's certificate: under mutual TLS
+// the node_id must equal the identity in the certificate. On plaintext servers
+// there is no certificate and nothing to check.
+func (s *NodeServer) checkIdentity(ctx context.Context, nodeID string) error {
+	id, ok := identityFromContext(ctx)
+	if !ok || id == nodeID {
+		return nil
+	}
+	s.logger.WarnContext(ctx, "request names a different node than the client certificate", "certificate_node", id, "requested_node", nodeID)
+	return newStatusError(codes.PermissionDenied, dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_IDENTITY_MISMATCH, "node_id does not match the identity in the client certificate", s.version)
+}
+
+func (s *NodeServer) notEnrolled(ctx context.Context, nodeID string) error {
+	s.logger.WarnContext(ctx, "rejected a node that is not enrolled", "node_id", nodeID)
+	return newStatusError(codes.PermissionDenied, dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_ENROLLED, "node is not enrolled; ask an administrator to enroll it", s.version)
+}
+
 // sessionError maps registry errors to protocol errors the agent can act on.
-func (s *NodeServer) sessionError(ctx context.Context, what string, err error) error {
+func (s *NodeServer) sessionError(ctx context.Context, what, nodeID string, err error) error {
 	switch {
+	case errors.Is(err, registry.ErrNotEnrolled):
+		return s.notEnrolled(ctx, nodeID)
 	case errors.Is(err, registry.ErrNotRegistered):
 		return newStatusError(codes.FailedPrecondition, dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_NOT_REGISTERED, "node is not registered; register again", s.version)
 	case errors.Is(err, registry.ErrSessionSuperseded):
@@ -124,6 +174,9 @@ func (s *NodeServer) sessionError(ctx context.Context, what string, err error) e
 }
 
 func (s *NodeServer) RegisterNode(ctx context.Context, req *dockfleetv1.RegisterNodeRequest) (*dockfleetv1.RegisterNodeResponse, error) {
+	if err := s.checkIdentity(ctx, req.GetIdentity().GetNodeId()); err != nil {
+		return nil, err
+	}
 	if err := checkAgentVersion(s.version, req.GetProtocolVersion()); err != nil {
 		s.logger.WarnContext(ctx, "registration rejected", "reason", err.Error())
 		return nil, newStatusError(codes.FailedPrecondition, dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_INCOMPATIBLE_VERSION, err.Error(), s.version)
@@ -154,6 +207,9 @@ func (s *NodeServer) RegisterNode(ctx context.Context, req *dockfleetv1.Register
 		Labels:       id.GetLabels(),
 		AgentVersion: id.GetAgentVersion(),
 	})
+	if errors.Is(err, registry.ErrNotEnrolled) {
+		return nil, s.notEnrolled(ctx, id.GetNodeId())
+	}
 	if err != nil {
 		return nil, s.internal(ctx, "register node", err)
 	}
@@ -168,6 +224,9 @@ func (s *NodeServer) RegisterNode(ctx context.Context, req *dockfleetv1.Register
 }
 
 func (s *NodeServer) Heartbeat(ctx context.Context, req *dockfleetv1.HeartbeatRequest) (*dockfleetv1.HeartbeatResponse, error) {
+	if err := s.checkIdentity(ctx, req.GetNodeId()); err != nil {
+		return nil, err
+	}
 	if len(req.GetStatuses()) > maxStatuses {
 		return nil, s.invalid("too many workload statuses")
 	}
@@ -186,14 +245,17 @@ func (s *NodeServer) Heartbeat(ctx context.Context, req *dockfleetv1.HeartbeatRe
 	}
 	workloads, err := s.registry.Heartbeat(ctx, req.GetNodeId(), req.GetSessionId(), reports)
 	if err != nil {
-		return nil, s.sessionError(ctx, "heartbeat", err)
+		return nil, s.sessionError(ctx, "heartbeat", req.GetNodeId(), err)
 	}
 	return &dockfleetv1.HeartbeatResponse{Assignments: toAssignments(workloads)}, nil
 }
 
 func (s *NodeServer) DeregisterNode(ctx context.Context, req *dockfleetv1.DeregisterNodeRequest) (*dockfleetv1.DeregisterNodeResponse, error) {
+	if err := s.checkIdentity(ctx, req.GetNodeId()); err != nil {
+		return nil, err
+	}
 	if err := s.registry.Deregister(ctx, req.GetNodeId(), req.GetSessionId()); err != nil {
-		return nil, s.sessionError(ctx, "deregister node", err)
+		return nil, s.sessionError(ctx, "deregister node", req.GetNodeId(), err)
 	}
 	return &dockfleetv1.DeregisterNodeResponse{}, nil
 }

@@ -69,7 +69,10 @@ func New(cfg Config) *Agent {
 // from the manager. Transient manager outages are retried with exponential
 // backoff and never end the agent. It returns an error only for failures that
 // retrying cannot fix: an incompatible protocol version, an invalid
-// registration, or rejected credentials.
+// registration, a node ID that differs from the client certificate, or
+// rejected credentials. A node that is not enrolled, or whose certificate is
+// expired, is retried: an administrator enrolling it or renewing the
+// certificate fixes it without restarting the agent.
 func (a *Agent) Run(ctx context.Context) error {
 	a.checkDocker(ctx)
 	for {
@@ -81,7 +84,11 @@ func (a *Agent) Run(ctx context.Context) error {
 			}
 			return err
 		}
-		if lost := a.serve(ctx, session); !lost {
+		lost, err := a.serve(ctx, session)
+		if err != nil {
+			return err
+		}
+		if !lost {
 			a.deregister(ctx, session)
 			a.cfg.Logger.Info("agent stopped")
 			return nil
@@ -119,7 +126,11 @@ func (a *Agent) register(ctx context.Context) (protocol.Session, error) {
 			a.cfg.Logger.Error("manager rejected registration", "error", err)
 			return protocol.Session{}, fmt.Errorf("registration rejected: %w", err)
 		}
-		a.cfg.Logger.Warn("registration failed", "error", err, "retry_in", delay)
+		if protocol.IsNotEnrolled(err) {
+			a.cfg.Logger.Error("this node is not enrolled; an administrator must enroll it", "node_id", a.cfg.Node.ID, "retry_in", delay)
+		} else {
+			a.cfg.Logger.Warn("registration failed", "error", err, "retry_in", delay)
+		}
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
@@ -131,9 +142,10 @@ func (a *Agent) register(ctx context.Context) (protocol.Session, error) {
 	}
 }
 
-// serve heartbeats until ctx ends (it returns false) or the manager no longer
-// recognizes the session (it returns true and the caller registers again).
-func (a *Agent) serve(ctx context.Context, session protocol.Session) (sessionLost bool) {
+// serve heartbeats until ctx ends (false, nil), the manager no longer
+// recognizes the session (true, nil: the caller registers again), or the
+// manager reports a failure that retrying cannot fix (an error).
+func (a *Agent) serve(ctx context.Context, session protocol.Session) (sessionLost bool, err error) {
 	a.reconcile(session.Assignments)
 	interval := session.HeartbeatInterval
 	if interval <= 0 {
@@ -145,23 +157,26 @@ func (a *Agent) serve(ctx context.Context, session protocol.Session) (sessionLos
 	for {
 		select {
 		case <-ctx.Done():
-			return false
+			return false, nil
 		case <-ticker.C:
 		}
 
 		callCtx, cancel := context.WithTimeout(ctx, a.cfg.RPCTimeout)
-		assigned, err := a.cfg.Manager.Heartbeat(callCtx, a.cfg.Node.ID, session.ID, a.snapshot())
+		assigned, hbErr := a.cfg.Manager.Heartbeat(callCtx, a.cfg.Node.ID, session.ID, a.snapshot())
 		cancel()
 		switch {
-		case err == nil:
+		case hbErr == nil:
 			a.reconcile(assigned)
 		case ctx.Err() != nil:
-			return false
-		case protocol.NeedsRegistration(err):
-			a.cfg.Logger.Warn("manager no longer recognizes this session; registering again", "error", err)
-			return true
+			return false, nil
+		case protocol.NeedsRegistration(hbErr):
+			a.cfg.Logger.Warn("manager no longer recognizes this session; registering again", "error", hbErr)
+			return true, nil
+		case protocol.IsPermanent(hbErr):
+			a.cfg.Logger.Error("manager rejected the agent; giving up", "error", hbErr)
+			return false, fmt.Errorf("heartbeat rejected: %w", hbErr)
 		default:
-			a.cfg.Logger.Warn("heartbeat failed", "error", err)
+			a.cfg.Logger.Warn("heartbeat failed", "error", hbErr)
 		}
 	}
 }

@@ -17,9 +17,15 @@ import (
 	"github.com/dockfleet/dockfleet/internal/netutil"
 )
 
-// ErrInsecureRemote is returned when a plaintext connection to a non-loopback
-// manager is requested. Remote access requires TLS.
-var ErrInsecureRemote = errors.New("refusing plaintext connection to a non-loopback address; configure TLS")
+var (
+	// ErrInsecureRemote is returned when a plaintext connection to a non-loopback
+	// manager is requested. Remote access requires mutual TLS; there is no
+	// plaintext fallback.
+	ErrInsecureRemote = errors.New("refusing plaintext connection to a non-loopback address; configure mutual TLS")
+	// ErrNoClientCertificate is returned for a TLS configuration that cannot
+	// present a client certificate; the manager requires one.
+	ErrNoClientCertificate = errors.New("TLS config has no client certificate; mutual TLS is required")
+)
 
 // NodeInfo describes a node as announced by its agent.
 type NodeInfo struct {
@@ -42,10 +48,13 @@ type Session struct {
 type ClientConfig struct {
 	// Addr is the manager's host:port (or any gRPC target when Dialer is set).
 	Addr string
-	// Token is the agent bearer token.
-	Token string
-	// TLS enables TLS when non-nil. Without it Addr must be loopback.
+	// TLS enables mutual TLS when non-nil: it must verify the manager and
+	// present the agent certificate (see pki.ClientTLS). Without it Addr must
+	// be loopback and Token authenticates the agent.
 	TLS *tls.Config
+	// Token is the bearer token for plaintext loopback development. It is not
+	// sent over TLS, where the client certificate is the credential.
+	Token string
 	// Dialer replaces the network dialer, for example with an in-memory
 	// transport in tests. The loopback rule cannot be checked for custom
 	// dialers, so the caller vouches for them.
@@ -71,18 +80,24 @@ func Dial(cfg ClientConfig) (*Client, error) {
 	if cfg.TLS == nil && cfg.Dialer == nil && !netutil.IsLoopbackAddr(cfg.Addr) {
 		return nil, ErrInsecureRemote
 	}
-	creds := credentials.TransportCredentials(insecure.NewCredentials())
+	var opts []grpc.DialOption
 	if cfg.TLS != nil {
-		creds = credentials.NewTLS(cfg.TLS)
+		if len(cfg.TLS.Certificates) == 0 && cfg.TLS.GetClientCertificate == nil {
+			return nil, ErrNoClientCertificate
+		}
+		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(cfg.TLS)))
+	} else {
+		opts = append(opts,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithPerRPCCredentials(tokenCredentials{token: cfg.Token}),
+		)
 	}
-	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(creds),
-		grpc.WithPerRPCCredentials(tokenCredentials{token: cfg.Token, secure: cfg.TLS != nil}),
+	opts = append(opts,
 		grpc.WithConnectParams(grpc.ConnectParams{
 			Backoff:           backoff.Config{BaseDelay: 500 * time.Millisecond, Multiplier: 1.6, Jitter: 0.2, MaxDelay: 10 * time.Second},
 			MinConnectTimeout: 5 * time.Second,
 		}),
-	}
+	)
 	if cfg.Dialer != nil {
 		opts = append(opts, grpc.WithContextDialer(cfg.Dialer))
 	}

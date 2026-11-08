@@ -22,6 +22,9 @@ import (
 var (
 	ErrNotRegistered     = errors.New("node is not registered")
 	ErrSessionSuperseded = errors.New("session was superseded by a newer registration")
+	// ErrNotEnrolled means no active enrollment exists for the node: it was
+	// never enrolled or an administrator revoked it.
+	ErrNotEnrolled = errors.New("node is not enrolled")
 )
 
 // Store is the subset of store.Store the registry uses.
@@ -30,6 +33,7 @@ type Store interface {
 	Heartbeat(ctx context.Context, id string, at time.Time) error
 	ListWorkloadsForNode(ctx context.Context, nodeID string) ([]store.Workload, error)
 	UpdateWorkloadStatus(ctx context.Context, id, nodeID, state, message string, at time.Time) error
+	GetEnrollment(ctx context.Context, nodeID string) (store.Enrollment, error)
 }
 
 // Session identifies one registration of a node.
@@ -68,10 +72,28 @@ func newSessionID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// checkEnrolled returns ErrNotEnrolled unless an active enrollment exists.
+func (r *Registry) checkEnrolled(ctx context.Context, nodeID string) error {
+	e, err := r.store.GetEnrollment(ctx, nodeID)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return ErrNotEnrolled
+	case err != nil:
+		return fmt.Errorf("check enrollment: %w", err)
+	case !e.Active():
+		return ErrNotEnrolled
+	}
+	return nil
+}
+
 // Register persists the node, starts a new session for it (replacing any
-// earlier one) and returns the workloads currently assigned to it. The caller
-// must have validated n.
+// earlier one) and returns the workloads currently assigned to it. Only
+// enrolled nodes may register; nothing is stored for others. The caller must
+// have validated n.
 func (r *Registry) Register(ctx context.Context, n store.Node) (Session, []store.Workload, error) {
+	if err := r.checkEnrolled(ctx, n.ID); err != nil {
+		return Session{}, nil, err
+	}
 	now := r.now()
 	n.RegisteredAt = now
 	n.LastHeartbeat = now
@@ -104,6 +126,14 @@ func (r *Registry) Register(ctx context.Context, n store.Node) (Session, []store
 // are not assigned to the node are ignored.
 func (r *Registry) Heartbeat(ctx context.Context, nodeID, sessionID string, reports []StatusReport) ([]store.Workload, error) {
 	if err := r.check(nodeID, sessionID); err != nil {
+		return nil, err
+	}
+	// Re-checked on every heartbeat so a revocation takes effect immediately.
+	if err := r.checkEnrolled(ctx, nodeID); err != nil {
+		if errors.Is(err, ErrNotEnrolled) {
+			r.drop(nodeID, sessionID)
+			r.logger.WarnContext(ctx, "session ended: node enrollment is gone", "node_id", nodeID, "session", sessionID)
+		}
 		return nil, err
 	}
 	now := r.now()

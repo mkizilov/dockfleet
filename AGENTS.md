@@ -24,8 +24,9 @@ DockFleet is a distributed container orchestration system: a manager (control pl
 
 - `cmd/manager`, `cmd/agent`: entry points only. Parse config, wire dependencies, handle signals. No business logic.
 - `internal/manager` wires `api`, `protocol`, `registry` and `store`; `internal/agent` wires `protocol` and `docker`.
-- `internal/api` (admin HTTP), `internal/protocol` (gRPC service, client, versioning), `internal/registry` (manager-side node sessions), `internal/scheduler` (pure placement), `internal/store` (persistence), `internal/docker` (Engine client), `internal/netutil`, `internal/config`, `internal/logging`. `internal/integration` is tests only.
-- Lower layers (`store`, `scheduler`, `registry`, `config`, `logging`, `netutil`) must not import `api`, `protocol`, `manager` or `agent`. Depend on small interfaces (`store.Store`, `registry.Store`, `protocol.Registry`, `agent.Manager`, `docker.Client`) so each package is testable with fakes.
+- `internal/api` (admin HTTP), `internal/protocol` (gRPC service, client, versioning), `internal/registry` (manager-side node sessions), `internal/scheduler` (pure placement), `internal/store` (persistence), `internal/docker` (Engine client), `internal/netutil`, `internal/pki` (certificates, node identity, TLS configs; imports nothing from the other internal packages), `internal/config`, `internal/logging`. `cmd/pki` is the certificate CLI. `internal/integration` is tests only.
+- Lower layers (`store`, `scheduler`, `registry`, `config`, `logging`, `netutil`, `pki`) must not import `api`, `protocol`, `manager` or `agent`. Depend on small interfaces (`store.Store`, `registry.Store`, `protocol.Registry`, `agent.Manager`, `docker.Client`) so each package is testable with fakes.
+- Authentication changes (mutual TLS, identity, enrollment) update `docs/mtls.md` and `docs/protocol.md` and get tests in `internal/pki`, `internal/protocol` and `internal/integration` for the failure cases (untrusted, wrong identity, expired, not enrolled, no plaintext fallback), not only the happy path.
 - The wire protocol is `proto/dockfleet/v1/fleet.proto` and `docs/protocol.md`. Any protocol change updates both, follows the versioning rules there, and is exercised in `internal/integration`.
 - Generated protobuf code lives in `internal/protocol/dockfleet/` and is git-ignored. Edit `proto/`, then run `make proto`. Never hand-edit generated files.
 
@@ -40,7 +41,7 @@ DockFleet is a distributed container orchestration system: a manager (control pl
 ### Test coverage
 
 - Every new package or behavior ships with tests in the same change; bug fixes include a regression test that fails without the fix.
-- Test through interfaces with fakes. Use `bufconn` for gRPC and `httptest` recorders or fake `http.RoundTripper`s for HTTP and Docker; open a real socket only when the test is about the socket, and then only on `127.0.0.1` in ports 21200–21299 (currently 21290–21293 in `internal/manager`; `internal/integration` uses an in-memory transport and no ports). Use `t.TempDir()` for files.
+- Test through interfaces with fakes. Use `bufconn` for gRPC and `httptest` recorders or fake `http.RoundTripper`s for HTTP and Docker; open a real socket only when the test is about the socket, and then only on `127.0.0.1` in ports 21200–21299 (currently 21290–21295 in `internal/manager`; `internal/integration` uses an in-memory transport and no ports). Use `t.TempDir()` for files.
 - Tests must not need Docker, a database or the internet. PostgreSQL tests are tagged `integration` and read `DOCKFLEET_TEST_DATABASE_URL`; both stores must keep passing `runStoreConformance`.
 - Tests must be deterministic: no fixed sleeps as synchronization (poll with a deadline), injected clocks where time matters, and `-race` clean.
 - Cover failure paths (bad input, auth failure, dependency errors, cancellation), not only success.
@@ -54,7 +55,8 @@ DockFleet is a distributed container orchestration system: a manager (control pl
 
 ### Secure defaults
 
-- Bind to loopback by default; a non-loopback bind requires TLS. Tokens are mandatory and are never defaulted, logged, echoed in errors or committed. The only credentials in the repository are the labeled throwaway values in `config/dev.env`.
+- Bind to loopback by default; a non-loopback bind requires TLS, and TLS on the agent listener means mutual TLS with a verified, identity-bound, enrolled client. Never add a plaintext fallback or a TLS mode without client certificates. Tokens are never defaulted, logged, echoed in errors or committed. The only credentials in the repository are the labeled throwaway tokens in `config/dev.env`.
+- Private keys and certificates for development live in the git-ignored `.dev-pki/` (`make dev-pki`), are written owner-only and are never printed, logged or committed; `make check-secrets` (part of `make check`) must pass. Test keys are generated in memory or `t.TempDir()`.
 - Validate all external input (HTTP, gRPC, env, files) at the boundary and bound its size. Compare secrets in constant time. Use parameterized SQL only.
 - Never expose the Docker Engine API over non-loopback TCP. Do not mount or use the host Docker socket from this development environment; Docker-dependent steps are written but reported as unverified here.
 - Do not log secrets, tokens, database URLs or request bodies.
@@ -67,7 +69,7 @@ Run from the repository root with a Go 1.23+ toolchain, installed under this rep
 make generate           # pinned buf + protoc plugins into .tools/bin, lint, generate code (needs network once)
 make proto-lint proto   # lint and generate protobuf code with the tools already installed
 make tidy               # go mod tidy; writes go.sum (needs network)
-make check              # gofmt check, go vet, go test -race ./...
+make check              # gofmt check, go vet, secret scan, go test -race ./...
 make build              # bin/dockfleet-manager, bin/dockfleet-agent
 make test-integration   # PostgreSQL store tests; needs `make compose-up`
 ```
