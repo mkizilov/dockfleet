@@ -255,6 +255,65 @@ func TestLoadManagerReconcileInterval(t *testing.T) {
 	}
 }
 
+func TestLoadManagerNodeFailureTimings(t *testing.T) {
+	c, err := LoadManager(getenv(managerEnv()))
+	if err != nil || c.NodeLease != time.Minute || c.NodeUnavailableAfter != 2*time.Minute {
+		t.Fatalf("defaults: lease %s, unavailable after %s, %v", c.NodeLease, c.NodeUnavailableAfter, err)
+	}
+	vars := managerEnv()
+	vars["DOCKFLEET_NODE_LEASE"], vars["DOCKFLEET_NODE_UNAVAILABLE_AFTER"] = "45s", "5m"
+	if c, err = LoadManager(getenv(vars)); err != nil || c.NodeLease != 45*time.Second || c.NodeUnavailableAfter != 5*time.Minute {
+		t.Fatalf("explicit: lease %s, unavailable after %s, %v", c.NodeLease, c.NodeUnavailableAfter, err)
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(map[string]string)
+		wantErr string
+	}{
+		{"unparsable lease", func(m map[string]string) { m["DOCKFLEET_NODE_LEASE"] = "long" }, "DOCKFLEET_NODE_LEASE"},
+		{"zero unavailable limit", func(m map[string]string) { m["DOCKFLEET_NODE_UNAVAILABLE_AFTER"] = "0s" }, "DOCKFLEET_NODE_UNAVAILABLE_AFTER"},
+		// One lost heartbeat must not end a lease.
+		{"lease shorter than two heartbeats", func(m map[string]string) { m["DOCKFLEET_NODE_LEASE"] = "15s" }, "at least twice"},
+		// Otherwise a replica could run on the lost node and on a new one.
+		{"given up on before the lease can end", func(m map[string]string) { m["DOCKFLEET_NODE_UNAVAILABLE_AFTER"] = "65s" }, "fenced itself"},
+		{"given up on exactly when the lease ends", func(m map[string]string) {
+			m["DOCKFLEET_NODE_LEASE"], m["DOCKFLEET_NODE_UNAVAILABLE_AFTER"] = "60s", "60s"
+		}, "fenced itself"},
+		{"unavailable before suspect", func(m map[string]string) {
+			m["DOCKFLEET_NODE_TTL"], m["DOCKFLEET_NODE_LEASE"], m["DOCKFLEET_NODE_UNAVAILABLE_AFTER"] = "3m", "30s", "90s"
+		}, "longer than DOCKFLEET_NODE_TTL"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vars := managerEnv()
+			tt.mutate(vars)
+			if _, err := LoadManager(getenv(vars)); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want it to mention %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadAgentFencing(t *testing.T) {
+	c, err := LoadAgent(getenv(agentEnv()))
+	if err != nil || !c.FenceOnLeaseLoss {
+		t.Fatalf("fencing is on by default: %+v, %v", c, err)
+	}
+	for value, want := range map[string]bool{"false": false, "0": false, "true": true, "1": true} {
+		vars := agentEnv()
+		vars["DOCKFLEET_FENCE_ON_LEASE_LOSS"] = value
+		if c, err := LoadAgent(getenv(vars)); err != nil || c.FenceOnLeaseLoss != want {
+			t.Errorf("%q: fencing = %v, %v", value, c.FenceOnLeaseLoss, err)
+		}
+	}
+	vars := agentEnv()
+	vars["DOCKFLEET_FENCE_ON_LEASE_LOSS"] = "sometimes"
+	if _, err := LoadAgent(getenv(vars)); err == nil || !strings.Contains(err.Error(), "DOCKFLEET_FENCE_ON_LEASE_LOSS") {
+		t.Errorf("error = %v, want one naming the setting", err)
+	}
+}
+
 func TestLoadManagerInstanceID(t *testing.T) {
 	first, err := LoadManager(getenv(managerEnv()))
 	if err != nil {

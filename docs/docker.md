@@ -57,6 +57,7 @@ Containers are addressed **only by workload ID**, never by Docker ID or name. Ea
 - named volumes not called `dockfleet-<name>`, so unrelated volumes stay untouched;
 - published ports on non-loopback addresses (ports default to `127.0.0.1`);
 - missing CPU or memory limits (every container runs limited, swap disabled, with a PID limit of 512 unless lowered or raised up to 32768);
+- a health check that is not bounded: the command is the exec form (a leading `CMD`, `CMD-SHELL` or `NONE` is refused, so there is never a shell string), 1 to 32 arguments of at most 1024 bytes, an interval of 1 s to 1 h, a timeout of 1 s to 5 min, a start period up to 1 h and 1 to 10 retries. Docker runs it inside the container, with the container's own privileges, and the container's state then carries `starting`, `healthy` or `unhealthy`, which `Inspect` reports and the agent acts on ([failure-handling.md](failure-handling.md));
 - malformed workload IDs, image references, environment names, users, mount targets, and oversized lists.
 
 The Docker layer (`sdk.go`) applies the same hardening independently of the spec: privileged off, `CapDrop: ALL`, `no-new-privileges`, no restart policy, bounded `json-file` logs, no host namespaces, no binds outside `Mounts` with `rprivate` propagation, and `bridge`/`none` networking only. `TestBuildConfigsIgnoresUnsafeFieldsEvenIfPolicyWereBypassed` checks that unsafe fields cannot leak through.

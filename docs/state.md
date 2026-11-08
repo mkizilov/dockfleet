@@ -40,6 +40,7 @@ Migrations are embedded in the binary (`internal/store/migrations/NNN_descriptio
 | 007 | `leases` |
 | 008 | `ports` (jsonb) on `workloads`, so the scheduler can keep two workloads from claiming one host port on a node; `unschedulable_replicas` |
 | 009 | `generation` and `runtime` (jsonb: command, environment, restart policy) on `workloads`; `acknowledged_generation` on `workload_observations` |
+| 010 | `health`, `health_since` and `deregistered_at` on `nodes`; `health` on `workload_observations`; a replica slot is now owned by the workload in it that is meant to run (partial unique index `workloads_running_replica_key`) instead of by any workload, and `runtime` also holds the health check |
 
 Tables and the indexes that serve the queries:
 
@@ -111,7 +112,7 @@ What is *not* done yet: no leader election is running (the lease primitive exist
 
 ## Administrative events
 
-`events` is an append-only audit trail written in the same transaction as the change it describes. Each event has the time, the manager instance, an actor (`admin` for the shared admin token, `node:<id>` for agents), an action, a resource and free-form details. Recorded today: `enrollment.created`, `enrollment.revoked`, `workload.created`, `node.registered`, `node.deregistered`, `node.session_ended`; by the scheduler (actor `scheduler`), `replica.scheduled` (resource: the workload) and `replica.unschedulable` (resource: the service; only when the explanation is new or changed), and by the reconciler (actor `reconciler`), `replica.stopped` and `replica.removed` (resource: the workload; the details give the reason). Requests that fail or change nothing record nothing. `GET /v1/events` lists them newest first (`resource_type`, `resource_id`, `before` for paging, `limit`). Service changes add `service.created`, `service.deployed`, `service.scaled` and `service.deleted`.
+`events` is an append-only audit trail written in the same transaction as the change it describes. Each event has the time, the manager instance, an actor (`admin` for the shared admin token, `node:<id>` for agents), an action, a resource and free-form details. Recorded today: `enrollment.created`, `enrollment.revoked`, `workload.created`, `node.registered`, `node.deregistered`, `node.session_ended`; by agents' reports (actor `node:<id>`, resource: the workload), `workload.failed`, `workload.unhealthy`, `workload.restarted` and `workload.recovered`; by the reconciler (actor `reconciler`, resource: the node), `node.suspect`, `node.unavailable` and `node.recovered` ([failure-handling.md](failure-handling.md)); by the scheduler (actor `scheduler`), `replica.scheduled` (resource: the workload) and `replica.unschedulable` (resource: the service; only when the explanation is new or changed), and by the reconciler (actor `reconciler`), `replica.stopped` and `replica.removed` (resource: the workload; the details give the reason). Requests that fail or change nothing record nothing. `GET /v1/events` lists them newest first (`resource_type`, `resource_id`, `before` for paging, `limit`). Service changes add `service.created`, `service.deployed`, `service.scaled` and `service.deleted`.
 
 ## Tests
 

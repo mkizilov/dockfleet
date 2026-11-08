@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 // ErrRejected is wrapped by every error that says a ContainerSpec violates the
@@ -44,6 +45,13 @@ const (
 	minMemoryBytes = 6 << 20
 	maxCPUMillis   = 1_000_000
 	maxImageLength = 255
+
+	maxHealthArgs        = 32
+	maxHealthArgBytes    = 1024
+	maxHealthRetries     = 10
+	maxHealthInterval    = time.Hour
+	maxHealthTimeout     = 5 * time.Minute
+	maxHealthStartPeriod = time.Hour
 )
 
 // deniedCapabilities can never be granted, whatever the policy allows. They
@@ -222,7 +230,41 @@ func (p *Policy) Validate(spec ContainerSpec) error {
 
 	p.checkPorts(spec.Ports, reject)
 	p.checkMounts(spec.Mounts, reject)
+	checkHealth(spec.HealthCheck, reject)
 	return errors.Join(errs...)
+}
+
+// checkHealth bounds a health check. Its command runs inside the container with
+// the container's own privileges, so it adds no access, but an unbounded one
+// could keep the daemon busy.
+func checkHealth(h *HealthCheck, reject rejectFunc) {
+	if h == nil {
+		return
+	}
+	switch {
+	case len(h.Command) == 0 || len(h.Command) > maxHealthArgs:
+		reject("HealthCheck", "the command needs 1-%d arguments", maxHealthArgs)
+	case h.Command[0] == "CMD" || h.Command[0] == "CMD-SHELL" || h.Command[0] == "NONE":
+		reject("HealthCheck", "the command must start with the program to run, not %q: only the exec form is supported", h.Command[0])
+	}
+	for _, arg := range h.Command {
+		if len(arg) > maxHealthArgBytes || strings.Contains(arg, "\x00") {
+			reject("HealthCheck", "arguments must be at most %d bytes and contain no NUL", maxHealthArgBytes)
+			break
+		}
+	}
+	if h.Interval < time.Second || h.Interval > maxHealthInterval {
+		reject("HealthCheck", "the interval must be between 1s and %s", maxHealthInterval)
+	}
+	if h.Timeout < time.Second || h.Timeout > maxHealthTimeout {
+		reject("HealthCheck", "the timeout must be between 1s and %s", maxHealthTimeout)
+	}
+	if h.StartPeriod < 0 || h.StartPeriod > maxHealthStartPeriod {
+		reject("HealthCheck", "the start period must be between 0 and %s", maxHealthStartPeriod)
+	}
+	if h.Retries < 1 || h.Retries > maxHealthRetries {
+		reject("HealthCheck", "retries must be between 1 and %d", maxHealthRetries)
+	}
 }
 
 type rejectFunc func(field, format string, args ...any)

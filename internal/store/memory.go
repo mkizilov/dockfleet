@@ -207,10 +207,41 @@ func (m *Memory) UpsertNode(_ context.Context, n Node) (Node, error) {
 	defer m.mu.Unlock()
 	if old, ok := m.s.nodes[n.ID]; ok {
 		n.RegisteredAt = old.RegisteredAt
+		n.Health, n.HealthSince = old.Health, old.HealthSince
+	} else {
+		n.Health, n.HealthSince = NodeHealthy, n.RegisteredAt
 	}
+	n.DeregisteredAt = time.Time{}
 	n = cloneNode(n)
 	m.s.nodes[n.ID] = n
 	return cloneNode(n), nil
+}
+
+func (m *Memory) DeregisterNode(_ context.Context, id string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n, ok := m.s.nodes[id]
+	if !ok {
+		return ErrNotFound
+	}
+	n.LastHeartbeat, n.DeregisteredAt = time.Time{}, at.UTC()
+	m.s.nodes[id] = n
+	return nil
+}
+
+func (m *Memory) SetNodeHealth(_ context.Context, id, health string, at time.Time) error {
+	if !ValidNodeHealth(health) {
+		return fmt.Errorf("%w: node health %q must be healthy, suspect or unavailable", ErrInvalid, health)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n, ok := m.s.nodes[id]
+	if !ok {
+		return ErrNotFound
+	}
+	n.Health, n.HealthSince = health, at.UTC()
+	m.s.nodes[id] = n
+	return nil
 }
 
 func (m *Memory) Heartbeat(_ context.Context, id string, at time.Time) error {
@@ -304,6 +335,7 @@ func (m *Memory) view(w Workload) Workload {
 		w.Env = cloneLabels(w.Env)
 	}
 	w.RestartPolicy = clonePtr(w.RestartPolicy)
+	w.HealthCheck = cloneHealthCheck(w.HealthCheck)
 	if o, ok := m.s.observations[w.ID]; ok {
 		c := cloneObservation(o)
 		w.Observed = &c
@@ -328,12 +360,20 @@ func (m *Memory) CreateWorkload(_ context.Context, w Workload) (Workload, error)
 		switch {
 		case existing.ID == w.ID || existing.Name == w.Name:
 			return Workload{}, ErrConflict
-		case w.ServiceID != "" && existing.ServiceID == w.ServiceID && existing.ServiceRevision == w.ServiceRevision && existing.ReplicaIndex == w.ReplicaIndex:
+		case m.holdsSlot(existing, w):
 			return Workload{}, ErrConflict
 		}
 	}
 	m.s.workloads[w.ID] = w
 	return m.view(w), nil
+}
+
+// holdsSlot is whether two workloads both claim the same replica slot of a
+// service revision. A slot belongs to one workload that is meant to run; any
+// number of stopped ones, whose containers are on their way out, may remain.
+func (m *Memory) holdsSlot(a, b Workload) bool {
+	return b.ServiceID != "" && a.ServiceID == b.ServiceID && a.ServiceRevision == b.ServiceRevision && a.ReplicaIndex == b.ReplicaIndex &&
+		a.DesiredState == DesiredRunning && b.DesiredState == DesiredRunning
 }
 
 func (m *Memory) GetWorkload(_ context.Context, id string) (Workload, error) {
@@ -392,6 +432,13 @@ func (m *Memory) SetWorkloadDesiredState(_ context.Context, id, desired string, 
 	}
 	if w.DesiredState == desired {
 		return m.view(w), ErrUnchanged
+	}
+	next := w
+	next.DesiredState = desired
+	for _, other := range m.s.workloads {
+		if other.ID != w.ID && m.holdsSlot(other, next) {
+			return Workload{}, fmt.Errorf("%w: another workload is meant to run in the same replica slot", ErrConflict)
+		}
 	}
 	w.DesiredState = desired
 	w.Generation++

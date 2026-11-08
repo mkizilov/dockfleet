@@ -130,6 +130,7 @@ var serviceTests = []serviceTest{
 	{"authentication", testServiceAuthentication},
 	{"create and inspect", testServiceCreateAndGet},
 	{"full definition", testServiceFullDefinition},
+	{"restart limits and backoff", testServiceRestartBackoff},
 	{"list", testServiceList},
 	{"unknown services", testServiceNotFound},
 	{"duplicate names", testServiceDuplicateName},
@@ -332,6 +333,38 @@ func testServiceFullDefinition(t *testing.T, e *serviceEnv) {
 		if rp := e.get(name).Spec.RestartPolicy; rp == nil || rp.Condition != condition || rp.MaxRetries != 0 {
 			t.Errorf("restart policy %q = %+v", condition, rp)
 		}
+	}
+}
+
+func testServiceRestartBackoff(t *testing.T, e *serviceEnv) {
+	service := func(name, policy string) string {
+		return `{"name":"` + name + `","replicas":0,"spec":{"image":"x","cpu_millis":1,"memory_bytes":134217728,"restart_policy":` + policy + `}}`
+	}
+
+	// "always" may be given a limit and a backoff of its own.
+	e.create(service("limited", `{"condition":"always","max_retries":4,"backoff_seconds":2,"max_backoff_seconds":30}`))
+	want := &store.RestartPolicy{Condition: store.RestartAlways, MaxRetries: 4, BackoffSeconds: 2, MaxBackoffSeconds: 30}
+	if got := e.get("limited").Spec.RestartPolicy; !reflect.DeepEqual(got, want) {
+		t.Fatalf("restart policy = %+v, want %+v", got, want)
+	}
+
+	// Without them it restarts without limit, after the default waits.
+	e.create(service("unlimited", `{"condition":"always"}`))
+	if got := e.get("unlimited").Spec.RestartPolicy; !reflect.DeepEqual(got, &store.RestartPolicy{Condition: store.RestartAlways}) {
+		t.Fatalf("restart policy = %+v", got)
+	}
+
+	// Writing the default down is the same definition as leaving it out.
+	e.create(service("explicit", `{"condition":"on-failure","max_retries":5,"backoff_seconds":1,"max_backoff_seconds":60}`))
+	e.create(service("implicit", `{"condition":"on-failure"}`))
+	if a, b := e.get("explicit").Spec, e.get("implicit").Spec; !reflect.DeepEqual(a, b) || a.Hash() != b.Hash() {
+		t.Fatalf("equivalent restart policies differ: %+v vs %+v", a.RestartPolicy, b.RestartPolicy)
+	}
+
+	// A backoff of the default maximum is allowed when the maximum is raised with it.
+	e.create(service("slow", `{"condition":"on-failure","backoff_seconds":120,"max_backoff_seconds":600}`))
+	if got := e.get("slow").Spec.RestartPolicy; got.BackoffSeconds != 120 || got.MaxBackoffSeconds != 600 || got.MaxRetries != 5 {
+		t.Fatalf("restart policy = %+v", got)
 	}
 }
 

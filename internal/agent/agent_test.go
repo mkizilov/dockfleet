@@ -34,6 +34,7 @@ type fakeManager struct {
 	deregistered  []string
 	deregisterErr error
 	interval      time.Duration
+	lease         time.Duration
 }
 
 func (f *fakeManager) Register(context.Context, protocol.NodeInfo) (protocol.Session, error) {
@@ -48,7 +49,7 @@ func (f *fakeManager) Register(context.Context, protocol.NodeInfo) (protocol.Ses
 		}
 	}
 	f.sessionSeq++
-	return protocol.Session{ID: "session-" + string(rune('0'+f.sessionSeq)), HeartbeatInterval: f.interval, Assignments: f.assignments}, nil
+	return protocol.Session{ID: "session-" + string(rune('0'+f.sessionSeq)), HeartbeatInterval: f.interval, Lease: f.lease, Assignments: f.assignments}, nil
 }
 
 func (f *fakeManager) Heartbeat(_ context.Context, _, sessionID string, statuses []*dockfleetv1.WorkloadStatus) ([]*dockfleetv1.WorkloadAssignment, error) {
@@ -184,6 +185,73 @@ func TestRunRegistersHeartbeatsAndDeregistersOnShutdown(t *testing.T) {
 	}
 	if got := m.deregistrations(); len(got) != 1 || got[0] != "session-1" {
 		t.Errorf("deregistrations = %v, want [session-1]", got)
+	}
+}
+
+// An agent that cannot get its heartbeats through stops its containers when
+// the lease runs out, and starts the same ones again as soon as the manager
+// answers: nothing is created or removed, and the pause is no failure.
+func TestRunFencesTheContainersWhenHeartbeatsStopAndResumesWhenTheyDo(t *testing.T) {
+	m := &fakeManager{interval: 2 * time.Millisecond, lease: 100 * time.Millisecond, assignments: []*dockfleetv1.WorkloadAssignment{assignment("w1")}}
+	engine := dockerfake.New("node-1")
+	engine.AddImage("img")
+	a := New(Config{
+		Node: protocol.NodeInfo{ID: "node-1"}, Manager: m, Docker: engine, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		RPCTimeout: time.Second, RetryMin: time.Millisecond, RetryMax: 4 * time.Millisecond, Resync: 5 * time.Millisecond,
+		FenceOnLeaseLoss: true,
+	})
+	start(t, a)
+	state := func() docker.State {
+		if got := engine.Managed(); len(got) == 1 {
+			return got[0].State
+		}
+		return ""
+	}
+	waitFor(t, "the container to run", func() bool { return state() == docker.StateRunning })
+
+	partition := make([]error, 100000)
+	for i := range partition {
+		partition[i] = status.Error(codes.Unavailable, "partition")
+	}
+	m.mu.Lock()
+	m.heartbeatErrs = partition
+	m.mu.Unlock()
+	waitFor(t, "the container to be stopped when the lease runs out", func() bool { return state() == docker.StateExited })
+	if engine.Count("remove") != 0 || engine.Count("create") != 1 {
+		t.Fatalf("calls = %v", engine.Calls())
+	}
+
+	m.mu.Lock()
+	m.heartbeatErrs = nil
+	m.mu.Unlock()
+	waitFor(t, "the container to run again", func() bool { return state() == docker.StateRunning })
+	if engine.Count("create") != 1 || engine.Count("stop") != 1 || engine.Count("start") != 2 || engine.Count("remove") != 0 {
+		t.Fatalf("calls = %v; the same container must run again", engine.Calls())
+	}
+}
+
+// Without fencing the same outage leaves the container alone.
+func TestRunLeavesContainersAloneWhenFencingIsOff(t *testing.T) {
+	m := &fakeManager{interval: 2 * time.Millisecond, lease: 20 * time.Millisecond, assignments: []*dockfleetv1.WorkloadAssignment{assignment("w1")}}
+	engine := dockerfake.New("node-1")
+	engine.AddImage("img")
+	start(t, newTestAgent(m, engine))
+	waitFor(t, "the container to run", func() bool {
+		got := engine.Managed()
+		return len(got) == 1 && got[0].State == docker.StateRunning
+	})
+
+	partition := make([]error, 100000)
+	for i := range partition {
+		partition[i] = status.Error(codes.Unavailable, "partition")
+	}
+	m.mu.Lock()
+	m.heartbeatErrs = partition
+	m.mu.Unlock()
+	before := len(m.calls())
+	waitFor(t, "many failed heartbeats, far more than the lease", func() bool { return len(m.calls()) >= before+50 })
+	if engine.Count("stop") != 0 {
+		t.Fatalf("calls = %v", engine.Calls())
 	}
 }
 

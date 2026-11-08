@@ -165,7 +165,7 @@ func TestPlan(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var got []want
-			for _, a := range Plan(definitions(tt.services), tt.workloads, nil) {
+			for _, a := range Plan(definitions(tt.services), tt.workloads, nil, nil) {
 				got = append(got, want{a.Kind, a.Reason, a.Workload.Name})
 			}
 			if !reflect.DeepEqual(got, tt.want) {
@@ -189,7 +189,7 @@ func TestPlanDoesNotDependOnInputOrder(t *testing.T) {
 		}
 		return out
 	}
-	want := names(Plan(definitions(services), workloads, nil))
+	want := names(Plan(definitions(services), workloads, nil, nil))
 	if len(want) != 4 {
 		t.Fatalf("plan = %v", want)
 	}
@@ -197,7 +197,7 @@ func TestPlanDoesNotDependOnInputOrder(t *testing.T) {
 	for i, w := range workloads {
 		reversed[len(workloads)-1-i] = w
 	}
-	if got := names(Plan(definitions([]store.Service{services[1], services[0]}), reversed, nil)); !reflect.DeepEqual(got, want) {
+	if got := names(Plan(definitions([]store.Service{services[1], services[0]}), reversed, nil, nil)); !reflect.DeepEqual(got, want) {
 		t.Fatalf("plan = %v, want %v", got, want)
 	}
 }
@@ -208,8 +208,8 @@ func TestPlanConverges(t *testing.T) {
 	services := []store.Service{service("web", 1, 2)}
 	workloads := []store.Workload{up(workload("web", 1, 1)), up(workload("web", 1, 2)), up(workload("web", 2, 1))}
 
-	first := Plan(definitions(services), workloads, nil)
-	if len(first) != 2 || !reflect.DeepEqual(first, Plan(definitions(services), workloads, nil)) {
+	first := Plan(definitions(services), workloads, nil, nil)
+	if len(first) != 2 || !reflect.DeepEqual(first, Plan(definitions(services), workloads, nil, nil)) {
 		t.Fatalf("plan = %+v", first)
 	}
 	// Apply the stops, as the store would, then let the nodes confirm.
@@ -220,7 +220,7 @@ func TestPlanConverges(t *testing.T) {
 			}
 		}
 	}
-	second := Plan(definitions(services), workloads, nil)
+	second := Plan(definitions(services), workloads, nil, nil)
 	if len(second) != 2 || second[0].Kind != ActionDelete || second[1].Kind != ActionDelete {
 		t.Fatalf("after the nodes confirmed: %+v", second)
 	}
@@ -230,7 +230,7 @@ func TestPlanConverges(t *testing.T) {
 			left = append(left, w)
 		}
 	}
-	if third := Plan(definitions(services), left, nil); len(third) != 0 {
+	if third := Plan(definitions(services), left, nil, nil); len(third) != 0 {
 		t.Fatalf("the plan keeps asking for changes: %+v", third)
 	}
 }
@@ -277,7 +277,7 @@ func TestPlanHandsOverFixedHostPorts(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			actions := Plan(tt.defs, tt.current, tt.waiting)
+			actions := Plan(tt.defs, tt.current, tt.waiting, nil)
 			if len(actions) != tt.want {
 				t.Fatalf("plan = %+v, want %d actions", actions, tt.want)
 			}
@@ -285,5 +285,116 @@ func TestPlanHandsOverFixedHostPorts(t *testing.T) {
 				t.Fatalf("plan = %+v", actions)
 			}
 		})
+	}
+}
+
+func onNode(w store.Workload, node string) store.Workload {
+	w.NodeID = node
+	return w
+}
+
+func describe(actions []Action) []string {
+	out := []string{}
+	for _, a := range actions {
+		out = append(out, a.Kind+" "+a.Reason+" "+a.Workload.Name)
+	}
+	return out
+}
+
+// A node that has been silent for longer than its lease is given up on, and
+// the replicas on it are told to stop so that the scheduler can start them on
+// other nodes. Anything that has a more specific reason keeps it.
+func TestPlanGivesUpOnLostNodes(t *testing.T) {
+	lost := map[string]bool{"dead": true}
+	tests := []struct {
+		name      string
+		services  []store.Service
+		workloads []store.Workload
+		want      []string
+	}{
+		{"a replica on a lost node is stopped",
+			[]store.Service{service("web", 2, 1)},
+			[]store.Workload{up(onNode(workload("web", 1, 1), "dead")), up(workload("web", 1, 2))},
+			[]string{"stop node_unavailable web-r1-1"}},
+		{"whatever state the lost node last reported",
+			[]store.Service{service("web", 3, 1)},
+			[]store.Workload{
+				onNode(workload("web", 1, 1), "dead"),
+				observed(onNode(workload("web", 1, 2), "dead"), store.WorkloadFailed, 1),
+				up(onNode(workload("web", 1, 3), "dead"))},
+			[]string{"stop node_unavailable web-r1-1", "stop node_unavailable web-r1-2", "stop node_unavailable web-r1-3"}},
+		{"replicas on nodes that are not lost are left alone",
+			[]store.Service{service("web", 2, 1)},
+			[]store.Workload{up(workload("web", 1, 1)), up(onNode(workload("web", 1, 2), "other"))},
+			[]string{}},
+		{"a workload that was stopped on a lost node waits for the node: nothing confirms it",
+			[]store.Service{service("web", 1, 1)},
+			[]store.Workload{stopped(onNode(workload("web", 1, 1), "dead"))},
+			[]string{}},
+		{"a standalone workload is pinned to its node and is not moved",
+			nil,
+			[]store.Workload{standalone(onNode(workload("web", 1, 1), "dead"))},
+			[]string{}},
+		{"a scaled-down replica keeps the more specific reason",
+			[]store.Service{service("web", 1, 1)},
+			[]store.Workload{up(workload("web", 1, 1)), onNode(workload("web", 1, 2), "dead")},
+			[]string{"stop scaled_down web-r1-2"}},
+		{"an old revision's replica whose successor runs is superseded",
+			[]store.Service{service("web", 1, 2)},
+			[]store.Workload{up(onNode(workload("web", 1, 1), "dead")), up(workload("web", 2, 1))},
+			[]string{"stop superseded web-r1-1"}},
+		{"an old revision's replica with no successor yet is still given up on",
+			[]store.Service{service("web", 1, 2)},
+			[]store.Workload{up(onNode(workload("web", 1, 1), "dead"))},
+			[]string{"stop node_unavailable web-r1-1"}},
+		{"stopping and deleting go on beside it",
+			[]store.Service{service("web", 2, 1)},
+			[]store.Workload{onNode(workload("web", 1, 1), "dead"), gone(workload("web", 1, 2))},
+			[]string{"stop node_unavailable web-r1-1", "delete retired web-r1-2"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := describe(Plan(definitions(tt.services), tt.workloads, nil, lost))
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("plan = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// Each change of a node's health is reported once, against the state last recorded.
+func TestPlanNodesReportsEachChangeOnce(t *testing.T) {
+	timing := scheduler.Timing{SuspectAfter: 30 * time.Second, UnavailableAfter: 2 * time.Minute}
+	registered := at.Add(-24 * time.Hour)
+	node := func(id string, silent time.Duration, recorded string) store.Node {
+		return store.Node{ID: id, LastHeartbeat: at.Add(-silent), RegisteredAt: registered, Health: recorded}
+	}
+	// a is fine, b went quiet, c is given up on, d and h came back, e is still
+	// suspect, f has nothing recorded (which counts as healthy), g is still gone.
+	nodes := []store.Node{
+		node("e", time.Minute, store.NodeSuspect),
+		node("d", 0, store.NodeUnavailable),
+		node("c", time.Hour, store.NodeSuspect),
+		node("b", time.Minute, store.NodeHealthy),
+		node("a", 0, store.NodeHealthy),
+		node("f", 0, ""),
+		node("g", time.Hour, store.NodeUnavailable),
+		node("h", 10*time.Second, store.NodeUnavailable),
+	}
+	var got []string
+	for _, c := range PlanNodes(nodes, at, timing) {
+		got = append(got, c.Node.ID+": "+c.From+" -> "+c.To)
+	}
+	want := []string{
+		"b: healthy -> suspect",
+		"c: suspect -> unavailable",
+		"d: unavailable -> healthy",
+		"h: unavailable -> healthy",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("changes = %v, want %v", got, want)
+	}
+	if again := PlanNodes(nodes, at, timing); !reflect.DeepEqual(again, PlanNodes(nodes, at, timing)) {
+		t.Fatal("planning twice from the same snapshot gave different answers")
 	}
 }

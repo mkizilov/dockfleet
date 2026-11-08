@@ -449,7 +449,7 @@ func TestPostgresQueriesUseIndexes(t *testing.T) {
 		// Lookups only: ordering clauses are left out because with empty tables the
 		// planner is free to satisfy ORDER BY from another index instead.
 		{"workloads of a node", workloadSelect + ` WHERE w.node_id = 'n'`, "workloads_node_id_idx"},
-		{"replicas of a service", workloadSelect + ` WHERE w.service_id = 's'`, "workloads_replica_key"},
+		{"replicas of a service", workloadSelect + ` WHERE w.service_id = 's'`, "workloads_replica_idx"},
 		{"observations of a node", `SELECT * FROM workload_observations WHERE node_id = 'n'`, "workload_observations_node_idx"},
 		{"observation of a workload", `SELECT * FROM workload_observations WHERE workload_id = 'w'`, "workload_observations_pkey"},
 		{"service by active name", `SELECT ` + serviceColumns + ` FROM services WHERE name = 'web' AND deleted_at IS NULL`, "services_active_name_key"},

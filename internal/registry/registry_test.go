@@ -26,6 +26,22 @@ func (c *countingStore) RecordObservations(ctx context.Context, nodeID string, o
 	return c.Memory.RecordObservations(ctx, nodeID, obs)
 }
 
+// InTx counts the observations written inside a transaction, which is where
+// the registry writes them together with their events.
+func (c *countingStore) InTx(ctx context.Context, fn func(store.Tx) error) error {
+	return c.Memory.InTx(ctx, func(tx store.Tx) error { return fn(countingTx{Tx: tx, c: c}) })
+}
+
+type countingTx struct {
+	store.Tx
+	c *countingStore
+}
+
+func (t countingTx) RecordObservations(ctx context.Context, nodeID string, obs []store.Observation) error {
+	t.c.observationWrites += len(obs)
+	return t.Tx.RecordObservations(ctx, nodeID, obs)
+}
+
 type fixture struct {
 	reg   *Registry
 	store *countingStore
@@ -495,5 +511,130 @@ func TestDeregisterMarksNodeNotReady(t *testing.T) {
 	}
 	if err := f.reg.Deregister(ctx, "n1", s.ID); !errors.Is(err, ErrNotRegistered) {
 		t.Fatalf("second deregister error = %v, want ErrNotRegistered", err)
+	}
+}
+
+// A report that says a workload failed, turned unhealthy, was restarted or
+// came back is an audit event, once per change: the same report repeated says
+// nothing new.
+func TestFailuresAreRecordedAsEventsOnce(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	s, _, _ := f.reg.Register(ctx, node("n1"))
+	f.addWorkload(t, "w1", "n1")
+	exit := 1
+	report := func(r StatusReport) {
+		t.Helper()
+		f.clock = f.clock.Add(time.Second)
+		r.WorkloadID = "w1"
+		if _, err := f.reg.Heartbeat(ctx, "n1", s.ID, []StatusReport{r}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	report(StatusReport{State: store.WorkloadRunning, ContainerID: "c1"})
+	report(StatusReport{State: store.WorkloadFailed, ContainerID: "c1", ExitCode: &exit, Message: "exited with code 1"})
+	report(StatusReport{State: store.WorkloadFailed, ContainerID: "c1", ExitCode: &exit, Message: "exited with code 1"})
+	report(StatusReport{State: store.WorkloadRunning, ContainerID: "c1", RestartCount: 1})
+	report(StatusReport{State: store.WorkloadRunning, ContainerID: "c1", RestartCount: 1, Health: store.HealthUnhealthy})
+	report(StatusReport{State: store.WorkloadRunning, ContainerID: "c1", RestartCount: 1, Health: store.HealthUnhealthy, Message: "still"})
+	report(StatusReport{State: store.WorkloadRunning, ContainerID: "c1", RestartCount: 1, Health: store.HealthHealthy})
+
+	want := []string{
+		"node.registered",
+		"workload.failed",
+		"workload.recovered", "workload.restarted",
+		"workload.unhealthy",
+		"workload.recovered",
+	}
+	if got := f.events(t); !equal(got, want) {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+	list, err := f.store.ListEvents(ctx, store.EventFilter{ResourceType: "workload", ResourceID: "w1"})
+	if err != nil || len(list) != 5 {
+		t.Fatalf("workload events = %+v, %v", list, err)
+	}
+	failed := list[4]
+	if failed.Action != "workload.failed" || failed.Actor != "node:n1" || failed.Details["node_id"] != "n1" || failed.Message == "" {
+		t.Fatalf("failure event = %+v", failed)
+	}
+	if w, _ := f.store.GetWorkload(ctx, "w1"); w.Observed == nil || w.Observed.Health != store.HealthHealthy {
+		t.Fatalf("the health result must be stored with the observation: %+v", w.Observed)
+	}
+}
+
+// The first report of a workload that is fine says nothing, and neither does a
+// restart count that went back to zero because the agent restarted.
+func TestHealthyReportsAndAgentRestartsAreNotFailures(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	s, _, _ := f.reg.Register(ctx, node("n1"))
+	f.addWorkload(t, "w1", "n1")
+	for i, r := range []StatusReport{
+		{State: store.WorkloadPending, Message: "starting"},
+		{State: store.WorkloadRunning, Health: store.HealthStarting},
+		{State: store.WorkloadRunning, Health: store.HealthHealthy, RestartCount: 3},
+		{State: store.WorkloadRunning, Health: store.HealthHealthy, RestartCount: 0},
+	} {
+		f.clock = f.clock.Add(time.Second)
+		r.WorkloadID = "w1"
+		if _, err := f.reg.Heartbeat(ctx, "n1", s.ID, []StatusReport{r}); err != nil {
+			t.Fatalf("report %d: %v", i, err)
+		}
+	}
+	// The third report raised the restart count from 0 to 3.
+	want := []string{"node.registered", "workload.restarted"}
+	if got := f.events(t); !equal(got, want) {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+}
+
+// A failed report and its event are saved together.
+func TestObservationsAndTheirEventsSucceedOrFailTogether(t *testing.T) {
+	mem := store.NewMemory()
+	ctx := context.Background()
+	if _, err := mem.CreateEnrollment(ctx, store.Enrollment{NodeID: "n1", CreatedAt: t0}); err != nil {
+		t.Fatal(err)
+	}
+	reg := New(mem, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s, _, err := reg.Register(ctx, node("n1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mem.CreateWorkload(ctx, store.Workload{ID: "w1", Name: "w1", Image: "img", CPUMillis: 1, MemoryBytes: 1, NodeID: "n1", CreatedAt: t0}); err != nil {
+		t.Fatal(err)
+	}
+	broken := New(failingEventStore{mem}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	broken.sessions = reg.sessions
+	_, err = broken.Heartbeat(ctx, "n1", s.ID, []StatusReport{{WorkloadID: "w1", State: store.WorkloadFailed, Message: "boom"}})
+	if err == nil {
+		t.Fatal("a report whose event cannot be recorded must fail")
+	}
+	if w, _ := mem.GetWorkload(ctx, "w1"); w.Observed != nil {
+		t.Fatalf("the observation was saved although its event was not: %+v", w.Observed)
+	}
+}
+
+// A clean departure is remembered with its time: that is where the clock for
+// "unavailable" starts, because the node's containers keep running.
+func TestDeregisterRecordsWhenTheAgentLeft(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	s, _, _ := f.reg.Register(ctx, node("n1"))
+	f.clock = f.clock.Add(time.Minute)
+	if err := f.reg.Deregister(ctx, "n1", s.ID); err != nil {
+		t.Fatal(err)
+	}
+	n, _ := f.store.GetNode(ctx, "n1")
+	if !n.DeregisteredAt.Equal(f.clock) || !n.LastHeartbeat.IsZero() {
+		t.Fatalf("node after leaving = %+v", n)
+	}
+	f.clock = f.clock.Add(time.Minute)
+	if _, _, err := f.reg.Register(ctx, node("n1")); err != nil {
+		t.Fatal(err)
+	}
+	n, _ = f.store.GetNode(ctx, "n1")
+	if !n.DeregisteredAt.IsZero() || !n.LastHeartbeat.Equal(f.clock) {
+		t.Fatalf("registering again must clear the departure: %+v", n)
 	}
 }

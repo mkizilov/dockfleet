@@ -16,6 +16,76 @@ import (
 
 var epoch = time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
+func TestNodeHealthFollowsHowLongTheNodeHasBeenSilent(t *testing.T) {
+	const suspect, gone = 30 * time.Second, 2 * time.Minute
+	timing := Timing{SuspectAfter: suspect, UnavailableAfter: gone}
+	registered := epoch.Add(-time.Hour)
+
+	tests := []struct {
+		name   string
+		node   store.Node
+		now    time.Time
+		timing Timing
+		want   string
+	}{
+		{"a heartbeat just now", store.Node{LastHeartbeat: epoch, RegisteredAt: registered}, epoch, timing, store.NodeHealthy},
+		{"exactly at the suspect limit", store.Node{LastHeartbeat: epoch.Add(-suspect), RegisteredAt: registered}, epoch, timing, store.NodeHealthy},
+		{"a moment past it", store.Node{LastHeartbeat: epoch.Add(-suspect - time.Nanosecond), RegisteredAt: registered}, epoch, timing, store.NodeSuspect},
+		{"silent for a minute", store.Node{LastHeartbeat: epoch.Add(-time.Minute), RegisteredAt: registered}, epoch, timing, store.NodeSuspect},
+		{"exactly at the unavailable limit", store.Node{LastHeartbeat: epoch.Add(-gone), RegisteredAt: registered}, epoch, timing, store.NodeSuspect},
+		{"a moment past it", store.Node{LastHeartbeat: epoch.Add(-gone - time.Nanosecond), RegisteredAt: registered}, epoch, timing, store.NodeUnavailable},
+		{"silent for a day", store.Node{LastHeartbeat: epoch.Add(-24 * time.Hour), RegisteredAt: registered}, epoch, timing, store.NodeUnavailable},
+		{"a heartbeat from the future (clock skew)", store.Node{LastHeartbeat: epoch.Add(time.Hour), RegisteredAt: registered}, epoch, timing, store.NodeHealthy},
+		{"never heard from, registered long ago", store.Node{RegisteredAt: registered}, epoch, timing, store.NodeUnavailable},
+		// An agent that left cleanly is suspect at once and unavailable when it has been gone long enough.
+		{"left a moment ago", store.Node{DeregisteredAt: epoch, RegisteredAt: registered}, epoch, timing, store.NodeSuspect},
+		{"left a minute ago", store.Node{DeregisteredAt: epoch.Add(-time.Minute), RegisteredAt: registered}, epoch, timing, store.NodeSuspect},
+		{"left three minutes ago", store.Node{DeregisteredAt: epoch.Add(-3 * time.Minute), RegisteredAt: registered}, epoch, timing, store.NodeUnavailable},
+		// Nodes are never given up on without a limit.
+		{"no unavailable limit", store.Node{LastHeartbeat: epoch.Add(-24 * time.Hour), RegisteredAt: registered}, epoch, Timing{SuspectAfter: suspect}, store.NodeSuspect},
+		// A manager that began to watch a minute ago cannot call a node unavailable for being silent before that.
+		{"silence from before the manager was watching", store.Node{LastHeartbeat: epoch.Add(-time.Hour), RegisteredAt: registered}, epoch,
+			Timing{SuspectAfter: suspect, UnavailableAfter: gone, Since: epoch.Add(-time.Minute)}, store.NodeSuspect},
+		{"and once it has watched long enough", store.Node{LastHeartbeat: epoch.Add(-time.Hour), RegisteredAt: registered}, epoch.Add(gone),
+			Timing{SuspectAfter: suspect, UnavailableAfter: gone, Since: epoch.Add(-time.Minute)}, store.NodeUnavailable},
+		{"a node that spoke after the manager began to watch", store.Node{LastHeartbeat: epoch.Add(-gone - time.Second), RegisteredAt: registered}, epoch,
+			Timing{SuspectAfter: suspect, UnavailableAfter: gone, Since: epoch.Add(-gone - time.Minute)}, store.NodeUnavailable},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.node.ID = "n"
+			if got := tt.timing.Health(tt.node, tt.now); got != tt.want {
+				t.Fatalf("Health = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLostNodesAreTheUnavailableOnes(t *testing.T) {
+	timing := Timing{SuspectAfter: 30 * time.Second, UnavailableAfter: 2 * time.Minute}
+	nodes := []store.Node{
+		{ID: "alive", LastHeartbeat: epoch, RegisteredAt: epoch},
+		{ID: "late", LastHeartbeat: epoch.Add(-time.Minute), RegisteredAt: epoch.Add(-time.Hour)},
+		{ID: "gone", LastHeartbeat: epoch.Add(-time.Hour), RegisteredAt: epoch.Add(-2 * time.Hour)},
+	}
+	lost := timing.Lost(nodes, epoch)
+	if len(lost) != 1 || !lost["gone"] {
+		t.Fatalf("lost = %v, want only gone", lost)
+	}
+}
+
+func TestHealthReasonsNameTheLimitsNotTheAge(t *testing.T) {
+	timing := Timing{SuspectAfter: 30 * time.Second, UnavailableAfter: 2 * time.Minute}
+	if got := timing.HealthReason(store.NodeHealthy); got != "" {
+		t.Errorf("healthy: %q", got)
+	}
+	for state, want := range map[string]string{store.NodeSuspect: "30s", store.NodeUnavailable: "2m0s"} {
+		if got := timing.HealthReason(state); !strings.Contains(got, want) {
+			t.Errorf("%s: %q does not name %s", state, got, want)
+		}
+	}
+}
+
 func TestUnavailability(t *testing.T) {
 	const ttl = 30 * time.Second
 	tests := []struct {

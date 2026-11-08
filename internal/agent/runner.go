@@ -23,6 +23,16 @@ const (
 	defaultBackoffBase = time.Second
 	defaultBackoffMax  = time.Minute
 
+	// defaultStableAfter is how long a restarted container must run before the
+	// restarts in a row are forgotten and the next failure starts over with the
+	// shortest wait.
+	defaultStableAfter = 30 * time.Second
+
+	// Defaults for a health check that arrives without them.
+	defaultHealthInterval = 30 * time.Second
+	defaultHealthTimeout  = 5 * time.Second
+	defaultHealthRetries  = 3
+
 	// defaultRestartRetries is how often "on-failure" restarts a container
 	// when the assignment does not say.
 	defaultRestartRetries = 5
@@ -42,7 +52,14 @@ type runnerConfig struct {
 	PullTimeout time.Duration
 	BackoffBase time.Duration
 	BackoffMax  time.Duration
-	Now         func() time.Time
+	// StableAfter is how long a restarted container must keep running before
+	// its restarts in a row are forgotten.
+	StableAfter time.Duration
+	// Fencing makes the runner stop every container of the node when the
+	// manager's lease runs out (see RenewLease). Off, containers outlive any
+	// outage of the manager.
+	Fencing bool
+	Now     func() time.Time
 }
 
 func (c runnerConfig) withDefaults() runnerConfig {
@@ -52,7 +69,7 @@ func (c runnerConfig) withDefaults() runnerConfig {
 	}{
 		{&c.Resync, defaultResync}, {&c.OrphanGrace, defaultOrphanGrace}, {&c.StopTimeout, defaultStopTimeout},
 		{&c.OpTimeout, defaultOpTimeout}, {&c.PullTimeout, defaultPullTimeout},
-		{&c.BackoffBase, defaultBackoffBase}, {&c.BackoffMax, defaultBackoffMax},
+		{&c.BackoffBase, defaultBackoffBase}, {&c.BackoffMax, defaultBackoffMax}, {&c.StableAfter, defaultStableAfter},
 	} {
 		if *d.field <= 0 {
 			*d.field = d.value
@@ -72,7 +89,8 @@ type workloadStatus struct {
 	exitCode     *int32
 	oomKilled    bool
 	restartCount int32
-	acked        int64 // the highest generation of the assignment seen
+	health       string // the health check result: empty without a check
+	acked        int64  // the highest generation of the assignment seen
 }
 
 func (s workloadStatus) proto(id string) *dockfleetv1.WorkloadStatus {
@@ -82,7 +100,7 @@ func (s workloadStatus) proto(id string) *dockfleetv1.WorkloadStatus {
 	}
 	st := &dockfleetv1.WorkloadStatus{
 		WorkloadId: id, Phase: phase, Message: s.message, AcknowledgedGeneration: s.acked,
-		ContainerId: s.containerID, OomKilled: s.oomKilled, RestartCount: s.restartCount,
+		ContainerId: s.containerID, OomKilled: s.oomKilled, RestartCount: s.restartCount, Health: s.health,
 	}
 	if s.exitCode != nil {
 		v := *s.exitCode
@@ -93,7 +111,7 @@ func (s workloadStatus) proto(id string) *dockfleetv1.WorkloadStatus {
 
 // sameObservation compares everything but the acknowledgment.
 func (s workloadStatus) sameObservation(o workloadStatus) bool {
-	if s.phase != o.phase || s.message != o.message || s.containerID != o.containerID || s.oomKilled != o.oomKilled || s.restartCount != o.restartCount {
+	if s.phase != o.phase || s.message != o.message || s.containerID != o.containerID || s.oomKilled != o.oomKilled || s.restartCount != o.restartCount || s.health != o.health {
 		return false
 	}
 	if s.exitCode == nil || o.exitCode == nil {
@@ -106,11 +124,14 @@ func (s workloadStatus) sameObservation(o workloadStatus) bool {
 // is only a pacing aid: losing it (an agent restart) costs a retry budget, never
 // correctness, because the containers on the node are the truth.
 type tracker struct {
-	restarts  int       // restarts by this agent since it started
-	restartAt time.Time // no restart before this
-	attempts  int       // consecutive failed attempts to create or start
-	retryAt   time.Time // no new attempt before this
-	failure   workloadStatus
+	restarts     int       // restarts by this agent since it started
+	streak       int       // restarts in a row, forgotten once the container has run steadily
+	restartAt    time.Time // no restart before this
+	runningSince time.Time // when the container was first seen running since its last start
+	unhealthy    bool      // the agent stopped the container because its health check fails
+	attempts     int       // consecutive failed attempts to create or start
+	retryAt      time.Time // no new attempt before this
+	failure      workloadStatus
 }
 
 // runner brings the node's containers to the manager's assignments. A pass
@@ -128,17 +149,55 @@ type runner struct {
 	assigned map[string]*dockfleetv1.WorkloadAssignment
 	heard    bool // the manager has answered at least once
 	statuses map[string]workloadStatus
+	// leaseUntil is when the manager's lease on this node runs out unless a
+	// heartbeat renews it; zero until the manager has granted one.
+	leaseUntil time.Time
 
 	// Only converge touches these.
 	trackers map[string]*tracker
 	orphans  map[string]time.Time
+	// fenced are the containers stopped because the lease ran out. They are
+	// started again, without counting as a failure, once it is renewed.
+	fenced map[string]bool
 }
 
 func newRunner(rt docker.Runtime, log *slog.Logger, cfg runnerConfig) *runner {
 	return &runner{
 		rt: rt, log: log, cfg: cfg.withDefaults(), wake: make(chan struct{}, 1),
-		statuses: map[string]workloadStatus{}, trackers: map[string]*tracker{}, orphans: map[string]time.Time{},
+		statuses: map[string]workloadStatus{}, trackers: map[string]*tracker{}, orphans: map[string]time.Time{}, fenced: map[string]bool{},
 	}
+}
+
+// RenewLease extends the manager's lease on this node until the given time. The
+// agent computes it from when it sent the heartbeat that the manager answered,
+// never from when the answer arrived, so the lease ends no later than the
+// manager thinks it does.
+func (r *runner) RenewLease(until time.Time) {
+	r.mu.Lock()
+	r.leaseUntil = until
+	r.mu.Unlock()
+	r.poke()
+}
+
+// leaseLapsed is whether fencing is on and the lease has run out.
+func (r *runner) leaseLapsed() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.cfg.Fencing && !r.leaseUntil.IsZero() && r.now().After(r.leaseUntil)
+}
+
+// nextWake is when the runner should look at the containers again: after the
+// resync period, or sooner if the lease runs out before then.
+func (r *runner) nextWake() time.Duration {
+	wait := r.cfg.Resync
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.cfg.Fencing && !r.leaseUntil.IsZero() {
+		if d := r.leaseUntil.Sub(r.now()); d > 0 && d+time.Millisecond < wait {
+			wait = d + time.Millisecond
+		}
+	}
+	return wait
 }
 
 func (r *runner) now() time.Time { return r.cfg.Now() }
@@ -200,21 +259,64 @@ func (r *runner) poke() {
 // every Resync, which is how a container that died is noticed. It leaves the
 // containers as they are when it stops, so they survive an agent restart.
 func (r *runner) Run(ctx context.Context) {
-	ticker := time.NewTicker(r.cfg.Resync)
-	defer ticker.Stop()
+	timer := time.NewTimer(r.cfg.Resync)
+	defer timer.Stop()
 	for {
 		r.converge(ctx)
+		timer.Reset(r.nextWake())
 		select {
 		case <-ctx.Done():
 			return
 		case <-r.wake:
-		case <-ticker.C:
+		case <-timer.C:
 		}
+	}
+}
+
+// fence stops every running container of the node, with no grace period. It
+// is what an agent does when the manager's lease on it has run out: from then
+// on the manager may start the node's replicas on other nodes, and a replica must
+// not run in two places. The containers are stopped, not removed, so a node that
+// reaches the manager again in time loses nothing but the downtime.
+func (r *runner) fence(ctx context.Context) {
+	containers, err := r.rt.List(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			r.log.Warn("listing containers to fence them failed; trying again", "error", err)
+		}
+		return
+	}
+	stopped := 0
+	for _, c := range containers {
+		if ctx.Err() != nil {
+			return
+		}
+		if c.State != docker.StateRunning && c.State != docker.StateRestarting && c.State != docker.StatePaused {
+			continue
+		}
+		err := r.do(ctx, r.cfg.OpTimeout, func(ctx context.Context) error { return r.rt.Stop(ctx, c.WorkloadID, 0) })
+		if err != nil && !errors.Is(err, docker.ErrNotFound) {
+			r.log.Warn("stopping a container to fence it failed; trying again", "workload_id", c.WorkloadID, "error", err)
+			continue
+		}
+		r.fenced[c.WorkloadID] = true
+		stopped++
+		r.setStatus(c.WorkloadID, workloadStatus{
+			phase: dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_PENDING, containerID: c.ID,
+			message: "stopped: the manager's lease on this node ran out",
+		})
+	}
+	if stopped > 0 {
+		r.log.Warn("the manager's lease on this node ran out; containers stopped so that no replica runs twice", "containers", stopped)
 	}
 }
 
 // converge makes one pass over the assignments.
 func (r *runner) converge(ctx context.Context) {
+	if r.leaseLapsed() {
+		r.fence(ctx)
+		return
+	}
 	r.mu.Lock()
 	if !r.heard {
 		r.mu.Unlock()
@@ -254,6 +356,11 @@ func (r *runner) converge(ctx context.Context) {
 			delete(r.trackers, id)
 		}
 	}
+	for id := range r.fenced {
+		if !assignedIDs[id] {
+			delete(r.fenced, id)
+		}
+	}
 	r.sweepOrphans(ctx, existing, assignedIDs)
 }
 
@@ -291,6 +398,8 @@ func (r *runner) do(ctx context.Context, timeout time.Duration, fn func(ctx cont
 
 func (r *runner) apply(ctx context.Context, a *dockfleetv1.WorkloadAssignment, c docker.Container, has bool) workloadStatus {
 	if a.GetDesiredState() == dockfleetv1.WorkloadDesiredState_WORKLOAD_DESIRED_STATE_STOPPED {
+		// A container fenced earlier is not started again: the manager moved the workload.
+		delete(r.fenced, a.GetWorkloadId())
 		return r.retire(ctx, a.GetWorkloadId(), c, has)
 	}
 	return r.run(ctx, a, c, has)
@@ -343,7 +452,24 @@ func (r *runner) run(ctx context.Context, a *dockfleetv1.WorkloadAssignment, c d
 	switch cs.State {
 	case docker.StateRunning:
 		tr.attempts, tr.failure = 0, workloadStatus{}
-		return workloadStatus{phase: dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_RUNNING, message: "running", containerID: cs.ID, restartCount: int32(tr.restarts)}
+		now := r.now()
+		if tr.runningSince.IsZero() {
+			tr.runningSince = now
+		}
+		// A container that has run steadily is not in a crash loop any more: the next
+		// failure starts over with the shortest wait and the full number of restarts.
+		if tr.streak > 0 && now.Sub(tr.runningSince) >= r.cfg.StableAfter {
+			tr.streak, tr.restartAt = 0, time.Time{}
+		}
+		st := workloadStatus{
+			phase: dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_RUNNING, message: "running", containerID: cs.ID,
+			restartCount: int32(tr.restarts), health: cs.Health,
+		}
+		if cs.Health == docker.HealthUnhealthy {
+			return r.unhealthy(ctx, a, tr, st)
+		}
+		tr.unhealthy = false
+		return st
 	case docker.StateCreated:
 		// Created but never started: the agent stopped between the two steps.
 		return r.start(ctx, id, cs.ID, tr)
@@ -355,6 +481,27 @@ func (r *runner) run(ctx context.Context, a *dockfleetv1.WorkloadAssignment, c d
 		return workloadStatus{phase: pending, message: "the container died; creating it again", containerID: cs.ID}
 	}
 	return workloadStatus{phase: pending, message: fmt.Sprintf("the container is %s", cs.State), containerID: cs.ID}
+}
+
+// unhealthy deals with a container that runs but fails its health check. Docker
+// only reports the result, so the agent acts on it: it stops the container and
+// lets the restart policy decide what happens next, exactly as for a container
+// that crashed (with a restart policy of "no" it only reports it).
+func (r *runner) unhealthy(ctx context.Context, a *dockfleetv1.WorkloadAssignment, tr *tracker, st workloadStatus) workloadStatus {
+	st.message = "running, but its health check fails"
+	if restartPolicy(a).condition == "no" {
+		return st
+	}
+	id := a.GetWorkloadId()
+	err := r.do(ctx, r.cfg.StopTimeout+r.cfg.OpTimeout, func(ctx context.Context) error { return r.rt.Stop(ctx, id, r.cfg.StopTimeout) })
+	if err != nil && !errors.Is(err, docker.ErrNotFound) {
+		st.message = clip("stopping the unhealthy container failed: " + err.Error())
+		return st
+	}
+	tr.unhealthy = true
+	st.phase = dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_PENDING
+	st.message = "stopped because its health check fails"
+	return st
 }
 
 // create makes the container, pulling the image when the node lacks it, and starts it.
@@ -407,13 +554,36 @@ func (r *runner) start(ctx context.Context, id, containerID string, tr *tracker)
 	return workloadStatus{phase: dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_PENDING, message: "starting", containerID: containerID, restartCount: int32(tr.restarts)}
 }
 
-// exited decides what happens to a container that stopped on its own.
+// exited decides what happens to a container that stopped: it is started again
+// when the restart policy says so, after a wait that doubles with every restart
+// in a row, and not at all once the policy's limit is reached.
 func (r *runner) exited(ctx context.Context, a *dockfleetv1.WorkloadAssignment, cs docker.ContainerState, tr *tracker) workloadStatus {
-	failed := cs.ExitCode != 0 || cs.OOMKilled
+	id := a.GetWorkloadId()
+	if r.fenced[id] {
+		// Stopped by the agent itself while the lease was gone; the manager still
+		// wants it running, so it is a pause, not a failure, and costs no restart.
+		err := r.do(ctx, r.cfg.OpTimeout, func(ctx context.Context) error { return r.rt.Start(ctx, id) })
+		if err != nil {
+			failure := r.fail(tr, "starting the container again after the lease was lost failed: "+err.Error())
+			failure.containerID = cs.ID
+			return failure
+		}
+		delete(r.fenced, id)
+		tr.runningSince = time.Time{}
+		return workloadStatus{
+			phase: dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_PENDING, message: "started again after the lease was renewed",
+			containerID: cs.ID, restartCount: int32(tr.restarts),
+		}
+	}
+
+	failed := cs.ExitCode != 0 || cs.OOMKilled || tr.unhealthy
 	exit := int32(cs.ExitCode)
 	what := fmt.Sprintf("exited with code %d", cs.ExitCode)
-	if cs.OOMKilled {
+	switch {
+	case cs.OOMKilled:
 		what = "killed: out of memory"
+	case tr.unhealthy:
+		what = fmt.Sprintf("stopped because its health check failed (exit code %d)", cs.ExitCode)
 	}
 	st := workloadStatus{containerID: cs.ID, exitCode: &exit, oomKilled: cs.OOMKilled, restartCount: int32(tr.restarts)}
 	st.phase = dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_SUCCEEDED
@@ -421,17 +591,20 @@ func (r *runner) exited(ctx context.Context, a *dockfleetv1.WorkloadAssignment, 
 		st.phase = dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_FAILED
 	}
 
-	condition, retries := restartPolicy(a)
-	restart := condition == "always" || (condition == "on-failure" && failed && tr.restarts < retries)
-	if !restart {
+	policy := restartPolicy(a)
+	restart := policy.condition == "always" || (policy.condition == "on-failure" && failed)
+	switch {
+	case !restart:
 		st.message = what
 		return st
-	}
-	if r.now().Before(tr.restartAt) {
+	case policy.retries > 0 && tr.streak >= policy.retries:
+		st.phase = dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_FAILED
+		st.message = fmt.Sprintf("%s; gave up after %d restarts in a row", what, tr.streak)
+		return st
+	case r.now().Before(tr.restartAt):
 		st.message = what + "; restart pending"
 		return st
 	}
-	id := a.GetWorkloadId()
 	err := r.do(ctx, r.cfg.OpTimeout, func(ctx context.Context) error { return r.rt.Start(ctx, id) })
 	if err != nil {
 		failure := r.fail(tr, "restarting the container failed: "+err.Error())
@@ -439,7 +612,10 @@ func (r *runner) exited(ctx context.Context, a *dockfleetv1.WorkloadAssignment, 
 		return failure
 	}
 	tr.restarts++
-	tr.restartAt = r.now().Add(r.backoff(tr.restarts))
+	tr.streak++
+	tr.restartAt = r.now().Add(r.restartDelay(policy, tr.streak))
+	tr.runningSince = time.Time{}
+	tr.unhealthy = false
 	st.phase = dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_PENDING
 	st.message = "restarting"
 	st.restartCount = int32(tr.restarts)
@@ -503,21 +679,53 @@ func (r *runner) sweepOrphans(ctx context.Context, existing map[string]docker.Co
 	}
 }
 
-// restartPolicy is the assignment's restart condition and retry limit; the
-// default is "on-failure" with 5 retries.
-func restartPolicy(a *dockfleetv1.WorkloadAssignment) (condition string, retries int) {
+// restartSettings is an assignment's restart policy with the defaults filled in.
+type restartSettings struct {
+	condition string // "no", "on-failure" or "always"
+	// retries is how many restarts in a row are allowed; 0 means no limit.
+	retries int
+	// base and max bound the wait between restarts; 0 means the runner's own.
+	base, max time.Duration
+}
+
+// restartPolicy reads the assignment's restart policy. The default is
+// "on-failure" with 5 retries; "always" has no limit unless the policy sets one.
+func restartPolicy(a *dockfleetv1.WorkloadAssignment) restartSettings {
 	p := a.GetRestartPolicy()
+	out := restartSettings{
+		base: time.Duration(p.GetBackoffSeconds()) * time.Second,
+		max:  time.Duration(p.GetMaxBackoffSeconds()) * time.Second,
+	}
 	switch p.GetCondition() {
 	case "no":
-		return "no", 0
+		out.condition = "no"
 	case "always":
-		return "always", 0
+		out.condition, out.retries = "always", int(p.GetMaxRetries())
+	default:
+		out.condition, out.retries = "on-failure", int(p.GetMaxRetries())
+		if out.retries == 0 {
+			out.retries = defaultRestartRetries
+		}
 	}
-	retries = int(p.GetMaxRetries())
-	if p.GetCondition() != "on-failure" || retries == 0 {
-		retries = defaultRestartRetries
+	return out
+}
+
+// restartDelay is the wait after the n-th restart in a row: the policy's base
+// (or the runner's), doubling with each one, up to the policy's maximum.
+func (r *runner) restartDelay(p restartSettings, n int) time.Duration {
+	base, limit := p.base, p.max
+	if base <= 0 {
+		base = r.cfg.BackoffBase
 	}
-	return "on-failure", retries
+	if limit <= 0 {
+		limit = r.cfg.BackoffMax
+	}
+	limit = max(limit, base)
+	d := base
+	for i := 1; i < n && d < limit; i++ {
+		d *= 2
+	}
+	return min(d, limit)
 }
 
 // specFor translates an assignment into a container spec. The container
@@ -536,7 +744,27 @@ func specFor(a *dockfleetv1.WorkloadAssignment) (docker.ContainerSpec, error) {
 			ContainerPort: uint16(p.GetContainerPort()), HostPort: uint16(p.GetHostPort()), Protocol: p.GetProtocol(),
 		})
 	}
+	if h := a.GetHealthCheck(); h != nil {
+		spec.HealthCheck = &docker.HealthCheck{
+			Command:     h.GetCommand(),
+			Interval:    secondsOr(h.GetIntervalSeconds(), defaultHealthInterval),
+			Timeout:     secondsOr(h.GetTimeoutSeconds(), defaultHealthTimeout),
+			StartPeriod: time.Duration(h.GetStartPeriodSeconds()) * time.Second,
+			Retries:     int(h.GetRetries()),
+		}
+		if spec.HealthCheck.Retries == 0 {
+			spec.HealthCheck.Retries = defaultHealthRetries
+		}
+	}
 	return spec, nil
+}
+
+// secondsOr converts a number of seconds, or returns def when it is 0.
+func secondsOr(seconds uint32, def time.Duration) time.Duration {
+	if seconds == 0 {
+		return def
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // clip shortens a message to what the protocol accepts, keeping it valid UTF-8.

@@ -11,6 +11,7 @@ import (
 	"github.com/dockfleet/dockfleet/internal/dockerfake"
 	"github.com/dockfleet/dockfleet/internal/placement"
 	"github.com/dockfleet/dockfleet/internal/reconcile"
+	"github.com/dockfleet/dockfleet/internal/scheduler"
 	"github.com/dockfleet/dockfleet/internal/store"
 )
 
@@ -23,9 +24,28 @@ import (
 // controlLoops runs the manager's scheduler and reconciler on the store, as the manager process does.
 func (m *manager) controlLoops() {
 	m.t.Helper()
+	m.controlLoopsWith(scheduler.Timing{})
+}
+
+// controlLoopsWith runs them with the given trust in silent nodes. Timing.Since
+// is when they start, as for a manager process, unless the test sets it. The
+// returned function stops them; it is also called when the test ends.
+func (m *manager) controlLoopsWith(timing scheduler.Timing) (stop func()) {
+	m.t.Helper()
+	if timing.Since.IsZero() {
+		timing.Since = time.Now()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	sched := placement.New(placement.Config{Store: m.store, Logger: discardLogger(), NodeTTL: time.Minute, Interval: 10 * time.Millisecond, InstanceID: "itest"})
-	rec := reconcile.New(reconcile.Config{Store: m.store, Logger: discardLogger(), Interval: 10 * time.Millisecond, InstanceID: "itest"})
+	nodeTTL := time.Minute
+	if timing.SuspectAfter > 0 {
+		nodeTTL = timing.SuspectAfter
+	}
+	sched := placement.New(placement.Config{
+		Store: m.store, Logger: discardLogger(), NodeTTL: nodeTTL, Timing: timing, Interval: 10 * time.Millisecond, InstanceID: "itest",
+	})
+	rec := reconcile.New(reconcile.Config{
+		Store: m.store, Logger: discardLogger(), Timing: timing, Interval: 10 * time.Millisecond, InstanceID: "itest",
+	})
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -36,10 +56,15 @@ func (m *manager) controlLoops() {
 		defer wg.Done()
 		rec.Run(ctx)
 	}()
-	m.t.Cleanup(func() {
-		cancel()
-		wg.Wait()
-	})
+	var once sync.Once
+	stop = func() {
+		once.Do(func() {
+			cancel()
+			wg.Wait()
+		})
+	}
+	m.t.Cleanup(stop)
+	return stop
 }
 
 func (m *manager) createService(name string, replicas int, image string) store.Service {

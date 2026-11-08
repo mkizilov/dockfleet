@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func validSpec() ContainerSpec {
@@ -102,6 +103,47 @@ func TestDefaultPolicyRejectsDangerousSettings(t *testing.T) {
 			spec := validSpec()
 			tt.mutate(&spec)
 			wantRejected(t, DefaultPolicy().Validate(spec), tt.field)
+		})
+	}
+}
+
+func validHealth() *HealthCheck {
+	return &HealthCheck{Command: []string{"curl", "-f", "http://localhost/"}, Interval: 10 * time.Second, Timeout: 2 * time.Second, StartPeriod: 5 * time.Second, Retries: 3}
+}
+
+func TestHealthChecksAreBounded(t *testing.T) {
+	spec := validSpec()
+	spec.HealthCheck = validHealth()
+	if err := DefaultPolicy().Validate(spec); err != nil {
+		t.Fatalf("an ordinary health check must be accepted: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*HealthCheck)
+	}{
+		{"no command", func(h *HealthCheck) { h.Command = nil }},
+		{"too many arguments", func(h *HealthCheck) { h.Command = make([]string, maxHealthArgs+1) }},
+		{"an argument that is too long", func(h *HealthCheck) { h.Command = []string{strings.Repeat("a", maxHealthArgBytes+1)} }},
+		{"an argument with NUL", func(h *HealthCheck) { h.Command = []string{"a\x00b"} }},
+		{"a shell string", func(h *HealthCheck) { h.Command = []string{"CMD-SHELL", "curl -f localhost || exit 1"} }},
+		{"docker's own CMD prefix", func(h *HealthCheck) { h.Command = []string{"CMD", "true"} }},
+		{"disabling the check", func(h *HealthCheck) { h.Command = []string{"NONE"} }},
+		{"no interval", func(h *HealthCheck) { h.Interval = 0 }},
+		{"an interval beyond an hour", func(h *HealthCheck) { h.Interval = 2 * time.Hour }},
+		{"no timeout", func(h *HealthCheck) { h.Timeout = 0 }},
+		{"a timeout beyond five minutes", func(h *HealthCheck) { h.Timeout = 10 * time.Minute }},
+		{"a negative start period", func(h *HealthCheck) { h.StartPeriod = -time.Second }},
+		{"a start period beyond an hour", func(h *HealthCheck) { h.StartPeriod = 2 * time.Hour }},
+		{"no retries", func(h *HealthCheck) { h.Retries = 0 }},
+		{"too many retries", func(h *HealthCheck) { h.Retries = maxHealthRetries + 1 }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := validSpec()
+			spec.HealthCheck = validHealth()
+			tt.mutate(spec.HealthCheck)
+			wantRejected(t, DefaultPolicy().Validate(spec), "HealthCheck")
 		})
 	}
 }

@@ -188,6 +188,69 @@ func TestAssignmentsCarryTheInstructionAndStatusesCarryTheAcknowledgment(t *test
 	}
 }
 
+// The lease is granted with the session; a manager that grants none says so with zero.
+func TestRegistrationGrantsALease(t *testing.T) {
+	ctx := ctxWithTimeout(t)
+	if session, err := newEnv(t, nil).client(t, serverToken, nil).Register(ctx, testNode()); err != nil || session.Lease != 0 {
+		t.Fatalf("without a lease: %+v, %v", session, err)
+	}
+	env := newEnv(t, func(s *NodeServer) { s.WithLease(45 * time.Second) })
+	session, err := env.client(t, serverToken, nil).Register(ctx, testNode())
+	if err != nil || session.Lease != 45*time.Second || session.HeartbeatInterval != 5*time.Second {
+		t.Fatalf("session = %+v, %v", session, err)
+	}
+}
+
+// How often a container is restarted, how long to wait, and its health check
+// travel with the assignment; the health the agent observes comes back with the report.
+func TestAssignmentsCarryTheRestartPolicyAndHealthCheckAndStatusesTheHealth(t *testing.T) {
+	env := newEnv(t, nil)
+	c := env.client(t, serverToken, nil)
+	ctx := ctxWithTimeout(t)
+	session, err := c.Register(ctx, testNode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := store.Workload{ID: "w1", Name: "web", Image: "nginx", CPUMillis: 100, MemoryBytes: 1 << 20, NodeID: "node-1", CreatedAt: time.Now()}
+	w.RestartPolicy = &store.RestartPolicy{Condition: store.RestartAlways, MaxRetries: 9, BackoffSeconds: 2, MaxBackoffSeconds: 90}
+	w.HealthCheck = &store.HealthCheck{Command: []string{"curl", "-f", "localhost"}, IntervalSeconds: 10, TimeoutSeconds: 2, StartPeriodSeconds: 5, Retries: 4}
+	if _, err := env.store.CreateWorkload(ctx, w); err != nil {
+		t.Fatal(err)
+	}
+
+	report := &dockfleetv1.WorkloadStatus{WorkloadId: "w1", Phase: dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_RUNNING, Health: "unhealthy"}
+	assigned, err := c.Heartbeat(ctx, "node-1", session.ID, []*dockfleetv1.WorkloadStatus{report})
+	if err != nil || len(assigned) != 1 {
+		t.Fatalf("assignments = %v, %v", assigned, err)
+	}
+	rp, hc := assigned[0].GetRestartPolicy(), assigned[0].GetHealthCheck()
+	if rp.GetCondition() != "always" || rp.GetMaxRetries() != 9 || rp.GetBackoffSeconds() != 2 || rp.GetMaxBackoffSeconds() != 90 {
+		t.Fatalf("restart policy = %v", rp)
+	}
+	if len(hc.GetCommand()) != 3 || hc.GetIntervalSeconds() != 10 || hc.GetTimeoutSeconds() != 2 || hc.GetStartPeriodSeconds() != 5 || hc.GetRetries() != 4 {
+		t.Fatalf("health check = %v", hc)
+	}
+	if got, _ := env.store.GetWorkload(ctx, "w1"); got.Observed == nil || got.Observed.Health != store.HealthUnhealthy {
+		t.Fatalf("observation = %+v", got.Observed)
+	}
+
+	// A workload without a health check sends none.
+	if _, err := env.store.CreateWorkload(ctx, store.Workload{ID: "w2", Name: "z-plain", Image: "nginx", CPUMillis: 100, MemoryBytes: 1 << 20, NodeID: "node-1", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	assigned, err = c.Heartbeat(ctx, "node-1", session.ID, nil)
+	if err != nil || len(assigned) != 2 || assigned[1].GetHealthCheck() != nil {
+		t.Fatalf("assignments = %v, %v", assigned, err)
+	}
+
+	// The agent may only report a health result there is.
+	bad := &dockfleetv1.WorkloadStatus{WorkloadId: "w1", Phase: dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_RUNNING, Health: "sleepy"}
+	_, err = c.Heartbeat(ctx, "node-1", session.ID, []*dockfleetv1.WorkloadStatus{bad})
+	if ErrorCode(err) != dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_INVALID_REQUEST {
+		t.Fatalf("error = %v, want INVALID_REQUEST", err)
+	}
+}
+
 func TestSupersededSession(t *testing.T) {
 	env := newEnv(t, nil)
 	first := env.client(t, serverToken, nil)

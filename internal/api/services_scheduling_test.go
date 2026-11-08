@@ -401,3 +401,55 @@ func testNodeViewExplainsAvailability(t *testing.T, e *serviceEnv) {
 		t.Fatalf("status = %+v", st)
 	}
 }
+
+// The status of a service shows each replica's failures and what the manager is doing about them.
+func TestServiceStatusCountsFailedUnhealthyAndLostReplicas(t *testing.T) {
+	svc := store.Service{ID: "s", Name: "web", Replicas: 5, CurrentRevision: 1}
+	exit := 1
+	replica := func(index int, node string, obs *store.Observation) store.Workload {
+		w := store.Workload{
+			ID: "w" + strconv.Itoa(index), Name: "web-" + strconv.Itoa(index), NodeID: node, DesiredState: store.DesiredRunning, Generation: 1,
+			ServiceID: svc.ID, ServiceRevision: 1, ReplicaIndex: index, Observed: obs,
+		}
+		if obs != nil {
+			obs.WorkloadID, obs.AckedGeneration = w.ID, 1
+		}
+		return w
+	}
+	moved := replica(4, "gone", &store.Observation{State: store.WorkloadRunning})
+	moved.ID, moved.Name, moved.DesiredState, moved.Generation = "old4", "web-old-4", store.DesiredStopped, 2
+
+	workloads := []store.Workload{
+		replica(1, "n1", &store.Observation{State: store.WorkloadRunning, Health: store.HealthHealthy}),
+		replica(2, "n1", &store.Observation{State: store.WorkloadRunning, Health: store.HealthUnhealthy, RestartCount: 1}),
+		replica(3, "n1", &store.Observation{State: store.WorkloadFailed, Message: "exited with code 1; gave up after 5 restarts in a row", ExitCode: &exit, RestartCount: 5}),
+		replica(4, "gone", &store.Observation{State: store.WorkloadRunning}),
+		replica(5, "n2", nil),
+		moved,
+	}
+	nodes := map[string]string{"n1": store.NodeHealthy, "n2": store.NodeSuspect, "gone": store.NodeUnavailable}
+	st := buildStatus(svc, workloads, nil, nodes)
+
+	if st.ScheduledReplicas != 5 || st.RunningReplicas != 1 || st.UnhealthyReplicas != 1 || st.FailedReplicas != 1 || st.LostReplicas != 1 || len(st.Replicas) != 6 {
+		t.Fatalf("status = %+v", st)
+	}
+	byName := map[string]replicaStatus{}
+	for _, r := range st.Replicas {
+		byName[r.WorkloadName] = r
+	}
+	if r := byName["web-2"]; r.Health != store.HealthUnhealthy || r.RestartCount != 1 || r.NodeHealth != store.NodeHealthy {
+		t.Errorf("unhealthy replica = %+v", r)
+	}
+	if r := byName["web-3"]; r.Phase != store.WorkloadFailed || r.RestartCount != 5 || r.ExitCode == nil || *r.ExitCode != 1 || !strings.Contains(r.Message, "gave up") {
+		t.Errorf("failed replica = %+v", r)
+	}
+	if r := byName["web-4"]; r.NodeHealth != store.NodeUnavailable || r.Phase != store.WorkloadRunning {
+		t.Errorf("replica on a lost node = %+v; it last reported running, which the node health contradicts", r)
+	}
+	if r := byName["web-5"]; r.Phase != store.WorkloadScheduled || r.NodeHealth != store.NodeSuspect {
+		t.Errorf("replica not yet reported = %+v", r)
+	}
+	if r := byName["web-old-4"]; r.DesiredState != store.DesiredStopped || r.NodeHealth != store.NodeUnavailable || r.Generation != 2 {
+		t.Errorf("the moved replica = %+v; it stays on record until its node confirms", r)
+	}
+}

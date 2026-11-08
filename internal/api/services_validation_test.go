@@ -192,7 +192,20 @@ func testServiceValidation(t *testing.T, e *serviceEnv) {
 		{"unless-stopped is not supported", func(d def) { specOf(d)["restart_policy"] = def{"condition": "unless-stopped"} }, []string{"spec.restart_policy.condition"}},
 		{"upper-case restart condition", func(d def) { specOf(d)["restart_policy"] = def{"condition": "ALWAYS"} }, []string{"spec.restart_policy.condition"}},
 		{"retries with no restart", func(d def) { specOf(d)["restart_policy"] = def{"condition": "no", "max_retries": 3} }, []string{"spec.restart_policy.max_retries"}},
-		{"retries with always restart", func(d def) { specOf(d)["restart_policy"] = def{"condition": "always", "max_retries": 1} }, []string{"spec.restart_policy.max_retries"}},
+		{"backoff with no restart", func(d def) { specOf(d)["restart_policy"] = def{"condition": "no", "backoff_seconds": 2} }, []string{"spec.restart_policy.backoff_seconds"}},
+		{"maximum backoff with no restart", func(d def) { specOf(d)["restart_policy"] = def{"condition": "no", "max_backoff_seconds": 2} }, []string{"spec.restart_policy.max_backoff_seconds"}},
+		{"more than 100 retries with always restart", func(d def) { specOf(d)["restart_policy"] = def{"condition": "always", "max_retries": 101} }, []string{"spec.restart_policy.max_retries"}},
+		{"negative backoff", func(d def) { specOf(d)["restart_policy"] = def{"condition": "always", "backoff_seconds": -1} }, []string{"spec.restart_policy.backoff_seconds"}},
+		{"backoff beyond an hour", func(d def) { specOf(d)["restart_policy"] = def{"condition": "on-failure", "backoff_seconds": 3601} }, []string{"spec.restart_policy.backoff_seconds"}},
+		{"maximum backoff beyond an hour", func(d def) {
+			specOf(d)["restart_policy"] = def{"condition": "on-failure", "max_backoff_seconds": 3601}
+		}, []string{"spec.restart_policy.max_backoff_seconds"}},
+		{"backoff above the maximum", func(d def) {
+			specOf(d)["restart_policy"] = def{"condition": "on-failure", "backoff_seconds": 30, "max_backoff_seconds": 10}
+		}, []string{"spec.restart_policy.max_backoff_seconds"}},
+		{"backoff above the default maximum", func(d def) {
+			specOf(d)["restart_policy"] = def{"condition": "on-failure", "backoff_seconds": 120}
+		}, []string{"spec.restart_policy.max_backoff_seconds"}},
 		{"negative retries", func(d def) { specOf(d)["restart_policy"] = def{"condition": "on-failure", "max_retries": -1} }, []string{"spec.restart_policy.max_retries"}},
 		{"more than 100 retries", func(d def) { specOf(d)["restart_policy"] = def{"condition": "on-failure", "max_retries": 101} }, []string{"spec.restart_policy.max_retries"}},
 		{"restart policy as a string", func(d def) { specOf(d)["restart_policy"] = "always" }, []string{"spec.restart_policy"}},

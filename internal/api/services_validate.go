@@ -39,6 +39,9 @@ const (
 	maxRestartRetries   = 100
 
 	defaultMaxRetries        = 5
+	defaultBackoffSeconds    = 1
+	defaultMaxBackoffSeconds = 60
+	maxBackoffSeconds        = 3600
 	defaultHealthInterval    = 30
 	defaultHealthTimeout     = 5
 	defaultHealthRetries     = 3
@@ -94,8 +97,10 @@ type healthBody struct {
 }
 
 type restartBody struct {
-	Condition  string `json:"condition"`
-	MaxRetries int    `json:"max_retries"`
+	Condition         string `json:"condition"`
+	MaxRetries        int    `json:"max_retries"`
+	BackoffSeconds    int    `json:"backoff_seconds"`
+	MaxBackoffSeconds int    `json:"max_backoff_seconds"`
 }
 
 // serviceInput is a validated, normalized service definition.
@@ -121,7 +126,7 @@ var (
 	specFields    = fieldSet("image", "command", "env", "cpu_millis", "memory_bytes", "ports", "health_check", "restart_policy", "node_selector")
 	portFields    = fieldSet("container_port", "protocol", "host_port")
 	healthFields  = fieldSet("command", "interval_seconds", "timeout_seconds", "start_period_seconds", "retries")
-	restartFields = fieldSet("condition", "max_retries")
+	restartFields = fieldSet("condition", "max_retries", "backoff_seconds", "max_backoff_seconds")
 
 	// unsafeFields are Docker options that weaken the isolation between a
 	// container and its host. They get a specific refusal so an administrator
@@ -534,18 +539,50 @@ func validateRestart(p *problems, r *restartBody) *store.RestartPolicy {
 	switch r.Condition {
 	case "":
 		p.add(field+".condition", `is required: "no", "on-failure" or "always"`)
-	case store.RestartNo, store.RestartAlways:
+	case store.RestartNo:
+		out.Condition = r.Condition
+		for _, f := range []struct {
+			name  string
+			value int
+		}{{"max_retries", r.MaxRetries}, {"backoff_seconds", r.BackoffSeconds}, {"max_backoff_seconds", r.MaxBackoffSeconds}} {
+			if f.value != 0 {
+				p.add(field+"."+f.name, `does not apply to the "no" condition: the container is never restarted`)
+			}
+		}
+	case store.RestartAlways:
+		// No limit unless one is given.
 		out.Condition = r.Condition
 		if r.MaxRetries != 0 {
-			p.add(field+".max_retries", `only applies to the "on-failure" condition`)
+			out.MaxRetries = intInRange(p, field+".max_retries", r.MaxRetries, 1, maxRestartRetries, 0)
 		}
+		out.BackoffSeconds, out.MaxBackoffSeconds = validateBackoff(p, field, r)
 	case store.RestartOnFailure:
 		out.Condition = r.Condition
 		out.MaxRetries = intInRange(p, field+".max_retries", r.MaxRetries, 1, maxRestartRetries, defaultMaxRetries)
+		out.BackoffSeconds, out.MaxBackoffSeconds = validateBackoff(p, field, r)
 	default:
 		p.add(field+".condition", `must be "no", "on-failure" or "always"`)
 	}
 	return &out
+}
+
+// validateBackoff checks the wait between restarts: it starts at backoff_seconds
+// (default 1), doubles with each restart in a row and stops at
+// max_backoff_seconds (default 60). A value that is the default is stored as 0,
+// so that writing the default and leaving it out are the same definition.
+func validateBackoff(p *problems, field string, r *restartBody) (base, limit int) {
+	base = intInRange(p, field+".backoff_seconds", r.BackoffSeconds, 1, maxBackoffSeconds, defaultBackoffSeconds)
+	limit = intInRange(p, field+".max_backoff_seconds", r.MaxBackoffSeconds, 1, maxBackoffSeconds, defaultMaxBackoffSeconds)
+	if base > limit {
+		p.add(field+".max_backoff_seconds", "must be at least backoff_seconds (%d)", base)
+	}
+	if base == defaultBackoffSeconds {
+		base = 0
+	}
+	if limit == defaultMaxBackoffSeconds {
+		limit = 0
+	}
+	return base, limit
 }
 
 func validateSelector(p *problems, sel map[string]string) map[string]string {

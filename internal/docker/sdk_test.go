@@ -70,6 +70,27 @@ func TestBuildConfigsHardensEveryContainer(t *testing.T) {
 	}
 }
 
+func TestBuildConfigsTurnsAHealthCheckIntoDockersExecForm(t *testing.T) {
+	spec := validSpec()
+	cfg, _ := buildConfigs(createRequest{Name: "x", Spec: spec})
+	if cfg.Healthcheck != nil {
+		t.Fatalf("a container without a health check got %+v", cfg.Healthcheck)
+	}
+
+	spec.HealthCheck = validHealth()
+	cfg, _ = buildConfigs(createRequest{Name: "x", Spec: spec})
+	h := cfg.Healthcheck
+	if h == nil || !reflect.DeepEqual(h.Test, []string{"CMD", "curl", "-f", "http://localhost/"}) ||
+		h.Interval != 10*time.Second || h.Timeout != 2*time.Second || h.StartPeriod != 5*time.Second || h.Retries != 3 {
+		t.Fatalf("health config = %+v; the command must run directly (CMD), never through a shell", h)
+	}
+	// The spec's own slice is not shared with the request to Docker.
+	h.Test[1] = "changed"
+	if spec.HealthCheck.Command[0] != "curl" {
+		t.Fatal("the health config shares the spec's command")
+	}
+}
+
 func TestBuildConfigsIgnoresUnsafeFieldsEvenIfPolicyWereBypassed(t *testing.T) {
 	spec := validSpec()
 	spec.Privileged = true

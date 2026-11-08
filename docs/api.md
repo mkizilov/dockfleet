@@ -54,7 +54,7 @@ Other statuses: `404` unknown service, `409` name already in use (or a concurren
       "command": ["curl", "-f", "http://localhost/healthz"],
       "interval_seconds": 30, "timeout_seconds": 5, "start_period_seconds": 0, "retries": 3
     },
-    "restart_policy": {"condition": "on-failure", "max_retries": 5},
+    "restart_policy": {"condition": "on-failure", "max_retries": 5, "backoff_seconds": 1, "max_backoff_seconds": 60},
     "node_selector": {"zone": "a"}
   }
 }
@@ -71,10 +71,10 @@ Other statuses: `404` unknown service, `409` name already in use (or a concurren
 | `spec.memory_bytes` | yes | Memory limit, 6 MiB to 1 TiB. Every service has one. |
 | `spec.ports` | no | Up to 32. `container_port` 1-65535 (required); `protocol` `tcp` (default) or `udp`; `host_port` 0 or omitted to let the node choose, otherwise 1024-65535 (lower ports are privileged). Ports and host ports must not repeat. Where a port is published is the agent's decision (loopback by default); a fixed `host_port` allows one replica per node. |
 | `spec.health_check` | no | `command`: program and arguments run inside the container, exit status 0 is healthy; at most 32 arguments. Exec form only: a leading `CMD`, `CMD-SHELL` or `NONE` is refused, so there is no shell string. `interval_seconds` (default 30, max 3600), `timeout_seconds` (5, max 300), `start_period_seconds` (0, max 3600), `retries` (3, max 10); zero or omitted means the default. |
-| `spec.restart_policy` | no | `condition` is `no`, `on-failure` or `always`. `max_retries` (1-100, default 5) applies to `on-failure` only. Omitted means `on-failure` with 5 retries. |
+| `spec.restart_policy` | no | `condition` is `no`, `on-failure` or `always`. `max_retries` (1-100) is how many restarts in a row are allowed: default 5 for `on-failure`; for `always` it is optional and means no limit when omitted. `backoff_seconds` (1-3600, default 1) is the wait before the second restart in a row, doubling with each further one up to `max_backoff_seconds` (1-3600, default 60, at least `backoff_seconds`). The first restart is immediate. A container that has run for 30 seconds starts over. `no` takes none of the three. Omitted means `on-failure` with 5 retries. A container that turns unhealthy is stopped and restarted under the same policy ([failure-handling.md](failure-handling.md)). |
 | `spec.node_selector` | no | Up to 16 labels a node must carry. The scheduler only places a replica on a node whose labels include all of them. |
 
-Defaults are written into the stored definition, and the definition is put in a canonical form (ports sorted, empty values dropped). So `GET` shows what is stored, the same definition written differently is not a change, and **what `GET` returns is a valid `PUT` body** apart from the read-only fields below.
+Defaults are written into the stored definition, and the definition is put in a canonical form (ports sorted, empty values dropped, the default restart waits stored as absent, so writing `"backoff_seconds": 1` and leaving it out are one definition). So `GET` shows what is stored, the same definition written differently is not a change, and **what `GET` returns is a valid `PUT` body** apart from the read-only fields below.
 
 ### Rejected options
 
@@ -134,12 +134,16 @@ Every service view (`GET /v1/services`, `GET /v1/services/{name}` and the respon
   "scheduled_replicas": 2,
   "unschedulable_replicas": 1,
   "running_replicas": 1,
+  "failed_replicas": 0,
+  "unhealthy_replicas": 0,
+  "lost_replicas": 0,
   "replicas": [
     {"revision": 2, "index": 1, "workload_id": "9c1e...", "workload_name": "web-r2-1-3f9a2c",
-     "node_id": "worker-1", "desired_state": "running", "generation": 1, "acknowledged": false, "phase": "scheduled"},
+     "node_id": "worker-1", "desired_state": "running", "generation": 1, "acknowledged": false, "phase": "scheduled",
+     "restart_count": 0, "node_health": "healthy"},
     {"revision": 2, "index": 2, "workload_id": "b07d...", "workload_name": "web-r2-2-81c0de",
      "node_id": "worker-2", "desired_state": "running", "generation": 1, "acknowledged": true, "phase": "running",
-     "message": "running", "container_id": "4be1..."}
+     "message": "running", "container_id": "4be1...", "health": "healthy", "restart_count": 1, "node_health": "healthy"}
   ],
   "unschedulable": [
     {"service_id": "5f0c...", "revision": 2, "replica_index": 3,
@@ -155,17 +159,20 @@ Every service view (`GET /v1/services`, `GET /v1/services/{name}` and the respon
 ```
 
 - `scheduled_replicas` counts the wanted replicas of the current revision (index up to `replicas`) that have a workload meant to run; `unschedulable_replicas` those that have none because no node qualifies.
-- `running_replicas` counts the wanted replicas of the current revision whose agent reports the container running.
-- `replicas` lists the service's workloads, by revision and index, including those of older revisions: they stay until the reconciler has replaced them (a replica of an older revision is stopped once the same replica of the current one runs) and their node has confirmed that the container is gone. `phase` is what the node's agent last reported, or `scheduled` before it has reported anything; `message` and `container_id` are the agent's words and the container it reported. The decision (`node_id`, `desired_state`, `generation`) and the observation (`phase`, `acknowledged`) are separate facts: `generation` counts the instructions given for the workload, and `acknowledged` says its node has received the latest. See [reconciliation.md](reconciliation.md).
+- `running_replicas` counts the wanted replicas of the current revision whose agent reports the container running and healthy on a node that is not unavailable. The others are counted where they are: `failed_replicas` (the container failed and is not being restarted, or not yet), `unhealthy_replicas` (it runs but fails its health check) and `lost_replicas` (its node is unavailable, so the manager is moving it). A replica that has not reported yet is only `scheduled`. How failures are handled is in [failure-handling.md](failure-handling.md).
+- `replicas` lists the service's workloads, by revision and index, including those of older revisions: they stay until the reconciler has replaced them (a replica of an older revision is stopped once the same replica of the current one runs) and their node has confirmed that the container is gone. `phase` is what the node's agent last reported, or `scheduled` before it has reported anything; `message` and `container_id` are the agent's words and the container it reported; `health` is its health check result (absent without a check), `restart_count` how often the agent restarted it, `exit_code` how it last ended, and `node_health` the state of its node (`healthy`, `suspect`, `unavailable`). The replica that was moved off a lost node stays listed as `stopped` until its node confirms. The decision (`node_id`, `desired_state`, `generation`) and the observation (`phase`, `acknowledged`) are separate facts: `generation` counts the instructions given for the workload, and `acknowledged` says its node has received the latest. See [reconciliation.md](reconciliation.md).
 - `unschedulable` explains each waiting replica: a `code` (`no_nodes`, `no_available_nodes`, `selector_unsatisfied`, `host_port_conflict`, `insufficient_resources`, `exceeds_capacity`), a `message`, one reason per node, and `since`, when this explanation first applied (it does not move while nothing changes). The codes are described in [scheduler.md](scheduler.md#why-a-replica-cannot-be-placed). Scheduling runs every `DOCKFLEET_SCHEDULER_INTERVAL`, so a new or changed service shows an empty status for up to that long.
 
 The assignments themselves are ordinary workloads: `GET /v1/workloads` lists them with `node_id`, `desired_state`, `service_id`, `service_revision`, `replica_index` and `ports`, and each carries the agent's `observed` report beside the decision. The scheduler's audit events, with the actor `scheduler`, are in `GET /v1/events`: `replica.scheduled` (resource: the workload; details: service, revision, replica, node) and `replica.unschedulable` (resource: the service), the latter only when an explanation is new or changed.
+
+Failures are on the same trail: the reconciler records `node.suspect`, `node.unavailable` and `node.recovered` (resource: the node) and `replica.stopped` with the reason `node_unavailable` when it moves a replica, and agents' reports produce `workload.failed`, `workload.unhealthy`, `workload.restarted` and `workload.recovered` (resource: the workload), each once per change.
 
 ### Nodes and standalone workloads
 
 The same scheduler serves the other state endpoints:
 
 - `GET /v1/nodes` and `GET /v1/nodes/{id}` show, beside `status` (`ready` or `not_ready`), a `status_reason` when it is not ready (for example `no heartbeat within the last 30s`), the `allocatable` CPU and memory (`cpu_millis`, `memory_bytes`: capacity times the overcommit factor) and what is `allocated` to workloads that are meant to run (`cpu_millis`, `memory_bytes`, `workloads`).
+- The same views carry the node's **health**, from how long it has been silent: `health` is `healthy`, `suspect` (silent longer than `DOCKFLEET_NODE_TTL`, or its agent has left: it gets no new replicas but keeps its own) or `unavailable` (silent longer than `DOCKFLEET_NODE_UNAVAILABLE_AFTER`: its replicas are being started on other nodes), with a `health_reason`, `health_since` (when the manager recorded the state; absent until it has) and `lease_expires_at` (last heartbeat plus the lease; an agent that fences itself stops its containers then). It is computed when read. See [failure-handling.md](failure-handling.md).
 - `POST /v1/workloads` places the workload with the same rules. When nothing fits the answer is `409` with the reason for the request and for every node: `{"error": "0/1 nodes can run ...", "code": "insufficient_resources", "nodes": [{"node_id": "...", "code": "...", "message": "..."}]}`. A node whose enrollment was revoked gets nothing. (A duplicate name is also `409`, with only `error`.)
 
 ## Audit events
@@ -174,7 +181,7 @@ Each successful change is recorded in `GET /v1/events` in the same transaction a
 
 ## Not yet
 
-No pagination of the service list, no partial (`PATCH`) updates, no secret values, no image allow-list, no per-user authentication (one shared admin token), and no failover: a replica on a node that never returns stays assigned to it (see [reconciliation.md](reconciliation.md#limitations)).
+No pagination of the service list, no partial (`PATCH`) updates, no secret values, no image allow-list, no per-user authentication (one shared admin token), and no rescheduling of a replica whose container failed beyond its restart limit (see [failure-handling.md](failure-handling.md#limitations)).
 
 ## Tests
 

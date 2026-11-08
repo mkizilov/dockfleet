@@ -11,9 +11,13 @@
 //
 // The unit of work is a replica slot: replica i of a service's current
 // revision. A slot with no workload is waiting. Placing it creates a workload
-// for that slot, and the database allows only one per slot. What a pass does not
-// do is remove anything: scaling a service down, retiring the replicas of an
-// older revision and moving workloads off dead nodes belong to a reconciler.
+// for that slot, and the database allows only one that is meant to run per
+// slot. What a pass does not do is remove anything: scaling a service down,
+// retiring the replicas of an older revision and stopping the workloads of a
+// node that was given up on belong to the reconciler (internal/reconcile). A
+// slot whose only workload was stopped on such a lost node is waiting again, so
+// that the replica is started on another node at once instead of when the lost
+// node returns.
 package placement
 
 import (
@@ -55,6 +59,9 @@ type Cluster struct {
 	Assignments []scheduler.Assignment
 	// Workloads is every workload, including the ones that no longer reserve anything.
 	Workloads []store.Workload
+	// Stored are the nodes as the store has them, for the checks that need more
+	// than the scheduler's view (how long a node has been silent).
+	Stored []store.Node
 }
 
 // ReadCluster takes a snapshot. A node is available when it has sent a
@@ -77,7 +84,7 @@ func ReadCluster(ctx context.Context, r Reader, now time.Time, ttl time.Duration
 	for _, e := range enrollments {
 		revoked[e.NodeID] = !e.Active()
 	}
-	c := Cluster{Workloads: workloads}
+	c := Cluster{Workloads: workloads, Stored: nodes}
 	for _, n := range nodes {
 		sn := scheduler.NodeFor(n, now, ttl)
 		if sn.Unavailable == "" && revoked[n.ID] {
@@ -118,11 +125,13 @@ type replicaKey struct {
 
 // findWaiting lists the replicas that have no workload: for each live service,
 // replicas 1 to N of its current revision. A slot that already has a workload
-// is not waiting, whatever state the workload is in.
-func findWaiting(defs []store.Definition, workloads []store.Workload) []waiting {
+// is not waiting, whatever state the workload is in, except that a workload
+// that was stopped on a lost node no longer holds its slot: that node cannot
+// be asked to remove the container, and the replica must not wait for it.
+func findWaiting(defs []store.Definition, workloads []store.Workload, lost map[string]bool) []waiting {
 	taken := make(map[slot]bool, len(workloads))
 	for _, w := range workloads {
-		if w.ServiceID != "" {
+		if w.ServiceID != "" && !(w.DesiredState == store.DesiredStopped && lost[w.NodeID]) {
 			taken[slot{w.ServiceID, w.ServiceRevision, w.ReplicaIndex}] = true
 		}
 	}
@@ -150,6 +159,8 @@ type Config struct {
 	Logger *slog.Logger
 	// NodeTTL is how long after its last heartbeat a node still counts as available.
 	NodeTTL time.Duration
+	// Timing says when a silent node is given up on. The zero value never does.
+	Timing scheduler.Timing
 	// Overcommit lets nodes be promised more than they have. The zero value, no overcommit, is the safe one.
 	Overcommit scheduler.Overcommit
 	// Interval is the time between passes of Run; Run does nothing when it is zero.
@@ -222,7 +233,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) (Report, error) {
 			return fmt.Errorf("list services: %w", err)
 		}
 
-		pending := findWaiting(defs, cluster.Workloads)
+		pending := findWaiting(defs, cluster.Workloads, s.cfg.Timing.Lost(cluster.Stored, now))
 		byReplica := make(map[replicaKey]waiting, len(pending))
 		replicas := make([]scheduler.Replica, 0, len(pending))
 		for _, w := range pending {
@@ -243,7 +254,7 @@ func (s *Scheduler) RunOnce(ctx context.Context) (Report, error) {
 					Image: spec.Image, CPUMillis: spec.CPUMillis, MemoryBytes: spec.MemoryBytes,
 					NodeID: d.NodeID, DesiredState: store.DesiredRunning,
 					ServiceID: svc.ID, ServiceRevision: svc.CurrentRevision, ReplicaIndex: d.Replica.Index,
-					Ports: spec.Ports, Command: spec.Command, Env: spec.Env, RestartPolicy: spec.RestartPolicy, CreatedAt: now,
+					Ports: spec.Ports, Command: spec.Command, Env: spec.Env, RestartPolicy: spec.RestartPolicy, HealthCheck: spec.HealthCheck, CreatedAt: now,
 				})
 				if err != nil {
 					return fmt.Errorf("assign %s: %w", d.Replica.Label(), err)

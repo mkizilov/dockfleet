@@ -41,6 +41,7 @@ type Manager struct {
 	registry   *registry.Registry
 	scheduler  *placement.Scheduler
 	reconciler *reconcile.Reconciler
+	timing     scheduler.Timing
 	logger     *slog.Logger
 	apiTLS     *tls.Config
 	grpcTLS    *tls.Config
@@ -58,15 +59,18 @@ func overcommit(cfg config.Manager) scheduler.Overcommit {
 // token) and the agent gRPC listener requires a client certificate signed by
 // the client CA; the certificate files are re-read when they change.
 func New(cfg config.Manager, st store.Store, logger *slog.Logger) (*Manager, error) {
+	// Silence from before this manager started is not counted against a node:
+	// a manager that was down cannot tell a dead node from one it could not hear.
+	timing := scheduler.Timing{SuspectAfter: cfg.NodeTTL, UnavailableAfter: cfg.NodeUnavailableAfter, Since: time.Now()}
 	m := &Manager{
-		cfg: cfg, store: st, logger: logger,
+		cfg: cfg, store: st, logger: logger, timing: timing,
 		registry: registry.New(st, logger).WithInstanceID(cfg.InstanceID),
 		scheduler: placement.New(placement.Config{
-			Store: st, Logger: logger, NodeTTL: cfg.NodeTTL, Overcommit: overcommit(cfg),
+			Store: st, Logger: logger, NodeTTL: cfg.NodeTTL, Timing: timing, Overcommit: overcommit(cfg),
 			Interval: cfg.SchedulerInterval, InstanceID: cfg.InstanceID,
 		}),
 		reconciler: reconcile.New(reconcile.Config{
-			Store: st, Logger: logger, Interval: cfg.ReconcileInterval, InstanceID: cfg.InstanceID,
+			Store: st, Logger: logger, Interval: cfg.ReconcileInterval, InstanceID: cfg.InstanceID, Timing: timing,
 		}),
 	}
 	if cfg.TLSCertFile != "" {
@@ -106,7 +110,7 @@ func (m *Manager) Serve(ctx context.Context, apiLn, grpcLn net.Listener) error {
 			return err
 		}
 	}
-	nodes := protocol.NewNodeServer(m.registry, m.cfg.HeartbeatInterval, m.logger)
+	nodes := protocol.NewNodeServer(m.registry, m.cfg.HeartbeatInterval, m.logger).WithLease(m.cfg.NodeLease)
 	grpcSrv, err := protocol.NewGRPCServer(nodes, protocol.ServerOptions{
 		TLS:              m.grpcTLS,
 		Token:            m.cfg.AgentToken,
@@ -122,6 +126,8 @@ func (m *Manager) Serve(ctx context.Context, apiLn, grpcLn net.Listener) error {
 			Store:      m.store,
 			Token:      m.cfg.APIToken,
 			NodeTTL:    m.cfg.NodeTTL,
+			Timing:     m.timing,
+			NodeLease:  m.cfg.NodeLease,
 			Logger:     m.logger,
 			InstanceID: m.cfg.InstanceID,
 			Overcommit: overcommit(m.cfg),

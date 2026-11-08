@@ -41,7 +41,10 @@ type NodeInfo struct {
 type Session struct {
 	ID                string
 	HeartbeatInterval time.Duration
-	Assignments       []*dockfleetv1.WorkloadAssignment
+	// Lease is how long a successful heartbeat keeps the session's lease, from
+	// when the agent sent it; zero when the manager grants none.
+	Lease       time.Duration
+	Assignments []*dockfleetv1.WorkloadAssignment
 }
 
 // ClientConfig configures Dial.
@@ -144,6 +147,7 @@ func (c *Client) Register(ctx context.Context, n NodeInfo) (Session, error) {
 	return Session{
 		ID:                resp.GetSessionId(),
 		HeartbeatInterval: time.Duration(resp.GetHeartbeatIntervalMs()) * time.Millisecond,
+		Lease:             time.Duration(resp.GetLeaseMs()) * time.Millisecond,
 		Assignments:       resp.GetAssignments(),
 	}, nil
 }

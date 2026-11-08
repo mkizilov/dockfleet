@@ -46,6 +46,21 @@ type Config struct {
 	// go without an assignment before it is removed (zero means 2 minutes).
 	Resync      time.Duration
 	OrphanGrace time.Duration
+	// FenceOnLeaseLoss makes the agent stop its containers when the lease the
+	// manager grants (renewed by every heartbeat it answers) runs out, so that a
+	// replica the manager has started on another node does not also run here.
+	// Off, containers keep running through any outage of the manager.
+	FenceOnLeaseLoss bool
+	// StableAfter is how long a restarted container must run before its
+	// restarts in a row are forgotten; zero means 30 seconds.
+	StableAfter time.Duration
+	// BackoffBase and BackoffMax bound the wait between restarts of a container
+	// whose restart policy sets none, and between retries of a failed create or
+	// start; zero means 1 second and 1 minute.
+	BackoffBase time.Duration
+	BackoffMax  time.Duration
+	// Now defaults to time.Now; tests set it.
+	Now func() time.Time
 }
 
 // Agent keeps one node connected to the manager until its context is
@@ -67,7 +82,20 @@ func New(cfg Config) *Agent {
 	if cfg.RetryMax <= 0 {
 		cfg.RetryMax = defaultRetryMax
 	}
-	return &Agent{cfg: cfg, runner: newRunner(cfg.Docker, cfg.Logger, runnerConfig{Resync: cfg.Resync, OrphanGrace: cfg.OrphanGrace})}
+	return &Agent{cfg: cfg, runner: newRunner(cfg.Docker, cfg.Logger, runnerConfig{
+		Resync: cfg.Resync, OrphanGrace: cfg.OrphanGrace, StableAfter: cfg.StableAfter, Fencing: cfg.FenceOnLeaseLoss, Now: cfg.Now,
+		BackoffBase: cfg.BackoffBase, BackoffMax: cfg.BackoffMax,
+	})}
+}
+
+// renewLease extends the lease the manager granted with the session, counted
+// from sentAt, when the agent sent the request that the manager answered. The
+// manager started its own clock when the request reached it, which is later, so
+// the agent's lease never outlasts the manager's.
+func (a *Agent) renewLease(sentAt time.Time, session protocol.Session) {
+	if session.Lease > 0 {
+		a.runner.RenewLease(sentAt.Add(session.Lease))
+	}
 }
 
 // Run blocks until ctx is canceled and then returns nil after deregistering
@@ -98,7 +126,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	}()
 
 	for {
-		session, err := a.register(ctx)
+		session, sentAt, err := a.register(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				a.cfg.Logger.Info("agent stopped before registering")
@@ -106,7 +134,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			}
 			return err
 		}
-		lost, err := a.serve(ctx, session)
+		lost, err := a.serve(ctx, session, sentAt)
 		if err != nil {
 			return err
 		}
@@ -129,24 +157,25 @@ func (a *Agent) checkDocker(ctx context.Context) {
 }
 
 // register retries until it succeeds, ctx ends, or the manager rejects the
-// registration permanently.
-func (a *Agent) register(ctx context.Context) (protocol.Session, error) {
+// registration permanently. It also returns when the successful request was sent.
+func (a *Agent) register(ctx context.Context) (protocol.Session, time.Time, error) {
 	delay := a.cfg.RetryMin
 	for {
 		callCtx, cancel := context.WithTimeout(ctx, a.cfg.RPCTimeout)
+		sentAt := a.runner.now()
 		session, err := a.cfg.Manager.Register(callCtx, a.cfg.Node)
 		cancel()
 		if err == nil {
 			a.cfg.Logger.Info("registered with manager", "node_id", a.cfg.Node.ID, "session", session.ID,
-				"heartbeat_interval", session.HeartbeatInterval, "assignments", len(session.Assignments))
-			return session, nil
+				"heartbeat_interval", session.HeartbeatInterval, "lease", session.Lease, "assignments", len(session.Assignments))
+			return session, sentAt, nil
 		}
 		if ctx.Err() != nil {
-			return protocol.Session{}, ctx.Err()
+			return protocol.Session{}, time.Time{}, ctx.Err()
 		}
 		if protocol.IsPermanent(err) {
 			a.cfg.Logger.Error("manager rejected registration", "error", err)
-			return protocol.Session{}, fmt.Errorf("registration rejected: %w", err)
+			return protocol.Session{}, time.Time{}, fmt.Errorf("registration rejected: %w", err)
 		}
 		if protocol.IsNotEnrolled(err) {
 			a.cfg.Logger.Error("this node is not enrolled; an administrator must enroll it", "node_id", a.cfg.Node.ID, "retry_in", delay)
@@ -157,7 +186,7 @@ func (a *Agent) register(ctx context.Context) (protocol.Session, error) {
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return protocol.Session{}, ctx.Err()
+			return protocol.Session{}, time.Time{}, ctx.Err()
 		case <-timer.C:
 		}
 		delay = min(delay*2, a.cfg.RetryMax)
@@ -167,7 +196,8 @@ func (a *Agent) register(ctx context.Context) (protocol.Session, error) {
 // serve heartbeats until ctx ends (false, nil), the manager no longer
 // recognizes the session (true, nil: the caller registers again), or the
 // manager reports a failure that retrying cannot fix (an error).
-func (a *Agent) serve(ctx context.Context, session protocol.Session) (sessionLost bool, err error) {
+func (a *Agent) serve(ctx context.Context, session protocol.Session, registeredAt time.Time) (sessionLost bool, err error) {
+	a.renewLease(registeredAt, session)
 	a.runner.Assign(session.Assignments)
 	interval := session.HeartbeatInterval
 	if interval <= 0 {
@@ -184,10 +214,12 @@ func (a *Agent) serve(ctx context.Context, session protocol.Session) (sessionLos
 		}
 
 		callCtx, cancel := context.WithTimeout(ctx, a.cfg.RPCTimeout)
+		sentAt := a.runner.now()
 		assigned, hbErr := a.cfg.Manager.Heartbeat(callCtx, a.cfg.Node.ID, session.ID, a.runner.Statuses())
 		cancel()
 		switch {
 		case hbErr == nil:
+			a.renewLease(sentAt, session)
 			a.runner.Assign(assigned)
 		case ctx.Err() != nil:
 			return false, nil

@@ -55,6 +55,13 @@ type manager struct {
 	dialsTry  atomic.Int64
 	// skew shifts the clock the server uses for per-call certificate checks.
 	skew atomic.Int64
+	// lease is the lease, in nanoseconds, the manager grants each session; zero grants none.
+	lease atomic.Int64
+	// fence makes the agents started afterwards stop their containers when their lease runs out.
+	fence bool
+	// backoff, when set, is the shortest wait between restarts of a container whose
+	// restart policy sets none (the longest is four times as long).
+	backoff time.Duration
 
 	mu  sync.Mutex
 	lis *bufconn.Listener
@@ -120,7 +127,7 @@ func (m *manager) start() {
 		logger = slog.New(m.logs)
 	}
 	reg := registry.New(m.store, logger)
-	node := protocol.NewNodeServer(reg, heartbeatEvery, logger)
+	node := protocol.NewNodeServer(reg, heartbeatEvery, logger).WithLease(time.Duration(m.lease.Load()))
 	if m.version != nil {
 		node.WithVersion(m.version)
 	}
@@ -247,6 +254,10 @@ func (m *manager) runAgent(rt docker.Runtime, id string, mutate func(*protocol.C
 		RetryMin:   5 * time.Millisecond,
 		RetryMax:   20 * time.Millisecond,
 		Resync:     10 * time.Millisecond,
+
+		FenceOnLeaseLoss: m.fence,
+		BackoffBase:      m.backoff,
+		BackoffMax:       4 * m.backoff,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &simAgent{t: m.t, cancel: cancel, exited: make(chan struct{})}

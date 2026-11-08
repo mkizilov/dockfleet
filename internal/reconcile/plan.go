@@ -11,6 +11,13 @@
 // and the scheduler fills it with a new workload when the service still wants a
 // replica there.
 //
+// A node that has been silent for longer than its lease is given up on: its
+// workloads are told to stop (generation up, so a node that comes back learns at
+// once that it no longer owns them), and the scheduler starts the replicas on
+// other nodes. The workload on the lost node keeps its record until that node,
+// if it returns, has removed the container; if it never does, the record stays
+// as the proof that the replica was moved.
+//
 // Everything here is derived from the store on every pass, so a pass can be
 // repeated, interrupted or run by another manager without harm.
 package reconcile
@@ -18,6 +25,7 @@ package reconcile
 import (
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/dockfleet/dockfleet/internal/scheduler"
 	"github.com/dockfleet/dockfleet/internal/store"
@@ -33,11 +41,12 @@ const (
 
 // Reasons for an action.
 const (
-	ReasonScaledDown     = "scaled_down"     // the replica index is beyond the service's replica count
-	ReasonServiceDeleted = "service_deleted" // the service was deleted
-	ReasonSuperseded     = "superseded"      // the same replica of the current revision is up
-	ReasonPortHandover   = "port_handover"   // the new replica needs the fixed host port the old one holds
-	ReasonRetired        = "retired"         // the node confirmed that the container is gone
+	ReasonScaledDown     = "scaled_down"      // the replica index is beyond the service's replica count
+	ReasonServiceDeleted = "service_deleted"  // the service was deleted
+	ReasonSuperseded     = "superseded"       // the same replica of the current revision is up
+	ReasonPortHandover   = "port_handover"    // the new replica needs the fixed host port the old one holds
+	ReasonNodeLost       = "node_unavailable" // the node has been silent for longer than its lease
+	ReasonRetired        = "retired"          // the node confirmed that the container is gone
 )
 
 // Action is one change to a workload.
@@ -104,11 +113,14 @@ func sharesHostPort(held, wanted []store.ServicePort) bool {
 //     because every node already uses a host port that the old replica holds
 //     and the new one needs too, the old one is stopped to free it. There is a
 //     gap then, because the two cannot run side by side.
+//   - A workload on a lost node is stopped, so that its replica is started on
+//     another node.
 //   - A stopped workload whose node confirmed the container is gone is deleted.
 //
-// Workloads that belong to no service are not touched. The result is ordered
-// by workload name, stops before deletes.
-func Plan(defs []store.Definition, workloads []store.Workload, waiting []store.Unschedulable) []Action {
+// Workloads that belong to no service are not touched: a standalone workload
+// is pinned to the node an administrator chose, so there is nowhere to move it.
+// The result is ordered by workload name, stops before deletes.
+func Plan(defs []store.Definition, workloads []store.Workload, waiting []store.Unschedulable, lost map[string]bool) []Action {
 	byID := make(map[string]store.Definition, len(defs))
 	for _, d := range defs {
 		byID[d.Service.ID] = d
@@ -146,6 +158,8 @@ func Plan(defs []store.Definition, workloads []store.Workload, waiting []store.U
 			actions = append(actions, Action{Kind: ActionStop, Reason: reason, Workload: w})
 		case w.ServiceRevision < s.CurrentRevision && up[slot{s.ID, w.ReplicaIndex}]:
 			actions = append(actions, Action{Kind: ActionStop, Reason: ReasonSuperseded, Workload: w})
+		case lost[w.NodeID]:
+			actions = append(actions, Action{Kind: ActionStop, Reason: ReasonNodeLost, Workload: w})
 		case w.ServiceRevision < s.CurrentRevision && portBlocked[slot{s.ID, w.ReplicaIndex}] && sharesHostPort(w.Ports, d.Revision.Spec.Ports):
 			actions = append(actions, Action{Kind: ActionStop, Reason: ReasonPortHandover, Workload: w})
 		}
@@ -158,4 +172,28 @@ func Plan(defs []store.Definition, workloads []store.Workload, waiting []store.U
 		return a.Workload.Name < b.Workload.Name
 	})
 	return actions
+}
+
+// NodeChange is a node whose health state is not the one recorded for it.
+type NodeChange struct {
+	Node     store.Node
+	From, To string
+}
+
+// PlanNodes lists the nodes whose health at now differs from the state last
+// recorded for them, ordered by node ID. The recorded state is what makes a
+// change an event: a node that stays suspect is reported once.
+func PlanNodes(nodes []store.Node, now time.Time, timing scheduler.Timing) []NodeChange {
+	var out []NodeChange
+	for _, n := range nodes {
+		from := n.Health
+		if from == "" {
+			from = store.NodeHealthy
+		}
+		if to := timing.Health(n, now); to != from {
+			out = append(out, NodeChange{Node: n, From: from, To: to})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Node.ID < out[j].Node.ID })
+	return out
 }

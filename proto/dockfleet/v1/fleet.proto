@@ -18,7 +18,15 @@ option go_package = "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/
 //     so every instruction is idempotent: an agent that receives the same set
 //     twice, or after a restart, converges to the same containers.
 //  3. DeregisterNode: the agent announces a clean shutdown so the manager can
-//     mark the node unavailable immediately instead of waiting for a timeout.
+//     stop placing work on the node immediately instead of waiting for a
+//     timeout.
+//
+// Leases: the manager grants each session a lease of lease_ms, renewed by
+// every successful Heartbeat. A node that stays silent is suspect, then
+// unavailable, and only an unavailable node's workloads are started on other
+// nodes. The manager waits longer than the lease before it does, so an agent
+// that fences itself when its lease runs out has stopped its containers by
+// then. See docs/failure-handling.md.
 //
 // Failures that the agent can act on carry a ProtocolError in the gRPC status
 // details. See docs/protocol.md.
@@ -86,12 +94,32 @@ message PortMapping {
   string protocol = 3;
 }
 
-// RestartPolicy says when the agent starts a container that exited.
+// RestartPolicy says when the agent starts a container that exited or turned
+// unhealthy, how long it waits and when it gives up.
 message RestartPolicy {
   // "no", "on-failure" or "always"; empty means "on-failure".
   string condition = 1;
-  // How many times "on-failure" restarts the container.
+  // How many restarts in a row are allowed. 0 means 5 for "on-failure" and no
+  // limit for "always". The count starts again after the container has run
+  // steadily for a while.
   uint32 max_retries = 2;
+  // The wait before the second restart in a row (the first is immediate); it
+  // doubles with each further restart up to max_backoff_seconds. 0 means 1.
+  uint32 backoff_seconds = 3;
+  // 0 means 60.
+  uint32 max_backoff_seconds = 4;
+}
+
+// HealthCheck is run by Docker inside the container; exit status 0 is healthy.
+message HealthCheck {
+  // Exec form: the program and its arguments, never a shell string.
+  repeated string command = 1;
+  uint32 interval_seconds = 2;
+  uint32 timeout_seconds = 3;
+  // Failures in this period after the start do not count.
+  uint32 start_period_seconds = 4;
+  // Consecutive failures that make the container unhealthy.
+  uint32 retries = 5;
 }
 
 // WorkloadAssignment is the instruction for one workload on the node. The
@@ -114,6 +142,8 @@ message WorkloadAssignment {
   repeated PortMapping ports = 10;
   // Absent means the default, "on-failure" with 5 retries.
   RestartPolicy restart_policy = 11;
+  // Absent means the container is not health checked.
+  HealthCheck health_check = 12;
 }
 
 enum WorkloadPhase {
@@ -141,6 +171,9 @@ message WorkloadStatus {
   bool oom_killed = 7;
   // How many times the agent restarted the container since it started.
   int32 restart_count = 8;
+  // The result of the container's health check: empty without one, else
+  // "starting", "healthy" or "unhealthy".
+  string health = 9;
 }
 
 enum ProtocolErrorCode {
@@ -186,6 +219,9 @@ message RegisterNodeResponse {
   int64 heartbeat_interval_ms = 3;
   // The complete set of workloads assigned to the node right now.
   repeated WorkloadAssignment assignments = 4;
+  // How long a successful Heartbeat keeps the session's lease, counted from
+  // when the agent sent the request. 0 from a manager that grants none.
+  int64 lease_ms = 5;
 }
 
 message HeartbeatRequest {

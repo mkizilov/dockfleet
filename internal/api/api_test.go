@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dockfleet/dockfleet/internal/scheduler"
 	"github.com/dockfleet/dockfleet/internal/store"
 )
 
@@ -116,6 +117,96 @@ func TestListAndGetNodes(t *testing.T) {
 	}
 	if rec := do(h, http.MethodGet, "/v1/nodes/ghost", "", true); rec.Code != http.StatusNotFound {
 		t.Fatalf("GET missing node = %d, want 404", rec.Code)
+	}
+}
+
+// Every node view says how long the node has been silent in the terms that
+// matter to a replica on it: healthy, suspect (it gets no new replicas but keeps
+// its own) or unavailable (its replicas are started elsewhere), and when its
+// lease runs out. The state is computed when it is asked for, so it is current
+// even before the reconciler has recorded the change.
+func TestNodesShowTheirHealthAndLease(t *testing.T) {
+	st := store.NewMemory()
+	h := New(Config{
+		Store: st, Token: token, NodeTTL: 30 * time.Second, NodeLease: time.Minute,
+		Timing: scheduler.Timing{SuspectAfter: 30 * time.Second, UnavailableAfter: 2 * time.Minute},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Now: func() time.Time { return fixedNow },
+	})
+	addNode(t, st, "alive", 1000, fixedNow.Add(-5*time.Second), nil)
+	addNode(t, st, "gone", 1000, fixedNow.Add(-time.Hour), nil)
+	addNode(t, st, "left", 1000, fixedNow.Add(-time.Minute), nil)
+	addNode(t, st, "quiet", 1000, fixedNow.Add(-time.Minute), nil)
+	ctx := context.Background()
+	if err := st.DeregisterNode(ctx, "left", fixedNow.Add(-10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// The reconciler has recorded the loss of "gone" but not yet the silence of "quiet".
+	recorded := fixedNow.Add(-58 * time.Minute)
+	if err := st.SetNodeHealth(ctx, "gone", store.NodeUnavailable, recorded); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := do(h, http.MethodGet, "/v1/nodes", "", true)
+	var list struct {
+		Nodes []struct {
+			ID             string     `json:"id"`
+			Status         string     `json:"status"`
+			Health         string     `json:"health"`
+			HealthReason   string     `json:"health_reason"`
+			HealthSince    *time.Time `json:"health_since"`
+			LeaseExpiresAt *time.Time `json:"lease_expires_at"`
+		} `json:"nodes"`
+	}
+	decode(t, rec, &list)
+	if rec.Code != http.StatusOK || len(list.Nodes) != 4 {
+		t.Fatalf("GET /v1/nodes = %d %s", rec.Code, rec.Body.String())
+	}
+	byID := map[string]int{}
+	for i, n := range list.Nodes {
+		byID[n.ID] = i
+	}
+	get := func(id string) int { return byID[id] }
+
+	alive := list.Nodes[get("alive")]
+	if alive.Health != store.NodeHealthy || alive.Status != "ready" || alive.HealthReason != "" ||
+		alive.LeaseExpiresAt == nil || !alive.LeaseExpiresAt.Equal(fixedNow.Add(-5*time.Second).Add(time.Minute)) ||
+		alive.HealthSince == nil || !alive.HealthSince.Equal(fixedNow.Add(-5*time.Second)) {
+		t.Fatalf("alive = %+v", alive)
+	}
+	quiet := list.Nodes[get("quiet")]
+	if quiet.Health != store.NodeSuspect || quiet.Status != "not_ready" || !strings.Contains(quiet.HealthReason, "30s") || quiet.HealthSince != nil {
+		t.Fatalf("quiet = %+v; the state is computed now, and HealthSince waits for the reconciler", quiet)
+	}
+	gone := list.Nodes[get("gone")]
+	if gone.Health != store.NodeUnavailable || !strings.Contains(gone.HealthReason, "2m0s") || gone.HealthSince == nil || !gone.HealthSince.Equal(recorded) {
+		t.Fatalf("gone = %+v", gone)
+	}
+	left := list.Nodes[get("left")]
+	if left.Health != store.NodeSuspect || left.LeaseExpiresAt != nil {
+		t.Fatalf("left = %+v; an agent that said goodbye holds no lease", left)
+	}
+
+	one := do(h, http.MethodGet, "/v1/nodes/gone", "", true)
+	if one.Code != http.StatusOK || !strings.Contains(one.Body.String(), `"health":"unavailable"`) {
+		t.Fatalf("GET node = %d %s", one.Code, one.Body.String())
+	}
+}
+
+// Without timings of its own the API still calls a node suspect once it has missed
+// its heartbeats, and never calls it unavailable.
+func TestNodeHealthDefaultsToTheHeartbeatLimit(t *testing.T) {
+	h, st := newTestHandler(t)
+	addNode(t, st, "fresh", 1000, fixedNow.Add(-5*time.Second), nil)
+	addNode(t, st, "stale", 1000, fixedNow.Add(-24*time.Hour), nil)
+	var list struct {
+		Nodes []struct {
+			ID     string `json:"id"`
+			Health string `json:"health"`
+		} `json:"nodes"`
+	}
+	decode(t, do(h, http.MethodGet, "/v1/nodes", "", true), &list)
+	if len(list.Nodes) != 2 || list.Nodes[0].Health != store.NodeHealthy || list.Nodes[1].Health != store.NodeSuspect {
+		t.Fatalf("nodes = %+v", list.Nodes)
 	}
 }
 

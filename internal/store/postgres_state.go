@@ -17,7 +17,7 @@ import (
 const workloadSelect = `SELECT w.id, w.name, w.image, w.cpu_millis, w.memory_bytes, w.node_id, w.desired_state,
 	w.service_id, w.service_revision, w.replica_index, w.ports, w.runtime, w.generation, w.created_at, w.updated_at,
 	o.workload_id, o.node_id, o.state, o.message, o.container_id, o.exit_code, o.oom_killed, o.restart_count,
-	o.started_at, o.finished_at, o.observed_at, o.acknowledged_generation
+	o.started_at, o.finished_at, o.observed_at, o.acknowledged_generation, o.health
 	FROM workloads w LEFT JOIN workload_observations o ON o.workload_id = w.id`
 
 func scanWorkload(row pgx.Row) (Workload, error) {
@@ -29,11 +29,12 @@ func scanWorkload(row pgx.Row) (Workload, error) {
 		obsOOM                                                              *bool
 		obsStarted, obsFinished, obsAt                                      *time.Time
 		obsAcked                                                            *int64
+		obsHealth                                                           *string
 	)
 	err := row.Scan(&w.ID, &w.Name, &w.Image, &w.CPUMillis, &w.MemoryBytes, &w.NodeID, &w.DesiredState,
 		&serviceID, &revision, &replica, &ports, &runtime, &w.Generation, &w.CreatedAt, &w.UpdatedAt,
 		&obsWorkload, &obsNode, &obsState, &obsMessage, &obsContainer, &obsExit, &obsOOM, &obsRestarts,
-		&obsStarted, &obsFinished, &obsAt, &obsAcked)
+		&obsStarted, &obsFinished, &obsAt, &obsAcked, &obsHealth)
 	if err != nil {
 		return Workload{}, mapError(err)
 	}
@@ -50,7 +51,7 @@ func scanWorkload(row pgx.Row) (Workload, error) {
 	if err := json.Unmarshal(runtime, &rt); err != nil {
 		return Workload{}, fmt.Errorf("decode runtime settings of workload %s: %w", w.ID, err)
 	}
-	w.Command, w.Env, w.RestartPolicy = rt.Command, rt.Env, rt.RestartPolicy
+	w.Command, w.Env, w.RestartPolicy, w.HealthCheck = rt.Command, rt.Env, rt.RestartPolicy, rt.HealthCheck
 	w.CreatedAt, w.UpdatedAt = w.CreatedAt.UTC(), w.UpdatedAt.UTC()
 	if obsWorkload != nil {
 		w.Observed = &Observation{
@@ -67,6 +68,7 @@ func scanWorkload(row pgx.Row) (Workload, error) {
 			ObservedAt:   obsAt.UTC(),
 
 			AckedGeneration: *obsAcked,
+			Health:          *obsHealth,
 		}
 	}
 	return w, nil
@@ -78,6 +80,7 @@ type workloadRuntime struct {
 	Command       []string          `json:"command,omitempty"`
 	Env           map[string]string `json:"env,omitempty"`
 	RestartPolicy *RestartPolicy    `json:"restart_policy,omitempty"`
+	HealthCheck   *HealthCheck      `json:"health_check,omitempty"`
 }
 
 func (q *queries) queryWorkloads(ctx context.Context, suffix string, args ...any) ([]Workload, error) {
@@ -110,7 +113,7 @@ func (q *queries) CreateWorkload(ctx context.Context, w Workload) (Workload, err
 	if err != nil {
 		return Workload{}, err
 	}
-	runtimeJSON, err := marshalJSON(workloadRuntime{Command: w.Command, Env: w.Env, RestartPolicy: w.RestartPolicy})
+	runtimeJSON, err := marshalJSON(workloadRuntime{Command: w.Command, Env: w.Env, RestartPolicy: w.RestartPolicy, HealthCheck: w.HealthCheck})
 	if err != nil {
 		return Workload{}, err
 	}
@@ -194,9 +197,9 @@ func (q *queries) RecordObservations(ctx context.Context, nodeID string, obs []O
 			_, err := q.db.Exec(ctx,
 				`INSERT INTO workload_observations
 				     (workload_id, node_id, state, message, container_id, exit_code, oom_killed, restart_count,
-				      started_at, finished_at, observed_at, acknowledged_generation)
+				      started_at, finished_at, observed_at, acknowledged_generation, health)
 				 SELECT w.id, w.node_id, $3::text, $4::text, $5::text, $6::integer, $7::boolean, $8::integer,
-				        $9::timestamptz, $10::timestamptz, $11::timestamptz, $12::bigint
+				        $9::timestamptz, $10::timestamptz, $11::timestamptz, $12::bigint, $13::text
 				 FROM workloads w
 				 WHERE w.id = $1 AND w.node_id = $2
 				 ON CONFLICT (workload_id) DO UPDATE SET
@@ -210,10 +213,11 @@ func (q *queries) RecordObservations(ctx context.Context, nodeID string, obs []O
 				     started_at = EXCLUDED.started_at,
 				     finished_at = EXCLUDED.finished_at,
 				     observed_at = EXCLUDED.observed_at,
-				     acknowledged_generation = EXCLUDED.acknowledged_generation
+				     acknowledged_generation = EXCLUDED.acknowledged_generation,
+				     health = EXCLUDED.health
 				 WHERE workload_observations.observed_at <= EXCLUDED.observed_at`,
 				o.WorkloadID, nodeID, o.State, o.Message, o.ContainerID, o.ExitCode, o.OOMKilled, o.RestartCount,
-				utcPtr(o.StartedAt), utcPtr(o.FinishedAt), o.ObservedAt.UTC(), o.AckedGeneration)
+				utcPtr(o.StartedAt), utcPtr(o.FinishedAt), o.ObservedAt.UTC(), o.AckedGeneration, o.Health)
 			if err != nil {
 				return mapError(err)
 			}

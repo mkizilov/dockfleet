@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/dockfleet/dockfleet/internal/placement"
+	"github.com/dockfleet/dockfleet/internal/scheduler"
 	"github.com/dockfleet/dockfleet/internal/store"
 )
 
@@ -29,15 +30,43 @@ type env struct {
 	rec      *Reconciler
 	place    *placement.Scheduler
 	holdBack func(store.Workload) bool
+	// timing is what the manager under test trusts: a node is suspect after 30
+	// seconds of silence and unavailable after two minutes.
+	timing scheduler.Timing
+	// down are the nodes whose agents say nothing: no heartbeat, no reports.
+	down map[string]bool
 }
 
 func newEnv(t *testing.T, st store.Store) *env {
 	t.Helper()
-	e := &env{t: t, st: st, clock: t0, obsAt: t0}
-	now := func() time.Time { return e.clock }
-	e.rec = New(Config{Store: st, InstanceID: "mgr-1", Now: now})
-	e.place = placement.New(placement.Config{Store: st, NodeTTL: time.Minute, InstanceID: "mgr-1", Now: now})
+	e := &env{t: t, st: st, clock: t0, obsAt: t0, down: map[string]bool{}}
+	e.timing = scheduler.Timing{SuspectAfter: 30 * time.Second, UnavailableAfter: 2 * time.Minute}
+	e.startManager()
 	return e
+}
+
+// startManager builds the scheduler and the reconciler, as a manager does when
+// it starts: from now on it counts silence, not from before.
+func (e *env) startManager() {
+	now := func() time.Time { return e.clock }
+	e.timing.Since = e.clock
+	e.rec = New(Config{Store: e.st, InstanceID: "mgr-1", Timing: e.timing, Now: now})
+	e.place = placement.New(placement.Config{Store: e.st, NodeTTL: 30 * time.Second, Timing: e.timing, InstanceID: "mgr-1", Now: now})
+}
+
+// advance moves the clock on while nobody is heartbeating (the manager is down).
+func (e *env) advance(d time.Duration) { e.clock = e.clock.Add(d) }
+
+// elapse lets time pass the way it does in a running fleet: the agents that are
+// up heartbeat every ten seconds, the ones that are down say nothing.
+func (e *env) elapse(d time.Duration) {
+	e.t.Helper()
+	for d > 0 {
+		step := min(d, 10*time.Second)
+		e.advance(step)
+		e.agents()
+		d -= step
+	}
 }
 
 func (e *env) ctx() context.Context { return context.Background() }
@@ -99,6 +128,10 @@ func (e *env) agents() {
 	nodes, err := e.st.ListNodes(e.ctx())
 	e.must(err)
 	for _, n := range nodes {
+		if e.down[n.ID] {
+			continue
+		}
+		e.must(e.st.Heartbeat(e.ctx(), n.ID, e.clock))
 		workloads, err := e.st.ListWorkloadsForNode(e.ctx(), n.ID)
 		e.must(err)
 		var reports []store.Observation
@@ -240,6 +273,12 @@ var reconcileTests = []reconcileTest{
 	{"the control loop deploys, scales, rolls out and removes a service", testControlLoopLifecycle},
 	{"a replica that never comes up keeps the old one", testFailedRolloutKeepsTheOldReplica},
 	{"a fixed host port is handed over to the new revision", testFixedHostPortIsHandedOver},
+	{"replicas of a lost node move, and the node is cleaned up when it returns", testLostNodeReplicasMove},
+	{"a manager that was down does not mistake its own absence for dead nodes", testManagerRestartDoesNotMoveReplicas},
+	{"a node that goes quiet and comes back keeps its replicas", testSuspectNodeKeepsItsReplicas},
+	{"an agent that left cleanly is given up on after the same time", testDepartedNodeIsGivenUpOnLater},
+	{"the only node is lost: the replica waits, then starts when it returns", testLostOnlyNode},
+	{"workloads that belong to no service stay where they were put", testStandaloneWorkloadsAreNotMoved},
 	{"repeating a pass changes nothing", testPassesAreIdempotent},
 	{"a failed pass saves nothing", testFailedPassIsRolledBack},
 	{"the loop retires replicas and stops", testRunLoop},
@@ -405,6 +444,272 @@ func testFixedHostPortIsHandedOver(t *testing.T, newStore func(t *testing.T) sto
 	}
 	if stopped != 1 {
 		t.Fatalf("%d replicas were stopped, want the old one only", stopped)
+	}
+}
+
+// meantToRun are the workloads of a service whose desired state is running.
+func (e *env) meantToRun(name string) []store.Workload {
+	e.t.Helper()
+	var out []store.Workload
+	for _, w := range e.workloads(name) {
+		if w.DesiredState == store.DesiredRunning {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+func (e *env) health(nodeID string) string {
+	e.t.Helper()
+	n, err := e.st.GetNode(e.ctx(), nodeID)
+	e.must(err)
+	return n.Health
+}
+
+// wantOneEach checks that the workloads that are meant to run cover replicas
+// 1..n once each, and returns them by node.
+func (e *env) wantOneEach(name string, n int) map[string][]store.Workload {
+	e.t.Helper()
+	seen := map[int]bool{}
+	byNode := map[string][]store.Workload{}
+	list := e.meantToRun(name)
+	for _, w := range list {
+		if w.ReplicaIndex < 1 || w.ReplicaIndex > n || seen[w.ReplicaIndex] {
+			e.t.Fatalf("replica %d of %s is missing, duplicated or out of range:\n%s", w.ReplicaIndex, name, e.describe())
+		}
+		seen[w.ReplicaIndex] = true
+		byNode[w.NodeID] = append(byNode[w.NodeID], w)
+	}
+	if len(list) != n {
+		e.t.Fatalf("%s has %d workloads meant to run, want %d:\n%s", name, len(list), n, e.describe())
+	}
+	return byNode
+}
+
+func testLostNodeReplicasMove(t *testing.T, newStore func(t *testing.T) store.Store) {
+	e := newEnv(t, newStore(t))
+	for _, id := range []string{"n1", "n2", "n3"} {
+		e.node(id)
+	}
+	e.service("web", 3, "nginx:1.0")
+	e.settle()
+	first := e.wantReplicas("web", 1, 3, "nginx:1.0")
+	var victim store.Workload
+	for _, w := range first {
+		if w.NodeID == "n3" {
+			victim = w
+		}
+	}
+	if victim.ID == "" {
+		t.Fatalf("three replicas over three nodes must put one on n3:\n%s", e.describe())
+	}
+
+	// n3 stops answering. Twenty seconds is within the limit: nothing happens.
+	e.down["n3"] = true
+	e.elapse(20 * time.Second)
+	e.settle()
+	if e.health("n3") != store.NodeHealthy || e.events("node.suspect") != 0 {
+		t.Fatalf("n3 is %s after 20s of silence", e.health("n3"))
+	}
+
+	// Forty seconds: suspect. It gets no new replicas, but keeps the one it has.
+	e.elapse(20 * time.Second)
+	e.settle()
+	if e.health("n3") != store.NodeSuspect || e.events("node.suspect") != 1 || e.events("replica.stopped") != 0 {
+		t.Fatalf("n3 is %s, %d suspect events, %d stops", e.health("n3"), e.events("node.suspect"), e.events("replica.stopped"))
+	}
+	e.wantOneEach("web", 3)
+
+	// More than the lease and its grace: unavailable. Its replica is stopped
+	// (generation up) and started on a node that answers.
+	e.elapse(90 * time.Second)
+	e.settle()
+	if e.health("n3") != store.NodeUnavailable || e.events("node.unavailable") != 1 {
+		t.Fatalf("n3 is %s, %d unavailable events", e.health("n3"), e.events("node.unavailable"))
+	}
+	byNode := e.wantOneEach("web", 3)
+	if len(byNode["n3"]) != 0 || len(byNode["n1"])+len(byNode["n2"]) != 3 {
+		t.Fatalf("replicas per node = %v; none may stay on the lost node:\n%s", byNode, e.describe())
+	}
+	for _, w := range e.meantToRun("web") {
+		if w.ID == victim.ID {
+			t.Fatal("the lost node's workload is still meant to run")
+		}
+	}
+	old, err := e.st.GetWorkload(e.ctx(), victim.ID)
+	e.must(err)
+	if old.DesiredState != store.DesiredStopped || old.Generation != 2 || old.NodeID != "n3" || old.Observed == nil || old.Observed.AckedGeneration != 1 {
+		t.Fatalf("the lost node's workload = %+v; it must be stopped at generation 2 and kept until the node confirms", old)
+	}
+	if len(e.workloads("web")) != 4 || e.events("replica.stopped") != 1 || e.events("replica.scheduled") != 4 {
+		t.Fatalf("%d workloads, %d stops, %d placements:\n%s", len(e.workloads("web")), e.events("replica.stopped"), e.events("replica.scheduled"), e.describe())
+	}
+
+	// Settling again changes nothing: the move happens once.
+	for i := 0; i < 5; i++ {
+		e.advance(time.Second)
+		e.cycle()
+	}
+	if len(e.workloads("web")) != 4 || e.events("replica.scheduled") != 4 {
+		t.Fatalf("repeated passes moved more replicas:\n%s", e.describe())
+	}
+
+	// n3 returns. It learns that its workload was stopped, confirms that the
+	// container is gone, the record is deleted, and nothing is moved back.
+	delete(e.down, "n3")
+	e.settle()
+	if e.health("n3") != store.NodeHealthy || e.events("node.recovered") != 1 || e.events("replica.removed") != 1 {
+		t.Fatalf("n3 is %s, %d recoveries, %d removals", e.health("n3"), e.events("node.recovered"), e.events("replica.removed"))
+	}
+	after := e.wantOneEach("web", 3)
+	if len(e.workloads("web")) != 3 || len(after["n3"]) != 0 {
+		t.Fatalf("after the node returned:\n%s", e.describe())
+	}
+}
+
+func testManagerRestartDoesNotMoveReplicas(t *testing.T, newStore func(t *testing.T) store.Store) {
+	e := newEnv(t, newStore(t))
+	e.node("n1")
+	e.node("n2")
+	e.service("web", 2, "nginx:1.0")
+	e.settle()
+	first := e.wantReplicas("web", 1, 2, "nginx:1.0")
+
+	// The manager is down for an hour, so no heartbeat was recorded. When it
+	// starts again every node looks silent, but it cannot know that for longer
+	// than it has been watching.
+	e.advance(time.Hour)
+	e.startManager()
+	for i := 0; i < 3; i++ {
+		e.cycle()
+	}
+	after := e.wantReplicas("web", 1, 2, "nginx:1.0")
+	for i := range first {
+		if after[i].ID != first[i].ID {
+			t.Fatalf("replica %d was replaced after a manager restart", i+1)
+		}
+	}
+	if e.events("node.unavailable") != 0 || e.events("node.suspect") != 0 || e.events("replica.stopped") != 0 {
+		t.Fatal("a manager restart was taken for a failure of its nodes")
+	}
+
+	// A node that does not come back is given up on, counted from the restart.
+	e.down["n2"] = true
+	e.elapse(3 * time.Minute)
+	e.settle()
+	if e.health("n2") != store.NodeUnavailable || e.health("n1") != store.NodeHealthy {
+		t.Fatalf("n1 is %s, n2 is %s", e.health("n1"), e.health("n2"))
+	}
+	if byNode := e.wantOneEach("web", 2); len(byNode["n1"]) != 2 {
+		t.Fatalf("both replicas belong on n1 now:\n%s", e.describe())
+	}
+}
+
+func testSuspectNodeKeepsItsReplicas(t *testing.T, newStore func(t *testing.T) store.Store) {
+	e := newEnv(t, newStore(t))
+	e.node("n1")
+	e.node("n2")
+	e.service("web", 2, "nginx:1.0")
+	e.settle()
+	first := e.wantReplicas("web", 1, 2, "nginx:1.0")
+
+	e.down["n2"] = true
+	e.elapse(45 * time.Second)
+	e.settle()
+	if e.health("n2") != store.NodeSuspect {
+		t.Fatalf("n2 is %s", e.health("n2"))
+	}
+	delete(e.down, "n2")
+	e.settle()
+	if e.health("n2") != store.NodeHealthy || e.events("node.suspect") != 1 || e.events("node.recovered") != 1 {
+		t.Fatalf("n2 is %s, %d suspect events, %d recoveries", e.health("n2"), e.events("node.suspect"), e.events("node.recovered"))
+	}
+	after := e.wantReplicas("web", 1, 2, "nginx:1.0")
+	for i := range first {
+		if after[i].ID != first[i].ID || after[i].Generation != 1 {
+			t.Fatalf("replica %d changed although its node only went quiet: %+v", i+1, after[i])
+		}
+	}
+	if e.events("replica.stopped") != 0 {
+		t.Fatal("a suspect node's replicas must not be stopped")
+	}
+}
+
+func testDepartedNodeIsGivenUpOnLater(t *testing.T, newStore func(t *testing.T) store.Store) {
+	e := newEnv(t, newStore(t))
+	e.node("n1")
+	e.node("n2")
+	e.service("web", 2, "nginx:1.0")
+	e.settle()
+	e.wantReplicas("web", 1, 2, "nginx:1.0")
+
+	// The agent on n2 shuts down cleanly; its containers keep running.
+	e.must(e.st.DeregisterNode(e.ctx(), "n2", e.clock))
+	e.down["n2"] = true
+	e.settle()
+	if e.health("n2") != store.NodeSuspect || e.events("replica.stopped") != 0 {
+		t.Fatalf("n2 is %s right after leaving, %d stops", e.health("n2"), e.events("replica.stopped"))
+	}
+	e.elapse(time.Minute)
+	e.settle()
+	if e.health("n2") != store.NodeSuspect || e.events("replica.stopped") != 0 {
+		t.Fatalf("n2 is %s after a minute, %d stops", e.health("n2"), e.events("replica.stopped"))
+	}
+	e.elapse(61 * time.Second)
+	e.settle()
+	if e.health("n2") != store.NodeUnavailable {
+		t.Fatalf("n2 is %s", e.health("n2"))
+	}
+	if byNode := e.wantOneEach("web", 2); len(byNode["n1"]) != 2 {
+		t.Fatalf("both replicas belong on n1 now:\n%s", e.describe())
+	}
+}
+
+func testLostOnlyNode(t *testing.T, newStore func(t *testing.T) store.Store) {
+	e := newEnv(t, newStore(t))
+	e.node("n1")
+	e.service("web", 1, "nginx:1.0")
+	e.settle()
+	old := e.wantReplicas("web", 1, 1, "nginx:1.0")[0]
+
+	e.down["n1"] = true
+	e.advance(3 * time.Minute)
+	e.settle()
+	if got := e.meantToRun("web"); len(got) != 0 {
+		t.Fatalf("nothing can run while the only node is gone:\n%s", e.describe())
+	}
+	waiting, err := e.st.ListUnschedulable(e.ctx(), "svc-web")
+	e.must(err)
+	if len(waiting) != 1 || waiting[0].Code != "no_available_nodes" {
+		t.Fatalf("the replica must be explained as waiting for a node: %+v", waiting)
+	}
+
+	delete(e.down, "n1")
+	e.settle()
+	now := e.wantReplicas("web", 1, 1, "nginx:1.0")[0]
+	if now.ID == old.ID || now.NodeID != "n1" || e.events("replica.removed") != 1 {
+		t.Fatalf("after the node returned: %+v, %d removals", now, e.events("replica.removed"))
+	}
+}
+
+func testStandaloneWorkloadsAreNotMoved(t *testing.T, newStore func(t *testing.T) store.Store) {
+	e := newEnv(t, newStore(t))
+	e.node("n1")
+	e.node("n2")
+	_, err := e.st.CreateWorkload(e.ctx(), store.Workload{
+		ID: "solo", Name: "solo", Image: "nginx:1.0", CPUMillis: 100, MemoryBytes: 64 << 20, NodeID: "n2", CreatedAt: e.clock,
+	})
+	e.must(err)
+	e.down["n2"] = true
+	e.elapse(5 * time.Minute)
+	e.settle()
+	w, err := e.st.GetWorkload(e.ctx(), "solo")
+	e.must(err)
+	if w.DesiredState != store.DesiredRunning || w.Generation != 1 || w.NodeID != "n2" {
+		t.Fatalf("a workload an administrator pinned to a node was changed: %+v", w)
+	}
+	if e.health("n2") != store.NodeUnavailable {
+		t.Fatalf("n2 is %s, but the node's state is shown anyway", e.health("n2"))
 	}
 }
 

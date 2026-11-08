@@ -49,6 +49,14 @@ type Manager struct {
 	// SchedulerInterval is the time between scheduling passes; zero (only
 	// possible outside this loader) turns the scheduler off.
 	SchedulerInterval time.Duration
+	// NodeLease is how long an agent's lease lasts after each heartbeat it
+	// sends. An agent that fences itself stops its containers when the lease
+	// has run out.
+	NodeLease time.Duration
+	// NodeUnavailableAfter is how long a node may be silent before it is given
+	// up on and its replicas are started on other nodes. It is longer than the
+	// lease, so an agent that fences itself has stopped by then.
+	NodeUnavailableAfter time.Duration
 	// ReconcileInterval is the time between passes that compare services with
 	// what agents report and stop or remove the workloads that should go; zero
 	// (only possible outside this loader) turns the reconciler off.
@@ -82,6 +90,13 @@ type Agent struct {
 	Labels        map[string]string
 	DockerHost    string
 	RPCTimeout    time.Duration
+
+	// FenceOnLeaseLoss makes the agent stop its containers when the manager's
+	// lease on the node runs out (no heartbeat was accepted for that long), so
+	// that a replica the manager has started elsewhere is not also running here.
+	// Turn it off to keep containers running through a long manager outage, at
+	// the price of duplicate replicas after a failover.
+	FenceOnLeaseLoss bool
 
 	// Container policy relaxations; empty means the strictest policy. The
 	// docker package validates them (they never allow the always-denied set).
@@ -122,6 +137,8 @@ func LoadManager(get Getenv) (Manager, error) {
 	c.TLSClientCAFile = env(get, "DOCKFLEET_TLS_CLIENT_CA_FILE", "")
 	c.HeartbeatInterval = duration(get, "DOCKFLEET_HEARTBEAT_INTERVAL", 10*time.Second, &errs)
 	c.NodeTTL = duration(get, "DOCKFLEET_NODE_TTL", 30*time.Second, &errs)
+	c.NodeLease = duration(get, "DOCKFLEET_NODE_LEASE", time.Minute, &errs)
+	c.NodeUnavailableAfter = duration(get, "DOCKFLEET_NODE_UNAVAILABLE_AFTER", 2*time.Minute, &errs)
 	c.RequestTimeout = duration(get, "DOCKFLEET_REQUEST_TIMEOUT", 10*time.Second, &errs)
 	c.ShutdownTimeout = duration(get, "DOCKFLEET_SHUTDOWN_TIMEOUT", 15*time.Second, &errs)
 	c.SchedulerInterval = duration(get, "DOCKFLEET_SCHEDULER_INTERVAL", 5*time.Second, &errs)
@@ -170,6 +187,17 @@ func LoadManager(get Getenv) (Manager, error) {
 	if c.NodeTTL < 2*c.HeartbeatInterval {
 		fail("DOCKFLEET_NODE_TTL (%s) must be at least twice DOCKFLEET_HEARTBEAT_INTERVAL (%s)", c.NodeTTL, c.HeartbeatInterval)
 	}
+	// A lease that a single lost heartbeat can end would stop containers for nothing, and a node
+	// must not be given up on before its agent has fenced itself, or the replica would run twice.
+	if c.NodeLease < 2*c.HeartbeatInterval {
+		fail("DOCKFLEET_NODE_LEASE (%s) must be at least twice DOCKFLEET_HEARTBEAT_INTERVAL (%s)", c.NodeLease, c.HeartbeatInterval)
+	}
+	if c.NodeUnavailableAfter < c.NodeLease+c.HeartbeatInterval {
+		fail("DOCKFLEET_NODE_UNAVAILABLE_AFTER (%s) must be at least DOCKFLEET_NODE_LEASE plus DOCKFLEET_HEARTBEAT_INTERVAL (%s), so that an agent has fenced itself before its replicas are started elsewhere", c.NodeUnavailableAfter, c.NodeLease+c.HeartbeatInterval)
+	}
+	if c.NodeUnavailableAfter <= c.NodeTTL {
+		fail("DOCKFLEET_NODE_UNAVAILABLE_AFTER (%s) must be longer than DOCKFLEET_NODE_TTL (%s): a node is suspect before it is unavailable", c.NodeUnavailableAfter, c.NodeTTL)
+	}
 
 	if err := errors.Join(errs...); err != nil {
 		return Manager{}, err
@@ -193,6 +221,7 @@ func LoadAgent(get Getenv) (Agent, error) {
 	c.TLSServerName = env(get, "DOCKFLEET_TLS_SERVER_NAME", "")
 	c.DockerHost = env(get, "DOCKFLEET_DOCKER_HOST", "unix:///var/run/docker.sock")
 	c.RPCTimeout = duration(get, "DOCKFLEET_RPC_TIMEOUT", 5*time.Second, &errs)
+	c.FenceOnLeaseLoss = boolean(get, "DOCKFLEET_FENCE_ON_LEASE_LOSS", true, &errs)
 	c.CPUMillis = positiveInt(get, "DOCKFLEET_NODE_CPU_MILLIS", int64(runtime.NumCPU())*1000, &errs)
 	// Declared capacity, not measured: host memory detection is future work.
 	c.MemoryBytes = positiveInt(get, "DOCKFLEET_NODE_MEMORY_MB", 1024, &errs) << 20
@@ -261,6 +290,19 @@ func duration(get Getenv, key string, def time.Duration, errs *[]error) time.Dur
 		return def
 	}
 	return d
+}
+
+func boolean(get Getenv, key string, def bool, errs *[]error) bool {
+	raw := strings.TrimSpace(get(key))
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		*errs = append(*errs, fmt.Errorf("%s must be true or false, got %q", key, raw))
+		return def
+	}
+	return v
 }
 
 // MaxOvercommit is the largest overcommit factor the scheduler accepts.

@@ -122,10 +122,11 @@ func run() error {
 	}
 	logger.Info("starting dockfleet agent", "version", version.Version, "node_id", cfg.NodeID, "manager_addr", cfg.ManagerAddr, "mutual_tls", cfg.TLSEnabled())
 	return agent.New(agent.Config{
-		Node:       node,
-		Manager:    client,
-		Docker:     engine,
-		Logger:     logger,
-		RPCTimeout: cfg.RPCTimeout,
+		Node:             node,
+		Manager:          client,
+		Docker:           engine,
+		Logger:           logger,
+		RPCTimeout:       cfg.RPCTimeout,
+		FenceOnLeaseLoss: cfg.FenceOnLeaseLoss,
 	}).Run(ctx)
 }

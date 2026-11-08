@@ -106,7 +106,7 @@ Workloads that belong to no service (`POST /v1/workloads`) are never stopped or 
 | **A heartbeat or a response is lost** | Both sides send the complete state every time, so the next one repairs it. |
 | **The database is rolled back to an older state** | Agents see a smaller assignment set; containers of workloads that vanished are removed after the grace period. |
 
-What is not covered: a node that never returns. Its workloads stay assigned to it, and the replica slots they hold stay occupied; nothing moves them elsewhere yet.
+A node that goes quiet is a different case from any of these: after a suspect period the manager gives up on it and starts its replicas on other nodes, using a lease on the agent's side and the workloads' generations so that the old copy is stopped first or told to go when the node returns. That is [failure-handling.md](failure-handling.md).
 
 ## See it work
 
@@ -133,8 +133,8 @@ The agent's timings (resync 2 s, orphan grace 2 min, stop grace 10 s, restart ba
 
 ## Limitations
 
-- A node that is gone for good keeps its workloads; there is no failover.
-- One container per workload; no health checks are executed (the field is accepted and stored).
+- A node that is gone for good keeps its stopped workloads on record, and a replica whose container failed beyond its restart limit is not moved ([failure-handling.md](failure-handling.md#limitations)).
+- One container per workload.
 - The scheduler counts a workload as freed as soon as it is told to stop, so for a few seconds a node can carry the old container beside the new one.
 - Environment values travel in assignments; a node's assignment set is limited to 32 MiB.
 - The runner handles workloads one after another: a long image pull delays the others' status updates (not heartbeats).

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/dockfleet/dockfleet/internal/scheduler"
 	"github.com/dockfleet/dockfleet/internal/store"
 )
 
@@ -26,6 +27,9 @@ type Config struct {
 	Interval time.Duration
 	// InstanceID names this manager in the audit trail.
 	InstanceID string
+	// Timing says when a silent node is suspect and when it is given up on and
+	// its replicas are started elsewhere. The zero value never gives up on one.
+	Timing scheduler.Timing
 	// Now defaults to time.Now; tests set it.
 	Now func() time.Time
 }
@@ -53,6 +57,27 @@ type Report struct {
 	// Deleted is how many stopped workloads were removed because their node
 	// confirmed that the container is gone.
 	Deleted int
+	// NodeChanges is how many nodes changed health state.
+	NodeChanges int
+}
+
+// nodeEvent names a node's new health state in the audit trail.
+func (r *Reconciler) nodeEvent(at time.Time, c NodeChange, reason string) store.Event {
+	action := "node." + c.To
+	message := fmt.Sprintf("node %s is %s", c.Node.ID, c.To)
+	if c.To == store.NodeHealthy {
+		action, message = "node.recovered", fmt.Sprintf("node %s is healthy again (it was %s)", c.Node.ID, c.From)
+	} else if reason != "" {
+		message += ": " + reason
+	}
+	details := map[string]string{"from": c.From, "to": c.To}
+	if !c.Node.LastHeartbeat.IsZero() && c.Node.LastHeartbeat.Year() > 1 {
+		details["last_heartbeat"] = c.Node.LastHeartbeat.UTC().Format(time.RFC3339)
+	}
+	return store.Event{
+		At: at, InstanceID: r.cfg.InstanceID, Actor: Actor, Action: action,
+		ResourceType: "node", ResourceID: c.Node.ID, Message: message, Details: details,
+	}
 }
 
 func (r *Reconciler) event(at time.Time, action string, a Action, message string) store.Event {
@@ -91,8 +116,21 @@ func (r *Reconciler) RunOnce(ctx context.Context) (Report, error) {
 		if err != nil {
 			return fmt.Errorf("list unschedulable replicas: %w", err)
 		}
+		nodes, err := tx.ListNodes(ctx)
+		if err != nil {
+			return fmt.Errorf("list nodes: %w", err)
+		}
 		now := r.cfg.Now().UTC()
-		for _, a := range Plan(defs, workloads, waiting) {
+		for _, c := range PlanNodes(nodes, now, r.cfg.Timing) {
+			if err := tx.SetNodeHealth(ctx, c.Node.ID, c.To, now); err != nil {
+				return fmt.Errorf("record that node %s is %s: %w", c.Node.ID, c.To, err)
+			}
+			if _, err := tx.AppendEvent(ctx, r.nodeEvent(now, c, r.cfg.Timing.HealthReason(c.To))); err != nil {
+				return err
+			}
+			report.NodeChanges++
+		}
+		for _, a := range Plan(defs, workloads, waiting, r.cfg.Timing.Lost(nodes, now)) {
 			w := a.Workload
 			label := fmt.Sprintf("%s (revision %d, replica %d)", w.Name, w.ServiceRevision, w.ReplicaIndex)
 			switch a.Kind {
@@ -104,8 +142,11 @@ func (r *Reconciler) RunOnce(ctx context.Context) (Report, error) {
 				if err != nil {
 					return fmt.Errorf("stop %s: %w", w.Name, err)
 				}
-				if _, err := tx.AppendEvent(ctx, r.event(now, "replica.stopped", a,
-					fmt.Sprintf("%s on node %s will be stopped: %s", label, w.NodeID, a.Reason))); err != nil {
+				message := fmt.Sprintf("%s on node %s will be stopped: %s", label, w.NodeID, a.Reason)
+				if a.Reason == ReasonNodeLost {
+					message = fmt.Sprintf("%s was given up on: node %s is unavailable, so the replica is started on another node and the node is told to remove the container if it returns", label, w.NodeID)
+				}
+				if _, err := tx.AppendEvent(ctx, r.event(now, "replica.stopped", a, message)); err != nil {
 					return err
 				}
 				report.Stopped++
@@ -162,7 +203,7 @@ func (r *Reconciler) pass(ctx context.Context) {
 	case err != nil:
 		r.cfg.Logger.Error("reconciliation pass failed", "error", err)
 	case report != (Report{}):
-		r.cfg.Logger.Info("reconciliation pass", "stopped", report.Stopped, "deleted", report.Deleted)
+		r.cfg.Logger.Info("reconciliation pass", "stopped", report.Stopped, "deleted", report.Deleted, "node_changes", report.NodeChanges)
 	default:
 		r.cfg.Logger.Debug("reconciliation pass found nothing to do")
 	}

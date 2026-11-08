@@ -153,15 +153,20 @@ func marshalJSON(v any) ([]byte, error) {
 
 // ---- nodes ----
 
-const nodeColumns = `id, name, cpu_millis, memory_bytes, labels, agent_version, registered_at, last_heartbeat`
+const nodeColumns = `id, name, cpu_millis, memory_bytes, labels, agent_version, registered_at, last_heartbeat, health, health_since, deregistered_at`
 
 func scanNode(row pgx.Row) (Node, error) {
 	var n Node
 	var labels []byte
-	err := row.Scan(&n.ID, &n.Name, &n.CPUMillis, &n.MemoryBytes, &labels, &n.AgentVersion, &n.RegisteredAt, &n.LastHeartbeat)
+	var deregistered *time.Time
+	err := row.Scan(&n.ID, &n.Name, &n.CPUMillis, &n.MemoryBytes, &labels, &n.AgentVersion, &n.RegisteredAt, &n.LastHeartbeat, &n.Health, &n.HealthSince, &deregistered)
 	if err != nil {
 		return Node{}, mapError(err)
 	}
+	if deregistered != nil {
+		n.DeregisteredAt = deregistered.UTC()
+	}
+	n.HealthSince = n.HealthSince.UTC()
 	if err := json.Unmarshal(labels, &n.Labels); err != nil {
 		return Node{}, fmt.Errorf("decode node labels: %w", err)
 	}
@@ -178,18 +183,46 @@ func (q *queries) UpsertNode(ctx context.Context, n Node) (Node, error) {
 	if err != nil {
 		return Node{}, err
 	}
+	// A new node starts healthy; an existing one keeps the health state the
+	// reconciler recorded, so the reconciler sees the recovery and reports it.
 	return scanNode(q.db.QueryRow(ctx,
 		`INSERT INTO nodes (`+nodeColumns+`)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'healthy', $7, NULL)
 		 ON CONFLICT (id) DO UPDATE SET
 		   name = EXCLUDED.name,
 		   cpu_millis = EXCLUDED.cpu_millis,
 		   memory_bytes = EXCLUDED.memory_bytes,
 		   labels = EXCLUDED.labels,
 		   agent_version = EXCLUDED.agent_version,
-		   last_heartbeat = EXCLUDED.last_heartbeat
+		   last_heartbeat = EXCLUDED.last_heartbeat,
+		   deregistered_at = NULL
 		 RETURNING `+nodeColumns,
 		n.ID, n.Name, n.CPUMillis, n.MemoryBytes, labels, n.AgentVersion, n.RegisteredAt, n.LastHeartbeat))
+}
+
+func (q *queries) DeregisterNode(ctx context.Context, id string, at time.Time) error {
+	tag, err := q.db.Exec(ctx, `UPDATE nodes SET last_heartbeat = $3, deregistered_at = $2 WHERE id = $1`, id, at.UTC(), time.Time{})
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (q *queries) SetNodeHealth(ctx context.Context, id, health string, at time.Time) error {
+	if !ValidNodeHealth(health) {
+		return fmt.Errorf("%w: node health %q must be healthy, suspect or unavailable", ErrInvalid, health)
+	}
+	tag, err := q.db.Exec(ctx, `UPDATE nodes SET health = $2, health_since = $3 WHERE id = $1`, id, health, at.UTC())
+	if err != nil {
+		return mapError(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (q *queries) Heartbeat(ctx context.Context, id string, at time.Time) error {

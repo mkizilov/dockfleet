@@ -42,6 +42,10 @@ var phaseStates = map[dockfleetv1.WorkloadPhase]string{
 	dockfleetv1.WorkloadPhase_WORKLOAD_PHASE_STOPPED:   store.WorkloadStopped,
 }
 
+// validHealth lists the health results an agent may report; empty means the
+// container has no health check.
+var validHealth = map[string]bool{"": true, "starting": true, "healthy": true, "unhealthy": true}
+
 // desiredStates maps a workload's stored desired state to the instruction sent to its agent.
 var desiredStates = map[string]dockfleetv1.WorkloadDesiredState{
 	store.DesiredRunning: dockfleetv1.WorkloadDesiredState_WORKLOAD_DESIRED_STATE_RUNNING,
@@ -61,6 +65,7 @@ type NodeServer struct {
 	dockfleetv1.UnimplementedNodeServiceServer
 	registry Registry
 	interval time.Duration
+	lease    time.Duration
 	logger   *slog.Logger
 	version  *dockfleetv1.ProtocolVersion
 }
@@ -68,6 +73,13 @@ type NodeServer struct {
 // NewNodeServer tells registering agents to heartbeat every interval.
 func NewNodeServer(reg Registry, interval time.Duration, logger *slog.Logger) *NodeServer {
 	return &NodeServer{registry: reg, interval: interval, logger: logger, version: CurrentVersion()}
+}
+
+// WithLease makes the server grant each session a lease of d, renewed by every
+// successful heartbeat. Zero, the default, grants none.
+func (s *NodeServer) WithLease(d time.Duration) *NodeServer {
+	s.lease = d
+	return s
 }
 
 // WithVersion overrides the protocol version the server speaks. It exists to
@@ -231,6 +243,7 @@ func (s *NodeServer) RegisterNode(ctx context.Context, req *dockfleetv1.Register
 		SessionId:           session.ID,
 		HeartbeatIntervalMs: s.interval.Milliseconds(),
 		Assignments:         toAssignments(workloads),
+		LeaseMs:             s.lease.Milliseconds(),
 	}, nil
 }
 
@@ -255,11 +268,13 @@ func (s *NodeServer) Heartbeat(ctx context.Context, req *dockfleetv1.HeartbeatRe
 			return nil, s.invalid("container_id must be at most 128 characters")
 		case st.GetAcknowledgedGeneration() < 0 || st.GetRestartCount() < 0:
 			return nil, s.invalid("acknowledged_generation and restart_count must not be negative")
+		case !validHealth[st.GetHealth()]:
+			return nil, s.invalid(`health must be empty, "starting", "healthy" or "unhealthy"`)
 		}
 		report := registry.StatusReport{
 			WorkloadID: st.GetWorkloadId(), State: state, Message: st.GetMessage(),
 			ContainerID: st.GetContainerId(), OOMKilled: st.GetOomKilled(), RestartCount: int(st.GetRestartCount()),
-			AckedGeneration: st.GetAcknowledgedGeneration(),
+			Health: st.GetHealth(), AckedGeneration: st.GetAcknowledgedGeneration(),
 		}
 		if st.ExitCode != nil {
 			exit := int(*st.ExitCode)
@@ -304,7 +319,16 @@ func toAssignments(workloads []store.Workload) []*dockfleetv1.WorkloadAssignment
 			})
 		}
 		if w.RestartPolicy != nil {
-			a.RestartPolicy = &dockfleetv1.RestartPolicy{Condition: w.RestartPolicy.Condition, MaxRetries: uint32(w.RestartPolicy.MaxRetries)}
+			a.RestartPolicy = &dockfleetv1.RestartPolicy{
+				Condition: w.RestartPolicy.Condition, MaxRetries: uint32(w.RestartPolicy.MaxRetries),
+				BackoffSeconds: uint32(w.RestartPolicy.BackoffSeconds), MaxBackoffSeconds: uint32(w.RestartPolicy.MaxBackoffSeconds),
+			}
+		}
+		if h := w.HealthCheck; h != nil {
+			a.HealthCheck = &dockfleetv1.HealthCheck{
+				Command: h.Command, IntervalSeconds: uint32(h.IntervalSeconds), TimeoutSeconds: uint32(h.TimeoutSeconds),
+				StartPeriodSeconds: uint32(h.StartPeriodSeconds), Retries: uint32(h.Retries),
+			}
 		}
 		out = append(out, a)
 	}

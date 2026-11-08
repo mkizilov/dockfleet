@@ -28,7 +28,13 @@ type Config struct {
 	Store   store.Store
 	Token   string
 	NodeTTL time.Duration
-	Logger  *slog.Logger
+	// Timing says when a silent node is suspect and when it is unavailable. The
+	// zero value gives suspect after NodeTTL and never unavailable.
+	Timing scheduler.Timing
+	// NodeLease is how long a heartbeat keeps a node's lease; zero when the
+	// manager grants none.
+	NodeLease time.Duration
+	Logger    *slog.Logger
 	// InstanceID names this manager in the audit events it records.
 	InstanceID string
 	// Overcommit is how far nodes may be promised beyond their capacity when a
@@ -42,6 +48,8 @@ type server struct {
 	store      store.Store
 	token      []byte
 	nodeTTL    time.Duration
+	timing     scheduler.Timing
+	nodeLease  time.Duration
 	logger     *slog.Logger
 	instanceID string
 	overcommit scheduler.Overcommit
@@ -55,6 +63,8 @@ func New(cfg Config) http.Handler {
 		store:      cfg.Store,
 		token:      []byte("Bearer " + cfg.Token),
 		nodeTTL:    cfg.NodeTTL,
+		timing:     cfg.Timing,
+		nodeLease:  cfg.NodeLease,
 		logger:     cfg.Logger,
 		instanceID: cfg.InstanceID,
 		overcommit: cfg.Overcommit,
@@ -62,6 +72,9 @@ func New(cfg Config) http.Handler {
 	}
 	if s.now == nil {
 		s.now = time.Now
+	}
+	if s.timing.SuspectAfter <= 0 {
+		s.timing.SuspectAfter = cfg.NodeTTL
 	}
 
 	mux := http.NewServeMux()
@@ -178,18 +191,41 @@ type allocation struct {
 // nodeView is a node with what the scheduler sees of it: whether it can take
 // new replicas and why not, how much of it may be promised, and how much has
 // been promised to workloads that are meant to run.
+//
+// Health is the node's state from how long it has been silent: healthy,
+// suspect (no new replicas, the ones it has stay) or unavailable (its replicas
+// are started elsewhere). It is computed on every read, so it is current even
+// when the reconciler has not recorded the change yet; HealthSince is when the
+// reconciler did, and is left out until it has. LeaseExpiresAt is when the
+// node's lease runs out unless it heartbeats, which is when an agent that fences
+// itself stops its containers.
 type nodeView struct {
 	store.Node
-	Status       string     `json:"status"`
-	StatusReason string     `json:"status_reason,omitempty"`
-	Allocatable  resources  `json:"allocatable"`
-	Allocated    allocation `json:"allocated"`
+	Status         string     `json:"status"`
+	StatusReason   string     `json:"status_reason,omitempty"`
+	Health         string     `json:"health"`
+	HealthReason   string     `json:"health_reason,omitempty"`
+	HealthSince    *time.Time `json:"health_since,omitempty"`
+	LeaseExpiresAt *time.Time `json:"lease_expires_at,omitempty"`
+	Allocatable    resources  `json:"allocatable"`
+	Allocated      allocation `json:"allocated"`
 }
 
 func (s *server) view(n store.Node, used scheduler.Used) nodeView {
-	v := nodeView{Node: n, Status: "ready", StatusReason: scheduler.Unavailability(n, s.now(), s.nodeTTL)}
+	now := s.now()
+	v := nodeView{Node: n, Status: "ready", StatusReason: scheduler.Unavailability(n, now, s.nodeTTL)}
 	if v.StatusReason != "" {
 		v.Status = "not_ready"
+	}
+	v.Health = s.timing.Health(n, now)
+	v.HealthReason = s.timing.HealthReason(v.Health)
+	if n.Health == v.Health && !n.HealthSince.IsZero() {
+		since := n.HealthSince.UTC()
+		v.HealthSince = &since
+	}
+	if s.nodeLease > 0 && !n.LastHeartbeat.IsZero() && n.LastHeartbeat.Year() > 1 {
+		expires := n.LastHeartbeat.Add(s.nodeLease).UTC()
+		v.LeaseExpiresAt = &expires
 	}
 	v.Allocatable.CPUMillis, v.Allocatable.MemoryBytes = s.overcommit.Allocatable(n.CPUMillis, n.MemoryBytes)
 	v.Allocated = allocation{resources: resources{CPUMillis: used.CPUMillis, MemoryBytes: used.MemoryBytes}, Workloads: used.Workloads}

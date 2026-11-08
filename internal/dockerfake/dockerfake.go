@@ -34,6 +34,8 @@ type Info struct {
 	State      docker.State
 	ExitCode   int
 	OOMKilled  bool
+	// Health is the health check result: empty for a container without a check.
+	Health string
 }
 
 type entry struct {
@@ -42,10 +44,35 @@ type entry struct {
 	spec   docker.ContainerSpec
 }
 
+// Journal records the changes made on several engines in one order, so a test
+// can tell which of two nodes acted first.
+type Journal struct {
+	mu      sync.Mutex
+	entries []string
+}
+
+// Entries returns the changes so far, in order, as "<node> <operation> <workload>".
+func (j *Journal) Entries() []string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return append([]string(nil), j.entries...)
+}
+
+// Index is the position of the first entry equal to want, or -1.
+func (j *Journal) Index(want string) int {
+	for i, e := range j.Entries() {
+		if e == want {
+			return i
+		}
+	}
+	return -1
+}
+
 // Fake is an in-memory Docker Engine for one node.
 type Fake struct {
-	nodeID string
-	policy *docker.Policy
+	nodeID  string
+	policy  *docker.Policy
+	journal *Journal
 
 	mu       sync.Mutex
 	entries  []*entry
@@ -58,6 +85,14 @@ type Fake struct {
 // New returns an engine for the node with no images and no containers.
 func New(nodeID string) *Fake {
 	return &Fake{nodeID: nodeID, policy: docker.DefaultPolicy(), images: map[string]bool{}, failures: map[string][]error{}}
+}
+
+// WithJournal makes the engine record its changes in j as well.
+func (f *Fake) WithJournal(j *Journal) *Fake {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.journal = j
+	return f
 }
 
 // AddImage puts an image on the node, so Create does not need a pull.
@@ -105,6 +140,17 @@ func (f *Fake) Crash(workloadID string, exitCode int) {
 	defer f.mu.Unlock()
 	if e := f.managed(workloadID); e != nil && e.State == docker.StateRunning {
 		e.State, e.ExitCode = docker.StateExited, exitCode
+	}
+}
+
+// SetHealth sets what the health check of a managed container reports
+// ("starting", "healthy" or "unhealthy"). A container with a health check starts
+// out healthy; one without has none, and SetHealth leaves it alone.
+func (f *Fake) SetHealth(workloadID, health string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if e := f.managed(workloadID); e != nil && e.spec.HealthCheck != nil {
+		e.Health = health
 	}
 }
 
@@ -193,6 +239,11 @@ func (f *Fake) take(op string) error {
 
 func (f *Fake) record(op, subject string) {
 	f.calls = append(f.calls, op+" "+subject)
+	if f.journal != nil {
+		f.journal.mu.Lock()
+		f.journal.entries = append(f.journal.entries, f.nodeID+" "+op+" "+subject)
+		f.journal.mu.Unlock()
+	}
 }
 
 func (f *Fake) Ping(context.Context) error {
@@ -284,6 +335,10 @@ func (f *Fake) Start(_ context.Context, workloadID string) error {
 	}
 	f.record("start", workloadID)
 	e.State, e.ExitCode, e.OOMKilled = docker.StateRunning, 0, false
+	e.Health = ""
+	if e.spec.HealthCheck != nil {
+		e.Health = docker.HealthHealthy
+	}
 	return nil
 }
 
@@ -339,6 +394,7 @@ func (f *Fake) Inspect(_ context.Context, workloadID string) (docker.ContainerSt
 		Running:   e.State == docker.StateRunning,
 		ExitCode:  e.ExitCode,
 		OOMKilled: e.OOMKilled,
+		Health:    e.Health,
 	}, nil
 }
 

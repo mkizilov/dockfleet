@@ -163,6 +163,17 @@ func buildConfigs(req createRequest) (*container.Config, *container.HostConfig) 
 		Tty:          false,
 		OpenStdin:    false,
 	}
+	if h := spec.HealthCheck; h != nil {
+		// Docker runs the probe inside the container and reports its result in
+		// the container's state; the exec form never goes through a shell.
+		cfg.Healthcheck = &container.HealthConfig{
+			Test:        append([]string{"CMD"}, h.Command...),
+			Interval:    h.Interval,
+			Timeout:     h.Timeout,
+			StartPeriod: h.StartPeriod,
+			Retries:     h.Retries,
+		}
+	}
 	host := &container.HostConfig{
 		NetworkMode:    container.NetworkMode(spec.networkMode()),
 		PortBindings:   bindings,

@@ -162,6 +162,7 @@ var placementTests = []placementTest{
 	{"spreading many replicas", eachStore(testSpreadsEvenly)},
 	{"workload names", eachStore(testWorkloadNames)},
 	{"workloads carry how to run the container", eachStore(testWorkloadsCarryHowToRun)},
+	{"lost nodes free their slots", testLostNodesFreeTheirSlots},
 	{"overcommit is off unless configured", testOvercommit},
 	{"the same input gives the same placement", testDeterminism},
 	{"a failed pass saves nothing", testFailedPassIsRolledBack},
@@ -674,16 +675,95 @@ func testWorkloadsCarryHowToRun(t *testing.T, e *env) {
 	s := spec(500)
 	s.Command = []string{"sleep", "300"}
 	s.Env = map[string]string{"MODE": "prod"}
-	s.RestartPolicy = &store.RestartPolicy{Condition: store.RestartAlways}
+	s.RestartPolicy = &store.RestartPolicy{Condition: store.RestartAlways, MaxRetries: 9, BackoffSeconds: 2, MaxBackoffSeconds: 120}
+	s.HealthCheck = &store.HealthCheck{Command: []string{"curl", "-f", "localhost"}, IntervalSeconds: 10, TimeoutSeconds: 2, StartPeriodSeconds: 5, Retries: 4}
 	svc := e.service("web", 1, s)
 	e.run()
 
 	ws, err := e.st.ListWorkloadsForService(e.ctx(), svc.ID)
 	e.must(err)
 	if len(ws) != 1 || !reflect.DeepEqual(ws[0].Command, s.Command) || !reflect.DeepEqual(ws[0].Env, s.Env) ||
-		ws[0].RestartPolicy == nil || ws[0].RestartPolicy.Condition != store.RestartAlways || ws[0].Generation != 1 {
-		t.Fatalf("workloads = %+v; they must carry the revision's command, environment and restart policy", ws)
+		!reflect.DeepEqual(ws[0].RestartPolicy, s.RestartPolicy) || !reflect.DeepEqual(ws[0].HealthCheck, s.HealthCheck) || ws[0].Generation != 1 {
+		t.Fatalf("workloads = %+v; they must carry the revision's command, environment, restart policy and health check", ws)
 	}
+}
+
+// A workload that was stopped on a node that has been given up on no longer
+// holds its replica slot, so the replica starts on another node at once. On a
+// node that is merely quiet, or when nodes are never given up on, the slot stays
+// taken until the node confirms that the container is gone.
+func testLostNodesFreeTheirSlots(t *testing.T, newStore func(t *testing.T) store.Store) {
+	timing := scheduler.Timing{SuspectAfter: ttl, UnavailableAfter: 2 * time.Minute}
+	stopOnVictim := func(e *env) (victim store.Workload, otherNode string) {
+		e.node("n1", 4000, 8*gib)
+		e.node("n2", 4000, 8*gib)
+		svc := e.service("web", 2, spec(500))
+		if report := e.run(); report.Placed != 2 {
+			t.Fatalf("report = %+v", report)
+		}
+		ws, err := e.st.ListWorkloadsForService(e.ctx(), svc.ID)
+		e.must(err)
+		victim = ws[0]
+		_, err = e.st.SetWorkloadDesiredState(e.ctx(), victim.ID, store.DesiredStopped, e.clock)
+		e.must(err)
+		otherNode = "n1"
+		if victim.NodeID == "n1" {
+			otherNode = "n2"
+		}
+		return victim, otherNode
+	}
+	replicas := func(e *env) (running, stopped []store.Workload) {
+		ws, err := e.st.ListWorkloadsForService(e.ctx(), "svc-web")
+		e.must(err)
+		for _, w := range ws {
+			if w.DesiredState == store.DesiredRunning {
+				running = append(running, w)
+			} else {
+				stopped = append(stopped, w)
+			}
+		}
+		return running, stopped
+	}
+
+	t.Run("the node is given up on", func(t *testing.T) {
+		e := newEnv(t, newStore(t), func(c *Config) { c.Timing = timing })
+		victim, other := stopOnVictim(e)
+
+		// The node is only quiet: the old container may still be there.
+		e.clock = e.clock.Add(90 * time.Second)
+		e.nodeBeat(other, e.clock, 4000, 8*gib)
+		if report := e.run(); report.Placed != 0 {
+			t.Fatalf("a suspect node's slot was refilled: %+v", report)
+		}
+
+		e.clock = e.clock.Add(90 * time.Second)
+		e.nodeBeat(other, e.clock, 4000, 8*gib)
+		if report := e.run(); report.Placed != 1 {
+			t.Fatalf("the lost node's slot was not refilled: %+v", report)
+		}
+		running, stopped := replicas(e)
+		if len(running) != 2 || len(stopped) != 1 || stopped[0].ID != victim.ID {
+			t.Fatalf("running %+v, stopped %+v", running, stopped)
+		}
+		for _, w := range running {
+			if w.NodeID != other {
+				t.Fatalf("replica %d is on %s; the other node is the only one that answers", w.ReplicaIndex, w.NodeID)
+			}
+		}
+		if report := e.run(); report.Placed != 0 || e.workloadCount() != 3 {
+			t.Fatalf("a second pass: %+v, %d workloads", report, e.workloadCount())
+		}
+	})
+
+	t.Run("nodes are never given up on", func(t *testing.T) {
+		e := newEnv(t, newStore(t))
+		_, other := stopOnVictim(e)
+		e.clock = e.clock.Add(24 * time.Hour)
+		e.nodeBeat(other, e.clock, 4000, 8*gib)
+		if report := e.run(); report.Placed != 0 {
+			t.Fatalf("%+v; without a limit the stopped workload keeps its slot", report)
+		}
+	})
 }
 
 func testOvercommit(t *testing.T, newStore func(t *testing.T) store.Store) {

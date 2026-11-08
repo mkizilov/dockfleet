@@ -568,3 +568,342 @@ func TestRunConvergesInTheBackgroundAndStops(t *testing.T) {
 		return st != nil && st.GetPhase() == phaseStopped && st.GetContainerId() == "" && len(engine.Managed()) == 0
 	})
 }
+
+// The wait before each restart in a row comes from the restart policy: it
+// starts at backoff_seconds, doubles, and stops at max_backoff_seconds.
+func TestRestartBackoffComesFromThePolicy(t *testing.T) {
+	r, engine, clk := newTestRunner(t)
+	a := assigned("w1", 1, wantRunning)
+	a.RestartPolicy = &dockfleetv1.RestartPolicy{Condition: "always", BackoffSeconds: 2, MaxBackoffSeconds: 8}
+	r.Assign([]*dockfleetv1.WorkloadAssignment{a})
+	r.pass() // create and start
+
+	// The first restart is immediate; then 2 s, 4 s, 8 s, and 8 s again.
+	steps := []struct {
+		wait       time.Duration
+		wantStarts int
+	}{
+		{0, 2},
+		{time.Second, 2},
+		{time.Second, 3},
+		{3 * time.Second, 3},
+		{time.Second, 4},
+		{7 * time.Second, 4},
+		{time.Second, 5},
+		{7 * time.Second, 5},
+		{time.Second, 6},
+	}
+	for i, step := range steps {
+		engine.Crash("w1", 1)
+		clk.advance(step.wait)
+		r.pass()
+		if got := engine.Count("start"); got != step.wantStarts {
+			t.Fatalf("step %d: started %d times, want %d", i, got, step.wantStarts)
+		}
+	}
+}
+
+// "always" restarts without limit unless the policy sets one, and then it gives
+// up like "on-failure" does, even when the container exits cleanly.
+func TestAlwaysRestartCanBeLimited(t *testing.T) {
+	r, engine, clk := newTestRunner(t)
+	a := assigned("w1", 1, wantRunning)
+	a.RestartPolicy = &dockfleetv1.RestartPolicy{Condition: "always", MaxRetries: 2}
+	r.Assign([]*dockfleetv1.WorkloadAssignment{a})
+	for i := 0; i < 8; i++ {
+		r.pass()
+		engine.Crash("w1", 0)
+		clk.advance(time.Minute)
+	}
+	r.pass()
+	if got := engine.Count("start"); got != 3 {
+		t.Fatalf("started %d times, want the first start and two restarts", got)
+	}
+	st := wantStatus(t, r, "w1", phaseFailed, "gave up after 2 restarts in a row")
+	if st.GetRestartCount() != 2 || st.ExitCode == nil || *st.ExitCode != 0 {
+		t.Fatalf("status = %v", st)
+	}
+}
+
+// A container that has run steadily for a while is not in a crash loop any
+// more: the restarts in a row are forgotten, so an occasional failure never
+// uses up the limit, while quick repeated failures do.
+func TestRestartsInARowAreForgottenOnceTheContainerRunsSteadily(t *testing.T) {
+	r, engine, clk := newTestRunner(t)
+	a := assigned("w1", 1, wantRunning)
+	a.RestartPolicy = &dockfleetv1.RestartPolicy{Condition: "on-failure", MaxRetries: 2}
+	r.Assign([]*dockfleetv1.WorkloadAssignment{a})
+	r.pass() // create and start
+
+	for round := 1; round <= 4; round++ {
+		engine.Crash("w1", 1)
+		clk.advance(time.Minute)
+		r.pass() // restarted
+		r.pass() // seen running: the steady period begins
+		clk.advance(defaultStableAfter + time.Second)
+		r.pass()
+		st := wantStatus(t, r, "w1", phaseRunning, "running")
+		if int(st.GetRestartCount()) != round {
+			t.Fatalf("round %d: restart count %d", round, st.GetRestartCount())
+		}
+	}
+	if got := engine.Count("start"); got != 5 {
+		t.Fatalf("started %d times, want 5: more restarts than the limit of 2, none of them in a row", got)
+	}
+
+	// Quick failures in a row are what the limit is for.
+	for i := 0; i < 3; i++ {
+		engine.Crash("w1", 1)
+		clk.advance(time.Minute)
+		r.pass()
+	}
+	if got := engine.Count("start"); got != 7 {
+		t.Fatalf("started %d times, want 7", got)
+	}
+	wantStatus(t, r, "w1", phaseFailed, "gave up after 2 restarts in a row")
+}
+
+func healthy(a *dockfleetv1.WorkloadAssignment) *dockfleetv1.WorkloadAssignment {
+	a.HealthCheck = &dockfleetv1.HealthCheck{Command: []string{"true"}, IntervalSeconds: 5, TimeoutSeconds: 1, Retries: 2}
+	return a
+}
+
+func TestAnUnhealthyContainerIsStoppedAndRestartedByThePolicy(t *testing.T) {
+	r, engine, _ := newTestRunner(t)
+	r.Assign([]*dockfleetv1.WorkloadAssignment{healthy(assigned("w1", 1, wantRunning))})
+	r.pass()
+	r.pass()
+	if st := wantStatus(t, r, "w1", phaseRunning, "running"); st.GetHealth() != "healthy" {
+		t.Fatalf("status = %v", st)
+	}
+	spec, _ := engine.Spec("w1")
+	if h := spec.HealthCheck; h == nil || h.Interval != 5*time.Second || h.Timeout != time.Second || h.Retries != 2 || len(h.Command) != 1 {
+		t.Fatalf("the health check did not reach the container: %+v", h)
+	}
+
+	engine.SetHealth("w1", docker.HealthUnhealthy)
+	r.pass()
+	if st := wantStatus(t, r, "w1", phasePending, "health check fails"); st.GetHealth() != docker.HealthUnhealthy || engine.Count("stop") != 1 {
+		t.Fatalf("status = %v, calls = %v", st, engine.Calls())
+	}
+	r.pass()
+	if st := wantStatus(t, r, "w1", phasePending, "restarting"); st.GetRestartCount() != 1 || engine.Count("start") != 2 {
+		t.Fatalf("status = %v, calls = %v", st, engine.Calls())
+	}
+	r.pass()
+	if st := wantStatus(t, r, "w1", phaseRunning, "running"); st.GetHealth() != "healthy" || st.GetRestartCount() != 1 {
+		t.Fatalf("status = %v", st)
+	}
+	if engine.Count("create") != 1 {
+		t.Fatalf("restarting must reuse the container: %v", engine.Calls())
+	}
+}
+
+func TestAnUnhealthyContainerIsOnlyReportedWithoutARestartPolicy(t *testing.T) {
+	r, engine, _ := newTestRunner(t)
+	a := healthy(assigned("w1", 1, wantRunning))
+	a.RestartPolicy = &dockfleetv1.RestartPolicy{Condition: "no"}
+	r.Assign([]*dockfleetv1.WorkloadAssignment{a})
+	r.pass()
+	r.pass()
+	engine.SetHealth("w1", docker.HealthUnhealthy)
+	for i := 0; i < 3; i++ {
+		r.pass()
+	}
+	st := wantStatus(t, r, "w1", phaseRunning, "health check fails")
+	if st.GetHealth() != docker.HealthUnhealthy || engine.Count("stop") != 0 {
+		t.Fatalf("status = %v, calls = %v; a container that is never restarted is only reported", st, engine.Calls())
+	}
+}
+
+func TestAnUnhealthyContainerCountsAgainstTheRestartLimit(t *testing.T) {
+	r, engine, clk := newTestRunner(t)
+	a := healthy(assigned("w1", 1, wantRunning))
+	a.RestartPolicy = &dockfleetv1.RestartPolicy{Condition: "on-failure", MaxRetries: 1}
+	r.Assign([]*dockfleetv1.WorkloadAssignment{a})
+	r.pass()
+	r.pass()
+	for round := 0; round < 2; round++ {
+		engine.SetHealth("w1", docker.HealthUnhealthy)
+		r.pass() // stopped
+		clk.advance(time.Minute)
+		r.pass() // restarted, or given up on
+	}
+	if got := engine.Count("start"); got != 2 {
+		t.Fatalf("started %d times, want the first start and one restart", got)
+	}
+	st := wantStatus(t, r, "w1", phaseFailed, "gave up after 1 restarts in a row")
+	if !strings.Contains(st.GetMessage(), "health check failed") {
+		t.Fatalf("status = %v; it must say why", st)
+	}
+}
+
+func newFencedRunner(t *testing.T) (*runner, *dockerfake.Fake, *clock) {
+	t.Helper()
+	engine := dockerfake.New("node-1")
+	engine.AddImage("img")
+	clk := &clock{now: time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)}
+	r := newRunner(engine, slog.New(slog.NewTextHandler(io.Discard, nil)), runnerConfig{
+		Now: clk.Now, OrphanGrace: time.Minute, BackoffBase: time.Second, BackoffMax: 4 * time.Second, Fencing: true,
+	})
+	return r, engine, clk
+}
+
+// When the manager's lease on the node runs out, the node's containers are
+// stopped: from then on the manager may start the replicas elsewhere. They are
+// stopped, not removed, and only the node's own containers. When the lease is
+// renewed the same containers start again, which is not a failure.
+func TestContainersAreFencedWhenTheLeaseRunsOut(t *testing.T) {
+	r, engine, clk := newFencedRunner(t)
+	bystander := engine.AddUnmanaged("redis", "redis:7", nil)
+	r.RenewLease(clk.now.Add(10 * time.Second))
+	r.Assign([]*dockfleetv1.WorkloadAssignment{assigned("w1", 1, wantRunning), assigned("w2", 1, wantRunning)})
+	r.pass()
+	r.pass()
+	wantStatus(t, r, "w1", phaseRunning, "running")
+	wantStatus(t, r, "w2", phaseRunning, "running")
+
+	// The lease has not run out yet at its last moment.
+	clk.advance(10 * time.Second)
+	r.pass()
+	if engine.Count("stop") != 0 || r.leaseLapsed() {
+		t.Fatalf("calls = %v", engine.Calls())
+	}
+
+	clk.advance(time.Millisecond)
+	if !r.leaseLapsed() {
+		t.Fatal("the lease should have run out")
+	}
+	r.pass()
+	if engine.Count("stop") != 2 || engine.Count("remove") != 0 {
+		t.Fatalf("calls = %v; both containers must be stopped and neither removed", engine.Calls())
+	}
+	wantStatus(t, r, "w1", phasePending, "lease")
+	for _, c := range engine.Containers() {
+		switch {
+		case c.ID == bystander && c.State != docker.StateRunning:
+			t.Fatalf("the bystander container was fenced: %+v", c)
+		case c.ID != bystander && c.State != docker.StateExited:
+			t.Fatalf("a container is still running after fencing: %+v", c)
+		}
+	}
+
+	// Further passes without a lease change nothing, and start nothing.
+	for i := 0; i < 3; i++ {
+		clk.advance(time.Minute)
+		r.pass()
+	}
+	if engine.Count("stop") != 2 || engine.Count("start") != 2 || engine.Count("create") != 2 {
+		t.Fatalf("calls = %v", engine.Calls())
+	}
+
+	// The lease comes back: the same containers run again, and it is not counted as a failure.
+	r.RenewLease(clk.now.Add(10 * time.Second))
+	r.pass()
+	wantStatus(t, r, "w1", phasePending, "started again after the lease was renewed")
+	r.pass()
+	st := wantStatus(t, r, "w1", phaseRunning, "running")
+	if st.GetRestartCount() != 0 || engine.Count("start") != 4 || engine.Count("create") != 2 {
+		t.Fatalf("status = %v, calls = %v", st, engine.Calls())
+	}
+
+	// Afterwards a crash is an ordinary crash again.
+	engine.Crash("w1", 1)
+	r.pass()
+	if st := wantStatus(t, r, "w1", phasePending, "restarting"); st.GetRestartCount() != 1 {
+		t.Fatalf("status = %v", st)
+	}
+}
+
+// A workload the manager moved away while the lease was out is told to stop
+// when the lease comes back: its container is removed, not started again.
+func TestAFencedContainerOfAMovedWorkloadIsRemoved(t *testing.T) {
+	r, engine, clk := newFencedRunner(t)
+	r.RenewLease(clk.now.Add(10 * time.Second))
+	r.Assign([]*dockfleetv1.WorkloadAssignment{assigned("w1", 1, wantRunning)})
+	r.pass()
+	r.pass()
+	clk.advance(11 * time.Second)
+	r.pass()
+	if engine.Count("stop") != 1 {
+		t.Fatalf("calls = %v", engine.Calls())
+	}
+
+	r.RenewLease(clk.now.Add(10 * time.Second))
+	r.Assign([]*dockfleetv1.WorkloadAssignment{assigned("w1", 2, wantStopped)})
+	r.pass()
+	if engine.Count("start") != 1 || engine.Count("remove") != 1 || len(engine.Managed()) != 0 {
+		t.Fatalf("calls = %v", engine.Calls())
+	}
+	st := wantStatus(t, r, "w1", phaseStopped, "removed")
+	if st.GetContainerId() != "" || st.GetAcknowledgedGeneration() != 2 {
+		t.Fatalf("status = %v", st)
+	}
+	if len(r.fenced) != 0 {
+		t.Fatalf("the fenced marker of a removed container stays: %v", r.fenced)
+	}
+}
+
+// Without fencing, or before the manager has granted a lease, containers
+// outlive any outage.
+func TestNoFencingWithoutAFencedRunnerOrALease(t *testing.T) {
+	r, engine, clk := newTestRunner(t) // fencing off
+	r.RenewLease(clk.now.Add(time.Second))
+	r.Assign([]*dockfleetv1.WorkloadAssignment{assigned("w1", 1, wantRunning)})
+	r.pass()
+	clk.advance(time.Hour)
+	r.pass()
+	r.pass()
+	if engine.Count("stop") != 0 {
+		t.Fatalf("a runner with fencing off stopped a container: %v", engine.Calls())
+	}
+
+	r, engine, clk = newFencedRunner(t) // fencing on, but no lease yet
+	r.Assign([]*dockfleetv1.WorkloadAssignment{assigned("w1", 1, wantRunning)})
+	r.pass()
+	clk.advance(time.Hour)
+	r.pass()
+	if engine.Count("stop") != 0 || r.leaseLapsed() {
+		t.Fatalf("a runner that was never granted a lease stopped a container: %v", engine.Calls())
+	}
+}
+
+func TestTheRunnerWakesWhenTheLeaseWouldRunOut(t *testing.T) {
+	r, _, clk := newFencedRunner(t)
+	if got := r.nextWake(); got != defaultResync {
+		t.Fatalf("without a lease the runner looks every %s, not %s", defaultResync, got)
+	}
+	r.RenewLease(clk.now.Add(500 * time.Millisecond))
+	if got := r.nextWake(); got != 501*time.Millisecond {
+		t.Fatalf("wake in %s, want just after the lease ends", got)
+	}
+	r.RenewLease(clk.now.Add(time.Hour))
+	if got := r.nextWake(); got != defaultResync {
+		t.Fatalf("a far-off lease must not shorten the resync period: %s", got)
+	}
+	clk.advance(2 * time.Hour)
+	if got := r.nextWake(); got != defaultResync {
+		t.Fatalf("a lapsed lease is already dealt with: %s", got)
+	}
+}
+
+func TestHealthChecksReachTheContainerWithDefaultsFilledIn(t *testing.T) {
+	a := assigned("w1", 1, wantRunning)
+	a.HealthCheck = &dockfleetv1.HealthCheck{Command: []string{"true"}}
+	spec, err := specFor(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := spec.HealthCheck
+	if h == nil || h.Interval != defaultHealthInterval || h.Timeout != defaultHealthTimeout || h.Retries != defaultHealthRetries || h.StartPeriod != 0 {
+		t.Fatalf("health check = %+v", h)
+	}
+	a.HealthCheck = &dockfleetv1.HealthCheck{Command: []string{"curl", "-f", "x"}, IntervalSeconds: 7, TimeoutSeconds: 3, StartPeriodSeconds: 20, Retries: 5}
+	spec, _ = specFor(a)
+	if h := spec.HealthCheck; h.Interval != 7*time.Second || h.Timeout != 3*time.Second || h.StartPeriod != 20*time.Second || h.Retries != 5 || len(h.Command) != 3 {
+		t.Fatalf("health check = %+v", h)
+	}
+	if spec, _ := specFor(assigned("w1", 1, wantRunning)); spec.HealthCheck != nil {
+		t.Fatalf("a workload without a health check got %+v", spec.HealthCheck)
+	}
+}

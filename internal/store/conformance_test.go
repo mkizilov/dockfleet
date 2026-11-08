@@ -19,9 +19,11 @@ func runStoreConformance(t *testing.T, newStore func(t *testing.T) Store) {
 		run  func(*testing.T, Store)
 	}{
 		{"nodes", testNodes},
+		{"node health and departure", testNodeHealthAndDeparture},
 		{"enrollments", testEnrollments},
 		{"workloads", testWorkloads},
 		{"observations", testObservations},
+		{"observation health and workload checks", testObservationHealth},
 		{"services", testServices},
 		{"service revisions", testRevisions},
 		{"service definitions", testDefinitions},

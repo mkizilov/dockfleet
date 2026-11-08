@@ -56,6 +56,25 @@ type Mount struct {
 	SizeBytes int64 // tmpfs only; 0 means 64 MiB
 }
 
+// Health check results in ContainerState.Health.
+const (
+	HealthStarting  = "starting"
+	HealthHealthy   = "healthy"
+	HealthUnhealthy = "unhealthy"
+)
+
+// HealthCheck is a command Docker runs inside the container at an interval;
+// exit status 0 is healthy. After Retries failures in a row the container is
+// unhealthy, which ContainerState.Health reports. Failures during StartPeriod
+// do not count.
+type HealthCheck struct {
+	Command     []string // exec form: the program and its arguments, never a shell string
+	Interval    time.Duration
+	Timeout     time.Duration
+	StartPeriod time.Duration
+	Retries     int
+}
+
 // ContainerSpec describes a container to create. It is deliberately a
 // restricted subset of what Docker accepts. Fields that could weaken the
 // isolation of the host (Privileged through SecurityOpt) exist only so that
@@ -77,6 +96,9 @@ type ContainerSpec struct {
 
 	Ports  []PortMapping
 	Mounts []Mount
+
+	// HealthCheck is optional; without it the container has no health state.
+	HealthCheck *HealthCheck
 
 	Privileged  bool
 	CapAdd      []string

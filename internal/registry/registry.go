@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -57,6 +58,9 @@ type StatusReport struct {
 	ExitCode     *int
 	OOMKilled    bool
 	RestartCount int
+	// Health is the container's health check result: empty without a check,
+	// else "starting", "healthy" or "unhealthy".
+	Health string
 
 	// AckedGeneration is the highest generation of the workload's assignment
 	// the agent has received.
@@ -194,6 +198,7 @@ func (r *Registry) Heartbeat(ctx context.Context, nodeID, sessionID string, repo
 		placed[workloads[i].ID] = &workloads[i]
 	}
 	var changed []store.Observation
+	var events []store.Event
 	for _, rep := range reports {
 		w, ok := placed[rep.WorkloadID]
 		if !ok {
@@ -209,21 +214,71 @@ func (r *Registry) Heartbeat(ctx context.Context, nodeID, sessionID string, repo
 		obs := store.Observation{
 			WorkloadID: w.ID, NodeID: nodeID, State: rep.State, Message: rep.Message,
 			ContainerID: rep.ContainerID, ExitCode: rep.ExitCode, OOMKilled: rep.OOMKilled, RestartCount: rep.RestartCount,
-			AckedGeneration: acked, ObservedAt: now,
+			Health: rep.Health, AckedGeneration: acked, ObservedAt: now,
 		}
 		if w.Observed != nil && obs.SameReport(*w.Observed) {
 			continue
 		}
+		events = append(events, r.failureEvents(now, *w, obs)...)
 		changed = append(changed, obs)
 		w.Observed = &obs
 	}
-	if err := r.store.RecordObservations(ctx, nodeID, changed); err != nil {
+	if len(changed) == 0 {
+		return workloads, nil
+	}
+	// The observations and the events about them are saved together.
+	err = r.store.InTx(ctx, func(tx store.Tx) error {
+		if err := tx.RecordObservations(ctx, nodeID, changed); err != nil {
+			return err
+		}
+		for _, ev := range events {
+			if _, err := tx.AppendEvent(ctx, ev); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, fmt.Errorf("record workload observations: %w", err)
 	}
 	return workloads, nil
 }
 
-// Deregister ends the session and marks the node unavailable immediately.
+// failureEvents are the audit events a new report of a workload calls for: it
+// failed, turned unhealthy, was restarted, or recovered. The first report of a
+// workload that is fine says nothing, and neither does a repeat of a state
+// already recorded. w holds the previous observation.
+func (r *Registry) failureEvents(at time.Time, w store.Workload, obs store.Observation) []store.Event {
+	prev := w.Observed
+	var out []store.Event
+	add := func(action, message string) {
+		out = append(out, store.Event{
+			At: at, InstanceID: r.instanceID, Actor: "node:" + obs.NodeID, Action: action,
+			ResourceType: "workload", ResourceID: w.ID, Message: message,
+			Details: map[string]string{
+				"node_id": obs.NodeID, "service_id": w.ServiceID, "restart_count": strconv.Itoa(obs.RestartCount),
+			},
+		})
+	}
+	wasFailed := prev != nil && prev.State == store.WorkloadFailed
+	wasUnhealthy := prev != nil && prev.Health == store.HealthUnhealthy
+	switch {
+	case obs.State == store.WorkloadFailed && !wasFailed:
+		add("workload.failed", fmt.Sprintf("%s failed on node %s: %s", w.Name, obs.NodeID, obs.Message))
+	case obs.Health == store.HealthUnhealthy && !wasUnhealthy:
+		add("workload.unhealthy", fmt.Sprintf("%s is unhealthy on node %s", w.Name, obs.NodeID))
+	case obs.State == store.WorkloadRunning && obs.Health != store.HealthUnhealthy && (wasFailed || wasUnhealthy):
+		add("workload.recovered", fmt.Sprintf("%s runs again on node %s", w.Name, obs.NodeID))
+	}
+	if prev != nil && obs.RestartCount > prev.RestartCount {
+		add("workload.restarted", fmt.Sprintf("%s was restarted on node %s (%d so far)", w.Name, obs.NodeID, obs.RestartCount))
+	}
+	return out
+}
+
+// Deregister ends the session and takes the node out of scheduling at once. Its
+// containers keep running, so its replicas are not moved until the node has been
+// gone for as long as a node that stopped heartbeating.
 func (r *Registry) Deregister(ctx context.Context, nodeID, sessionID string) error {
 	if err := r.check(nodeID, sessionID); err != nil {
 		return err
@@ -231,9 +286,10 @@ func (r *Registry) Deregister(ctx context.Context, nodeID, sessionID string) err
 	r.drop(nodeID, sessionID)
 	now := r.now()
 	err := r.store.InTx(ctx, func(tx store.Tx) error {
-		// The zero time makes the node not ready until it registers again.
-		if err := tx.Heartbeat(ctx, nodeID, time.Time{}); err != nil && !errors.Is(err, store.ErrNotFound) {
-			return fmt.Errorf("mark node unavailable: %w", err)
+		// The node is not ready until it registers again; how long it has been
+		// gone is counted from now.
+		if err := tx.DeregisterNode(ctx, nodeID, now); err != nil && !errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("mark node deregistered: %w", err)
 		}
 		_, err := tx.AppendEvent(ctx, r.event(now, nodeID, "node.deregistered", nil))
 		return err

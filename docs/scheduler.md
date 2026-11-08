@@ -76,7 +76,9 @@ A replica slot is replica `i` (1 to `replicas`) of a service's current revision.
 
 If any step fails nothing is saved and the next pass starts over. A pass is idempotent: with nothing waiting it writes nothing. The manager runs one every `DOCKFLEET_SCHEDULER_INTERVAL` (default `5s`) until it shuts down.
 
-Deliberately not done by a pass: removing workloads (scaling down, retiring the replicas of an older revision), moving workloads off a node that died, and starting containers. A deployment of a new revision therefore places the new revision's replicas beside the old ones, and needs room for both until the reconciler ([reconciliation.md](reconciliation.md)) retires the old ones, one replica at a time, as the new ones come up. The scheduler treats a workload as freed the moment it is told to stop, even though its container takes a moment to go.
+A slot with a stopped workload on it is not waiting while the container may still be there, with one exception: when the workload's node has been given up on (silent for `DOCKFLEET_NODE_UNAVAILABLE_AFTER`, see [failure-handling.md](failure-handling.md)), the reconciler has stopped the workload and the node cannot be asked to remove the container, so the slot is waiting again and the replica is placed on another node at once. The database allows only one workload *meant to run* per slot, so the old and new workloads never both claim it.
+
+Deliberately not done by a pass: removing workloads (scaling down, retiring the replicas of an older revision, stopping the workloads of a lost node), and starting containers. A deployment of a new revision therefore places the new revision's replicas beside the old ones, and needs room for both until the reconciler ([reconciliation.md](reconciliation.md)) retires the old ones, one replica at a time, as the new ones come up. The scheduler treats a workload as freed the moment it is told to stop, even though its container takes a moment to go.
 
 Standalone workloads (`POST /v1/workloads`) use the same scheduler and the same rules, so what a service's replicas reserve counts against them and the other way round.
 

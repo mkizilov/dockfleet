@@ -106,6 +106,28 @@ type Node struct {
 	AgentVersion  string            `json:"agent_version"`
 	RegisteredAt  time.Time         `json:"registered_at"`
 	LastHeartbeat time.Time         `json:"last_heartbeat"`
+
+	// Health is the state the reconciler last recorded for the node, and
+	// HealthSince when it recorded it. Health lags the heartbeat by at most one
+	// pass; the API computes the state from the heartbeat on every read. An
+	// agent's registration keeps both. DeregisteredAt is when the agent left
+	// cleanly, or zero while it is registered. None of the three is part of the
+	// node's JSON form: the node view reports the computed state instead.
+	Health         string    `json:"-"`
+	HealthSince    time.Time `json:"-"`
+	DeregisteredAt time.Time `json:"-"`
+}
+
+// Node health states.
+const (
+	NodeHealthy     = "healthy"
+	NodeSuspect     = "suspect"
+	NodeUnavailable = "unavailable"
+)
+
+// ValidNodeHealth reports whether s is a node health state.
+func ValidNodeHealth(s string) bool {
+	return s == NodeHealthy || s == NodeSuspect || s == NodeUnavailable
 }
 
 // Enrollment is an administrator's explicit permission for a node ID to join
@@ -142,14 +164,16 @@ type Workload struct {
 	// Ports are the ports the workload publishes. The scheduler keeps two
 	// workloads from claiming the same fixed host port on one node.
 	Ports []ServicePort `json:"ports,omitempty"`
-	// Command, Env and RestartPolicy are what the agent starts the container
-	// with. They are copied from the service revision when the workload is
-	// placed, so a workload never changes underneath its container. Env is not
-	// part of the JSON form: values can be secrets, and the service definition
-	// that holds them is where an administrator reads them.
+	// Command, Env, RestartPolicy and HealthCheck are what the agent starts
+	// the container with and watches it by. They are copied from the service
+	// revision when the workload is placed, so a workload never changes
+	// underneath its container. Env is not part of the JSON form: values can be
+	// secrets, and the service definition that holds them is where an
+	// administrator reads them.
 	Command       []string          `json:"command,omitempty"`
 	Env           map[string]string `json:"-"`
 	RestartPolicy *RestartPolicy    `json:"restart_policy,omitempty"`
+	HealthCheck   *HealthCheck      `json:"health_check,omitempty"`
 	// Generation starts at 1 and increases every time the desired state
 	// changes. The agent acknowledges the generation it has seen
 	// (Observation.AckedGeneration), which tells an instruction that was
@@ -162,6 +186,15 @@ type Workload struct {
 	// is read-only here: CreateWorkload ignores it, and only RecordObservations
 	// writes it.
 	Observed *Observation `json:"observed"`
+}
+
+func cloneHealthCheck(h *HealthCheck) *HealthCheck {
+	if h == nil {
+		return nil
+	}
+	c := *h
+	c.Command = append([]string(nil), h.Command...)
+	return &c
 }
 
 // Phase is the workload's observed lifecycle phase: WorkloadScheduled until
@@ -187,6 +220,7 @@ func (w Workload) prepareForCreate() (Workload, error) {
 		w.Env = cloneLabels(w.Env)
 	}
 	w.RestartPolicy = clonePtr(w.RestartPolicy)
+	w.HealthCheck = cloneHealthCheck(w.HealthCheck)
 	if w.Generation == 0 {
 		w.Generation = 1
 	}
@@ -212,6 +246,13 @@ func (w Workload) prepareForCreate() (Workload, error) {
 	return w, nil
 }
 
+// Health check results an agent reports (Observation.Health).
+const (
+	HealthStarting  = "starting"
+	HealthHealthy   = "healthy"
+	HealthUnhealthy = "unhealthy"
+)
+
 // Observation is what a node's agent reported about one workload's container:
 // observed state. A workload has at most one, replaced by each newer report.
 type Observation struct {
@@ -223,6 +264,7 @@ type Observation struct {
 	ExitCode     *int       `json:"exit_code,omitempty"`
 	OOMKilled    bool       `json:"oom_killed"`
 	RestartCount int        `json:"restart_count"`
+	Health       string     `json:"health,omitempty"` // "" without a health check, else "starting", "healthy" or "unhealthy"
 	StartedAt    *time.Time `json:"started_at,omitempty"`
 	FinishedAt   *time.Time `json:"finished_at,omitempty"`
 	ObservedAt   time.Time  `json:"observed_at"` // when the manager received the report
@@ -236,7 +278,7 @@ type Observation struct {
 // change nothing.
 func (o Observation) SameReport(p Observation) bool {
 	return o.State == p.State && o.Message == p.Message && o.ContainerID == p.ContainerID &&
-		o.OOMKilled == p.OOMKilled && o.RestartCount == p.RestartCount && o.AckedGeneration == p.AckedGeneration &&
+		o.OOMKilled == p.OOMKilled && o.RestartCount == p.RestartCount && o.AckedGeneration == p.AckedGeneration && o.Health == p.Health &&
 		equalPtr(o.ExitCode, p.ExitCode) && equalTimePtr(o.StartedAt, p.StartedAt) && equalTimePtr(o.FinishedAt, p.FinishedAt)
 }
 
@@ -298,11 +340,18 @@ type HealthCheck struct {
 	Retries            int      `json:"retries"`
 }
 
-// RestartPolicy says when a replica that stopped is started again.
+// RestartPolicy says when a replica that stopped is started again, and how
+// often and how fast. Zero values mean the defaults.
 type RestartPolicy struct {
 	Condition string `json:"condition"` // RestartNo, RestartOnFailure or RestartAlways
-	// MaxRetries bounds restarts for RestartOnFailure; it is 0 for the others.
+	// MaxRetries bounds the restarts in a row: for RestartOnFailure it is at
+	// least 1 (default 5), for RestartAlways 0 means no limit, and RestartNo
+	// has none. The count starts again after the container has run steadily.
 	MaxRetries int `json:"max_retries,omitempty"`
+	// BackoffSeconds is the wait before the first restart in a row (default
+	// 1); it doubles with each further one, up to MaxBackoffSeconds (default 60).
+	BackoffSeconds    int `json:"backoff_seconds,omitempty"`
+	MaxBackoffSeconds int `json:"max_backoff_seconds,omitempty"`
 }
 
 // Hash identifies the spec's content: equal specs hash equally, whatever the
@@ -473,6 +522,13 @@ type NodeRepository interface {
 	UpsertNode(ctx context.Context, n Node) (Node, error)
 	// Heartbeat sets LastHeartbeat; it returns ErrNotFound for unknown nodes.
 	Heartbeat(ctx context.Context, id string, at time.Time) error
+	// DeregisterNode records that the agent left cleanly at the given time and
+	// clears the node's last heartbeat, so it is not ready until it registers
+	// again. It returns ErrNotFound for an unknown node.
+	DeregisterNode(ctx context.Context, id string, at time.Time) error
+	// SetNodeHealth records the node's health state and when it began
+	// (ErrInvalid for an unknown state, ErrNotFound for an unknown node).
+	SetNodeHealth(ctx context.Context, id, health string, at time.Time) error
 	GetNode(ctx context.Context, id string) (Node, error)
 	ListNodes(ctx context.Context) ([]Node, error)
 }
