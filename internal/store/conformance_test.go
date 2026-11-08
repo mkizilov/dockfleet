@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -10,20 +11,60 @@ import (
 var testTime = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 
 // runStoreConformance exercises behavior every Store implementation must share.
-// The store must be empty.
-func runStoreConformance(t *testing.T, s Store) {
+// newStore returns an empty store; it is called once per subtest.
+func runStoreConformance(t *testing.T, newStore func(t *testing.T) Store) {
 	t.Helper()
-	ctx := context.Background()
+	suites := map[string]func(*testing.T, Store){
+		"nodes":                 testNodes,
+		"enrollments":           testEnrollments,
+		"workloads":             testWorkloads,
+		"observations":          testObservations,
+		"services":              testServices,
+		"service revisions":     testRevisions,
+		"service workloads":     testServiceWorkloads,
+		"service deletion":      testServiceDeletion,
+		"events":                testEvents,
+		"leases":                testLeases,
+		"transactions":          testTransactions,
+		"transaction rollbacks": testTransactionRollbacks,
+	}
+	for name, suite := range suites {
+		t.Run(name, func(t *testing.T) {
+			s := newStore(t)
+			suite(t, s)
+		})
+	}
+}
 
-	if err := s.Ping(ctx); err != nil {
-		t.Fatalf("Ping: %v", err)
+func wantErr(t *testing.T, err, want error) {
+	t.Helper()
+	if !errors.Is(err, want) {
+		t.Fatalf("error = %v, want %v", err, want)
 	}
-	if _, err := s.GetNode(ctx, "missing"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("GetNode(missing) error = %v, want ErrNotFound", err)
+}
+
+func noErr(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := s.Heartbeat(ctx, "missing", testTime); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("Heartbeat(missing) error = %v, want ErrNotFound", err)
-	}
+}
+
+func addNode(t *testing.T, s Repositories, id string) Node {
+	t.Helper()
+	n, err := s.UpsertNode(context.Background(), Node{
+		ID: id, Name: id, CPUMillis: 4000, MemoryBytes: 8 << 30,
+		RegisteredAt: testTime, LastHeartbeat: testTime,
+	})
+	noErr(t, err)
+	return n
+}
+
+func testNodes(t *testing.T, s Store) {
+	ctx := context.Background()
+	_, err := s.GetNode(ctx, "missing")
+	wantErr(t, err, ErrNotFound)
+	wantErr(t, s.Heartbeat(ctx, "missing", testTime), ErrNotFound)
 
 	node := Node{
 		ID: "node-b", Name: "B", CPUMillis: 4000, MemoryBytes: 8 << 30,
@@ -31,127 +72,48 @@ func runStoreConformance(t *testing.T, s Store) {
 		RegisteredAt: testTime, LastHeartbeat: testTime,
 	}
 	got, err := s.UpsertNode(ctx, node)
-	if err != nil {
-		t.Fatalf("UpsertNode: %v", err)
-	}
-	if got.ID != "node-b" || got.Labels["zone"] != "a" || !got.RegisteredAt.Equal(testTime) {
+	noErr(t, err)
+	if got.ID != "node-b" || got.Labels["zone"] != "a" || !got.RegisteredAt.Equal(testTime) || got.CPUMillis != 4000 {
 		t.Fatalf("unexpected node: %+v", got)
 	}
-	if _, err := s.UpsertNode(ctx, Node{ID: "node-a", Name: "A", CPUMillis: 1000, MemoryBytes: 1 << 30, RegisteredAt: testTime, LastHeartbeat: testTime}); err != nil {
-		t.Fatalf("UpsertNode node-a: %v", err)
-	}
+	addNode(t, s, "node-a")
 
 	later := testTime.Add(time.Minute)
-	node.Name = "B2"
-	node.RegisteredAt = later
-	node.LastHeartbeat = later
+	node.Name, node.RegisteredAt, node.LastHeartbeat = "B2", later, later
 	updated, err := s.UpsertNode(ctx, node)
-	if err != nil {
-		t.Fatalf("UpsertNode update: %v", err)
-	}
+	noErr(t, err)
 	if updated.Name != "B2" || !updated.RegisteredAt.Equal(testTime) || !updated.LastHeartbeat.Equal(later) {
 		t.Fatalf("update must keep RegisteredAt and refresh the rest: %+v", updated)
 	}
 
 	hb := later.Add(time.Minute)
-	if err := s.Heartbeat(ctx, "node-b", hb); err != nil {
-		t.Fatalf("Heartbeat: %v", err)
-	}
+	noErr(t, s.Heartbeat(ctx, "node-b", hb))
 	fetched, err := s.GetNode(ctx, "node-b")
 	if err != nil || !fetched.LastHeartbeat.Equal(hb) {
 		t.Fatalf("GetNode after heartbeat = %+v, %v", fetched, err)
 	}
 
 	nodes, err := s.ListNodes(ctx)
-	if err != nil || len(nodes) != 2 || nodes[0].ID != "node-a" || nodes[1].ID != "node-b" {
+	if err != nil || len(nodes) != 2 || nodes[0].ID != "node-a" || nodes[1].ID != "node-b" || nodes[0].Labels == nil {
 		t.Fatalf("ListNodes = %+v, %v", nodes, err)
 	}
-	if nodes[0].Labels == nil {
-		t.Fatal("Labels must never be nil")
-	}
-
-	w := Workload{ID: "w1", Name: "web", Image: "nginx:1", CPUMillis: 500, MemoryBytes: 256 << 20, NodeID: "node-a", State: WorkloadScheduled, CreatedAt: testTime}
-	if _, err := s.CreateWorkload(ctx, w); err != nil {
-		t.Fatalf("CreateWorkload: %v", err)
-	}
-	dupName := w
-	dupName.ID = "w2"
-	if _, err := s.CreateWorkload(ctx, dupName); !errors.Is(err, ErrConflict) {
-		t.Fatalf("duplicate name error = %v, want ErrConflict", err)
-	}
-	dupID := w
-	dupID.Name = "other"
-	if _, err := s.CreateWorkload(ctx, dupID); !errors.Is(err, ErrConflict) {
-		t.Fatalf("duplicate id error = %v, want ErrConflict", err)
-	}
-	orphan := Workload{ID: "w3", Name: "orphan", Image: "x", CPUMillis: 1, MemoryBytes: 1, NodeID: "ghost", State: WorkloadScheduled, CreatedAt: testTime}
-	if _, err := s.CreateWorkload(ctx, orphan); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("unknown node error = %v, want ErrNotFound", err)
-	}
-
-	gw, err := s.GetWorkload(ctx, "w1")
-	if err != nil || gw.Name != "web" || gw.NodeID != "node-a" || !gw.CreatedAt.Equal(testTime) {
-		t.Fatalf("GetWorkload = %+v, %v", gw, err)
-	}
-	if _, err := s.GetWorkload(ctx, "nope"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("GetWorkload(nope) error = %v, want ErrNotFound", err)
-	}
-	ws, err := s.ListWorkloads(ctx)
-	if err != nil || len(ws) != 1 || ws[0].ID != "w1" {
-		t.Fatalf("ListWorkloads = %+v, %v", ws, err)
-	}
-	if gw.StatusUpdatedAt != nil || gw.StatusMessage != "" {
-		t.Fatalf("new workload must have no status report: %+v", gw)
-	}
-
-	forNode, err := s.ListWorkloadsForNode(ctx, "node-a")
-	if err != nil || len(forNode) != 1 || forNode[0].ID != "w1" {
-		t.Fatalf("ListWorkloadsForNode(node-a) = %+v, %v", forNode, err)
-	}
-	other, err := s.ListWorkloadsForNode(ctx, "node-b")
-	if err != nil || other == nil || len(other) != 0 {
-		t.Fatalf("ListWorkloadsForNode(node-b) = %+v, %v; want empty non-nil", other, err)
-	}
-
-	reported := testTime.Add(time.Hour)
-	if err := s.UpdateWorkloadStatus(ctx, "w1", "node-a", WorkloadPending, "accepted", reported); err != nil {
-		t.Fatalf("UpdateWorkloadStatus: %v", err)
-	}
-	gw, err = s.GetWorkload(ctx, "w1")
-	if err != nil || gw.State != WorkloadPending || gw.StatusMessage != "accepted" || gw.StatusUpdatedAt == nil || !gw.StatusUpdatedAt.Equal(reported) {
-		t.Fatalf("workload after status update = %+v, %v", gw, err)
-	}
-	if err := s.UpdateWorkloadStatus(ctx, "w1", "node-b", WorkloadRunning, "", reported); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("status from the wrong node: error = %v, want ErrNotFound", err)
-	}
-	if err := s.UpdateWorkloadStatus(ctx, "nope", "node-a", WorkloadRunning, "", reported); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("status for unknown workload: error = %v, want ErrNotFound", err)
-	}
-
-	runEnrollmentConformance(t, s)
 }
 
-func runEnrollmentConformance(t *testing.T, s Store) {
-	t.Helper()
+func testEnrollments(t *testing.T, s Store) {
 	ctx := context.Background()
-
-	if _, err := s.GetEnrollment(ctx, "worker-1"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("GetEnrollment(unenrolled) error = %v, want ErrNotFound", err)
-	}
-	if _, err := s.RevokeEnrollment(ctx, "worker-1", testTime); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("RevokeEnrollment(unenrolled) error = %v, want ErrNotFound", err)
-	}
+	_, err := s.GetEnrollment(ctx, "worker-1")
+	wantErr(t, err, ErrNotFound)
+	_, err = s.RevokeEnrollment(ctx, "worker-1", testTime)
+	wantErr(t, err, ErrNotFound)
 
 	created, err := s.CreateEnrollment(ctx, Enrollment{NodeID: "worker-1", Description: "rack 4", CreatedAt: testTime})
 	if err != nil || !created.Active() || created.Description != "rack 4" || !created.CreatedAt.Equal(testTime) {
 		t.Fatalf("CreateEnrollment = %+v, %v", created, err)
 	}
-	if _, err := s.CreateEnrollment(ctx, Enrollment{NodeID: "worker-1", CreatedAt: testTime}); !errors.Is(err, ErrConflict) {
-		t.Fatalf("duplicate active enrollment error = %v, want ErrConflict", err)
-	}
-	if _, err := s.CreateEnrollment(ctx, Enrollment{NodeID: "worker-0", CreatedAt: testTime}); err != nil {
-		t.Fatalf("CreateEnrollment worker-0: %v", err)
-	}
+	_, err = s.CreateEnrollment(ctx, Enrollment{NodeID: "worker-1", CreatedAt: testTime})
+	wantErr(t, err, ErrConflict)
+	_, err = s.CreateEnrollment(ctx, Enrollment{NodeID: "worker-0", CreatedAt: testTime})
+	noErr(t, err)
 
 	revokedAt := testTime.Add(time.Hour)
 	revoked, err := s.RevokeEnrollment(ctx, "worker-1", revokedAt)
@@ -171,9 +133,201 @@ func runEnrollmentConformance(t *testing.T, s Store) {
 	if err != nil || !reenrolled.Active() || reenrolled.Description != "rack 5" {
 		t.Fatalf("re-enrollment after revocation = %+v, %v", reenrolled, err)
 	}
-
 	list, err := s.ListEnrollments(ctx)
 	if err != nil || len(list) != 2 || list[0].NodeID != "worker-0" || list[1].NodeID != "worker-1" || !list[1].Active() {
 		t.Fatalf("ListEnrollments = %+v, %v", list, err)
+	}
+}
+
+func standalone(id, name, node string) Workload {
+	return Workload{ID: id, Name: name, Image: "nginx:1", CPUMillis: 500, MemoryBytes: 256 << 20, NodeID: node, CreatedAt: testTime}
+}
+
+func testWorkloads(t *testing.T, s Store) {
+	ctx := context.Background()
+	addNode(t, s, "node-a")
+	addNode(t, s, "node-b")
+
+	w, err := s.CreateWorkload(ctx, standalone("w1", "web", "node-a"))
+	noErr(t, err)
+	if w.DesiredState != DesiredRunning || !w.CreatedAt.Equal(testTime) || !w.UpdatedAt.Equal(testTime) || w.Observed != nil || w.Phase() != WorkloadScheduled {
+		t.Fatalf("new workload = %+v", w)
+	}
+	if w.ServiceID != "" || w.ServiceRevision != 0 || w.ReplicaIndex != 0 {
+		t.Fatalf("a standalone workload belongs to no service: %+v", w)
+	}
+
+	dupName := standalone("w2", "web", "node-a")
+	_, err = s.CreateWorkload(ctx, dupName)
+	wantErr(t, err, ErrConflict)
+	dupID := standalone("w1", "other", "node-a")
+	_, err = s.CreateWorkload(ctx, dupID)
+	wantErr(t, err, ErrConflict)
+	_, err = s.CreateWorkload(ctx, standalone("w3", "orphan", "ghost"))
+	wantErr(t, err, ErrNotFound)
+
+	invalid := map[string]func(*Workload){
+		"no cpu":            func(w *Workload) { w.CPUMillis = 0 },
+		"no memory":         func(w *Workload) { w.MemoryBytes = 0 },
+		"no image":          func(w *Workload) { w.Image = "" },
+		"bad desired state": func(w *Workload) { w.DesiredState = "paused" },
+		"service id alone":  func(w *Workload) { w.ServiceID = "svc" },
+		"revision alone":    func(w *Workload) { w.ServiceRevision = 1 },
+		"negative index":    func(w *Workload) { w.ReplicaIndex = -1 },
+	}
+	for name, mutate := range invalid {
+		bad := standalone("w-bad", "bad-"+name, "node-a")
+		mutate(&bad)
+		if _, err := s.CreateWorkload(ctx, bad); !errors.Is(err, ErrInvalid) {
+			t.Errorf("%s: error = %v, want ErrInvalid", name, err)
+		}
+	}
+
+	_, err = s.CreateWorkload(ctx, standalone("w4", "api", "node-b"))
+	noErr(t, err)
+	got, err := s.GetWorkload(ctx, "w1")
+	if err != nil || got.Name != "web" || got.NodeID != "node-a" || got.DesiredState != DesiredRunning {
+		t.Fatalf("GetWorkload = %+v, %v", got, err)
+	}
+	_, err = s.GetWorkload(ctx, "nope")
+	wantErr(t, err, ErrNotFound)
+
+	all, err := s.ListWorkloads(ctx)
+	if err != nil || len(all) != 2 || all[0].Name != "api" || all[1].Name != "web" {
+		t.Fatalf("ListWorkloads = %+v, %v", all, err)
+	}
+	forA, err := s.ListWorkloadsForNode(ctx, "node-a")
+	if err != nil || len(forA) != 1 || forA[0].ID != "w1" {
+		t.Fatalf("ListWorkloadsForNode(node-a) = %+v, %v", forA, err)
+	}
+	none, err := s.ListWorkloadsForNode(ctx, "nobody")
+	if err != nil || none == nil || len(none) != 0 {
+		t.Fatalf("ListWorkloadsForNode(nobody) = %+v, %v; want empty and non-nil", none, err)
+	}
+
+	// Changing the desired state records when, and leaves everything else alone.
+	stopAt := testTime.Add(time.Hour)
+	stopped, err := s.SetWorkloadDesiredState(ctx, "w1", DesiredStopped, stopAt)
+	if err != nil || stopped.DesiredState != DesiredStopped || !stopped.UpdatedAt.Equal(stopAt) || !stopped.CreatedAt.Equal(testTime) {
+		t.Fatalf("SetWorkloadDesiredState = %+v, %v", stopped, err)
+	}
+	same, err := s.SetWorkloadDesiredState(ctx, "w1", DesiredStopped, stopAt.Add(time.Hour))
+	if !errors.Is(err, ErrUnchanged) || !same.UpdatedAt.Equal(stopAt) {
+		t.Fatalf("setting the current state: %+v, %v; want ErrUnchanged and no change", same, err)
+	}
+	_, err = s.SetWorkloadDesiredState(ctx, "w1", "paused", stopAt)
+	wantErr(t, err, ErrInvalid)
+	_, err = s.SetWorkloadDesiredState(ctx, "nope", DesiredRunning, stopAt)
+	wantErr(t, err, ErrNotFound)
+}
+
+func intPtr(v int) *int { return &v }
+
+func timePtr(v time.Time) *time.Time { return &v }
+
+func observation(id, state string, at time.Time) Observation {
+	return Observation{WorkloadID: id, State: state, ObservedAt: at}
+}
+
+func testObservations(t *testing.T, s Store) {
+	ctx := context.Background()
+	addNode(t, s, "node-a")
+	addNode(t, s, "node-b")
+	_, err := s.CreateWorkload(ctx, standalone("w1", "web", "node-a"))
+	noErr(t, err)
+	_, err = s.CreateWorkload(ctx, standalone("w2", "api", "node-b"))
+	noErr(t, err)
+
+	// An observation passed to CreateWorkload is not stored: only agents' reports are observed state.
+	smuggled := standalone("w3", "smuggled", "node-a")
+	smuggled.Observed = &Observation{WorkloadID: "w3", State: WorkloadRunning, ObservedAt: testTime}
+	created, err := s.CreateWorkload(ctx, smuggled)
+	noErr(t, err)
+	got, _ := s.GetWorkload(ctx, "w3")
+	if created.Observed != nil || got.Observed != nil {
+		t.Fatalf("CreateWorkload must ignore Observed: %+v / %+v", created.Observed, got.Observed)
+	}
+
+	// A full report round-trips.
+	started, finished := testTime.Add(-time.Hour), testTime.Add(-time.Minute)
+	report := Observation{
+		WorkloadID: "w1", State: WorkloadFailed, Message: "exited", ContainerID: "c0ffee",
+		ExitCode: intPtr(137), OOMKilled: true, RestartCount: 2,
+		StartedAt: timePtr(started), FinishedAt: timePtr(finished), ObservedAt: testTime.Add(10 * time.Second),
+	}
+	noErr(t, s.RecordObservations(ctx, "node-a", []Observation{report}))
+	w, err := s.GetWorkload(ctx, "w1")
+	noErr(t, err)
+	o := w.Observed
+	if o == nil || o.WorkloadID != "w1" || o.NodeID != "node-a" || o.State != WorkloadFailed || o.Message != "exited" || o.ContainerID != "c0ffee" ||
+		o.ExitCode == nil || *o.ExitCode != 137 || !o.OOMKilled || o.RestartCount != 2 ||
+		o.StartedAt == nil || !o.StartedAt.Equal(started) || o.FinishedAt == nil || !o.FinishedAt.Equal(finished) || !o.ObservedAt.Equal(testTime.Add(10*time.Second)) {
+		t.Fatalf("observation = %+v", o)
+	}
+	if w.Phase() != WorkloadFailed {
+		t.Errorf("Phase = %q", w.Phase())
+	}
+
+	// Desired and observed state are independent: reporting "stopped" does not
+	// change what was asked for, and asking for "stopped" is not a report.
+	if w.DesiredState != DesiredRunning {
+		t.Fatalf("an observation changed the desired state: %+v", w)
+	}
+	_, err = s.SetWorkloadDesiredState(ctx, "w1", DesiredStopped, testTime.Add(time.Hour))
+	noErr(t, err)
+	w, _ = s.GetWorkload(ctx, "w1")
+	if w.Observed == nil || w.Observed.State != WorkloadFailed {
+		t.Fatalf("a desired-state change altered the observation: %+v", w.Observed)
+	}
+	if w2, _ := s.GetWorkload(ctx, "w2"); w2.Observed != nil || w2.Phase() != WorkloadScheduled {
+		t.Fatalf("a workload nobody reported on has no observation: %+v", w2)
+	}
+
+	// Newer reports replace older ones; late arrivals are ignored.
+	noErr(t, s.RecordObservations(ctx, "node-a", []Observation{observation("w1", WorkloadRunning, testTime.Add(20*time.Second))}))
+	noErr(t, s.RecordObservations(ctx, "node-a", []Observation{observation("w1", WorkloadPending, testTime.Add(15*time.Second))}))
+	w, _ = s.GetWorkload(ctx, "w1")
+	if w.Observed.State != WorkloadRunning || w.Observed.ExitCode != nil || w.Observed.OOMKilled {
+		t.Fatalf("expected the newest report to win, replacing every field: %+v", w.Observed)
+	}
+
+	// Reports for workloads the node does not own, or that do not exist, are ignored.
+	noErr(t, s.RecordObservations(ctx, "node-b", []Observation{observation("w1", WorkloadStopped, testTime.Add(time.Hour))}))
+	noErr(t, s.RecordObservations(ctx, "node-a", []Observation{observation("ghost", WorkloadRunning, testTime.Add(time.Hour))}))
+	w, _ = s.GetWorkload(ctx, "w1")
+	if w.Observed.State != WorkloadRunning || w.Observed.NodeID != "node-a" {
+		t.Fatalf("a foreign report was accepted: %+v", w.Observed)
+	}
+
+	// A batch is all or nothing.
+	batch := []Observation{observation("w2", WorkloadRunning, testTime), observation("w2", "exploded", testTime)}
+	wantErr(t, s.RecordObservations(ctx, "node-b", batch), ErrInvalid)
+	if w2, _ := s.GetWorkload(ctx, "w2"); w2.Observed != nil {
+		t.Fatalf("part of a rejected batch was stored: %+v", w2.Observed)
+	}
+	wantErr(t, s.RecordObservations(ctx, "node-b", []Observation{observation("w2", WorkloadScheduled, testTime)}), ErrInvalid)
+	wantErr(t, s.RecordObservations(ctx, "node-b", []Observation{{WorkloadID: "w2", State: WorkloadRunning}}), ErrInvalid)
+	noErr(t, s.RecordObservations(ctx, "node-b", nil))
+	noErr(t, s.RecordObservations(ctx, "node-b", []Observation{
+		observation("w2", WorkloadPending, testTime),
+		observation("w2", WorkloadRunning, testTime.Add(time.Second)),
+	}))
+	if w2, _ := s.GetWorkload(ctx, "w2"); w2.Observed == nil || w2.Observed.State != WorkloadRunning {
+		t.Fatalf("batch order must be respected: %+v", w2.Observed)
+	}
+
+	// Listings carry the observations.
+	list, err := s.ListWorkloadsForNode(ctx, "node-b")
+	if err != nil || len(list) != 1 || list[0].Observed == nil || list[0].Observed.State != WorkloadRunning {
+		t.Fatalf("ListWorkloadsForNode = %+v, %v", list, err)
+	}
+	all, _ := s.ListWorkloads(ctx)
+	seen := map[string]string{}
+	for _, w := range all {
+		seen[w.ID] = w.Phase()
+	}
+	want := map[string]string{"w1": WorkloadRunning, "w2": WorkloadRunning, "w3": WorkloadScheduled}
+	if !reflect.DeepEqual(seen, want) {
+		t.Fatalf("phases = %v, want %v", seen, want)
 	}
 }

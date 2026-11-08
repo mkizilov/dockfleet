@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/dockfleet/dockfleet/internal/store"
 )
 
 func getenv(vars map[string]string) Getenv {
@@ -178,6 +180,31 @@ func TestLoadAgentRejectsInvalid(t *testing.T) {
 				t.Fatalf("error = %v, want it to mention %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestLoadManagerInstanceID(t *testing.T) {
+	first, err := LoadManager(getenv(managerEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := LoadManager(getenv(managerEnv()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(first.InstanceID, "manager-") || !store.ValidName(first.InstanceID) || first.InstanceID == second.InstanceID {
+		t.Errorf("default instance IDs must be valid and differ per process: %q, %q", first.InstanceID, second.InstanceID)
+	}
+
+	vars := managerEnv()
+	vars["DOCKFLEET_INSTANCE_ID"] = "manager-eu-1"
+	c, err := LoadManager(getenv(vars))
+	if err != nil || c.InstanceID != "manager-eu-1" {
+		t.Fatalf("explicit instance ID = %q, %v", c.InstanceID, err)
+	}
+	vars["DOCKFLEET_INSTANCE_ID"] = "bad id"
+	if _, err := LoadManager(getenv(vars)); err == nil || !strings.Contains(err.Error(), "DOCKFLEET_INSTANCE_ID") {
+		t.Errorf("an invalid instance ID must be rejected, got %v", err)
 	}
 }
 

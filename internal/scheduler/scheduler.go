@@ -28,11 +28,17 @@ func Ready(n store.Node, now time.Time, ttl time.Duration) bool {
 	return now.Sub(n.LastHeartbeat) <= ttl
 }
 
-// Candidates keeps only ready nodes and sums the resources of workloads placed on them.
+// Candidates keeps only ready nodes and sums the resources of workloads placed
+// on them. Only workloads whose desired state is running reserve resources: a
+// workload that is meant to be stopped is not counted, whatever its observed
+// phase is.
 func Candidates(nodes []store.Node, workloads []store.Workload, now time.Time, ttl time.Duration) []Candidate {
 	type usage struct{ cpu, mem int64 }
 	used := map[string]usage{}
 	for _, w := range workloads {
+		if w.DesiredState == store.DesiredStopped {
+			continue
+		}
 		u := used[w.NodeID]
 		u.cpu += w.CPUMillis
 		u.mem += w.MemoryBytes

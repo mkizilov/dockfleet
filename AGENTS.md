@@ -36,14 +36,15 @@ DockFleet is a distributed container orchestration system: a manager (control pl
 - Implement only what the current task asks for. No drive-by refactors, renames, formatting sweeps or dependency upgrades.
 - Every changed line should trace to the request. Keep commits to one logical change using conventional commit messages (`feat:`, `fix:`, `test:`, `docs:`, `chore:`, `ci:`, `refactor:`).
 - New third-party dependencies need a reason in the commit message; prefer the standard library. Pin tool versions in the `Makefile`.
-- Database changes are new numbered files in `internal/store/migrations/`; never edit an applied migration.
+- Database changes are new numbered files in `internal/store/migrations/` (`NNN_description.sql`, no gaps); never edit a released migration (checksums are recorded and `TestReleasedMigrationsAreUnchanged` pins them). Add new migrations to the list in `docs/state.md`.
+- Keep desired state (what an administrator asked for) and observed state (what agents reported) apart: separate tables, separate writers, separate fields. Observations are written only through `RecordObservations`; intent is never derived from a report. Anything that must be consistent across several writes goes in one `InTx`; placement takes `Tx.LockPlacement`; concurrent edits of a service use its version (`ErrVersionConflict`). Nothing may keep cluster state only in process memory, because several managers may share the database.
 - Public behavior changes (API routes, env vars, RPCs, schema) update `README.md` and `docs/architecture.md` in the same change.
 
 ### Test coverage
 
 - Every new package or behavior ships with tests in the same change; bug fixes include a regression test that fails without the fix.
 - Test through interfaces with fakes. Use `bufconn` for gRPC and `httptest` recorders or fake `http.RoundTripper`s for HTTP and Docker; open a real socket only when the test is about the socket, and then only on `127.0.0.1` in ports 21200–21299 (currently 21290–21295 in `internal/manager`; `internal/integration` uses an in-memory transport and no ports). Use `t.TempDir()` for files.
-- Tests must not need Docker, a database or the internet. PostgreSQL tests are tagged `integration` and read `DOCKFLEET_TEST_DATABASE_URL`; Docker daemon tests are tagged `dockerintegration` and read `DOCKFLEET_TEST_DOCKER_HOST` (never run against the host's Docker from this development sandbox); both stores must keep passing `runStoreConformance`.
+- Tests must not need Docker, a database or the internet. PostgreSQL tests are tagged `integration` and read `DOCKFLEET_TEST_DATABASE_URL` (a server whose role may `CREATE DATABASE`; every test makes and drops its own database and never writes to the one in the URL); Docker daemon tests are tagged `dockerintegration` and read `DOCKFLEET_TEST_DOCKER_HOST` (never run against the host's Docker from this development sandbox); both stores must keep passing `runStoreConformance`.
 - Tests must be deterministic: no fixed sleeps as synchronization (poll with a deadline), injected clocks where time matters, and `-race` clean.
 - Cover failure paths (bad input, auth failure, dependency errors, cancellation), not only success.
 
@@ -72,7 +73,7 @@ make proto-lint proto   # lint and generate protobuf code with the tools already
 make tidy               # go mod tidy; writes go.sum (needs network)
 make check              # gofmt check, go vet, secret scan, go test -race ./...
 make build              # bin/dockfleet-manager, bin/dockfleet-agent
-make test-integration   # PostgreSQL store tests; needs `make compose-up`
+make test-integration   # PostgreSQL store tests (each test gets its own throwaway database); needs `make compose-up`
 make test-docker        # Docker Engine tests (build tag dockerintegration); needs DOCKFLEET_TEST_DOCKER_HOST
 ```
 

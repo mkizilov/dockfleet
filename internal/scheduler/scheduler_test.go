@@ -90,6 +90,19 @@ func TestCandidatesFiltersStaleNodesAndSumsUsage(t *testing.T) {
 	}
 }
 
+func TestCandidatesIgnoreWorkloadsThatShouldBeStopped(t *testing.T) {
+	nodes := []store.Node{node("a", 4000, 1<<30, nil)}
+	workloads := []store.Workload{
+		{NodeID: "a", CPUMillis: 100, MemoryBytes: 10, DesiredState: store.DesiredRunning},
+		{NodeID: "a", CPUMillis: 200, MemoryBytes: 20}, // an unset desired state means running
+		{NodeID: "a", CPUMillis: 4000, MemoryBytes: 1 << 29, DesiredState: store.DesiredStopped},
+	}
+	got := Candidates(nodes, workloads, now, 30*time.Second)
+	if len(got) != 1 || got[0].UsedCPUMillis != 300 || got[0].UsedMemoryBytes != 30 {
+		t.Fatalf("Candidates = %+v; a stopped workload must not reserve capacity", got)
+	}
+}
+
 func TestReadyBoundary(t *testing.T) {
 	n := node("a", 1, 1, nil)
 	n.LastHeartbeat = now.Add(-30 * time.Second)

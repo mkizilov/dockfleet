@@ -335,8 +335,8 @@ func TestAssignedWorkloadsAreReportedBack(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, w := range []store.Workload{
-		{ID: "w-mine", Name: "mine", Image: "nginx:1", CPUMillis: 100, MemoryBytes: 1 << 20, NodeID: "sim-1", State: store.WorkloadScheduled, CreatedAt: now},
-		{ID: "w-theirs", Name: "theirs", Image: "nginx:1", CPUMillis: 100, MemoryBytes: 1 << 20, NodeID: "elsewhere", State: store.WorkloadScheduled, CreatedAt: now},
+		{ID: "w-mine", Name: "mine", Image: "nginx:1", CPUMillis: 100, MemoryBytes: 1 << 20, NodeID: "sim-1", CreatedAt: now},
+		{ID: "w-theirs", Name: "theirs", Image: "nginx:1", CPUMillis: 100, MemoryBytes: 1 << 20, NodeID: "elsewhere", CreatedAt: now},
 	} {
 		if _, err := m.store.CreateWorkload(ctx, w); err != nil {
 			t.Fatal(err)
@@ -345,14 +345,14 @@ func TestAssignedWorkloadsAreReportedBack(t *testing.T) {
 
 	waitFor(t, "the assigned workload to be reported", func() bool {
 		w, err := m.store.GetWorkload(ctx, "w-mine")
-		return err == nil && w.State == store.WorkloadPending && w.StatusMessage != "" && w.StatusUpdatedAt != nil
+		return err == nil && w.Phase() == store.WorkloadPending && w.Observed != nil && w.Observed.Message != "" && w.Observed.NodeID == "sim-1"
 	})
 
 	// Let the agent heartbeat a few more times, then check it left the other node's workload alone.
 	n, _ := m.node("sim-1")
 	waitFor(t, "more heartbeats", func() bool { cur, _ := m.node("sim-1"); return cur.LastHeartbeat.After(n.LastHeartbeat.Add(2 * heartbeatEvery)) })
 	other, err := m.store.GetWorkload(ctx, "w-theirs")
-	if err != nil || other.State != store.WorkloadScheduled || other.StatusUpdatedAt != nil {
+	if err != nil || other.Phase() != store.WorkloadScheduled || other.Observed != nil {
 		t.Fatalf("another node's workload must not be touched: %+v, %v", other, err)
 	}
 }
@@ -542,7 +542,7 @@ func TestWorkloadsStayAssignedAcrossReRegistration(t *testing.T) {
 	if _, err := m.store.UpsertNode(ctx, store.Node{ID: "sim-1", Name: "sim-1", CPUMillis: 2000, MemoryBytes: 1 << 30, RegisteredAt: now, LastHeartbeat: now}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.store.CreateWorkload(ctx, store.Workload{ID: "w1", Name: "web", Image: "nginx", CPUMillis: 1, MemoryBytes: 1, NodeID: "sim-1", State: store.WorkloadScheduled, CreatedAt: now}); err != nil {
+	if _, err := m.store.CreateWorkload(ctx, store.Workload{ID: "w1", Name: "web", Image: "nginx", CPUMillis: 1, MemoryBytes: 1, NodeID: "sim-1", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 

@@ -73,6 +73,6 @@ func run() error {
 		return fmt.Errorf("listen on gRPC address: %w", err)
 	}
 
-	logger.Info("starting dockfleet manager", "version", version.Version, "store", cfg.Store)
+	logger.Info("starting dockfleet manager", "version", version.Version, "store", cfg.Store, "instance_id", cfg.InstanceID)
 	return m.Serve(ctx, apiLn, grpcLn)
 }

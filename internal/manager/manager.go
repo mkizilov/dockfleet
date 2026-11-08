@@ -48,7 +48,7 @@ type Manager struct {
 // token) and the agent gRPC listener requires a client certificate signed by
 // the client CA; the certificate files are re-read when they change.
 func New(cfg config.Manager, st store.Store, logger *slog.Logger) (*Manager, error) {
-	m := &Manager{cfg: cfg, store: st, registry: registry.New(st, logger), logger: logger}
+	m := &Manager{cfg: cfg, store: st, registry: registry.New(st, logger).WithInstanceID(cfg.InstanceID), logger: logger}
 	if cfg.TLSCertFile != "" {
 		var err error
 		m.apiTLS, err = pki.ServerTLS(pki.ServerConfig{CertFile: cfg.TLSCertFile, KeyFile: cfg.TLSKeyFile, Logger: logger})
@@ -99,10 +99,11 @@ func (m *Manager) Serve(ctx context.Context, apiLn, grpcLn net.Listener) error {
 	}
 	httpSrv := &http.Server{
 		Handler: api.New(api.Config{
-			Store:   m.store,
-			Token:   m.cfg.APIToken,
-			NodeTTL: m.cfg.NodeTTL,
-			Logger:  m.logger,
+			Store:      m.store,
+			Token:      m.cfg.APIToken,
+			NodeTTL:    m.cfg.NodeTTL,
+			Logger:     m.logger,
+			InstanceID: m.cfg.InstanceID,
 		}),
 		TLSConfig:         m.apiTLS,
 		ReadHeaderTimeout: 10 * time.Second,

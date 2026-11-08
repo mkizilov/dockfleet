@@ -2,15 +2,13 @@ package api
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/dockfleet/dockfleet/internal/scheduler"
@@ -30,30 +28,31 @@ type Config struct {
 	Token   string
 	NodeTTL time.Duration
 	Logger  *slog.Logger
+	// InstanceID names this manager in the audit events it records.
+	InstanceID string
 	// Now defaults to time.Now; tests override it.
 	Now func() time.Time
 }
 
 type server struct {
-	store   store.Store
-	token   []byte
-	nodeTTL time.Duration
-	logger  *slog.Logger
-	now     func() time.Time
-	// placeMu serializes placement so concurrent requests cannot overcommit a
-	// node. It is sufficient for a single manager instance only.
-	placeMu sync.Mutex
+	store      store.Store
+	token      []byte
+	nodeTTL    time.Duration
+	logger     *slog.Logger
+	instanceID string
+	now        func() time.Time
 }
 
 // New returns the administrative HTTP handler. /healthz and /readyz are open;
 // everything under /v1/ requires "Authorization: Bearer <token>".
 func New(cfg Config) http.Handler {
 	s := &server{
-		store:   cfg.Store,
-		token:   []byte("Bearer " + cfg.Token),
-		nodeTTL: cfg.NodeTTL,
-		logger:  cfg.Logger,
-		now:     cfg.Now,
+		store:      cfg.Store,
+		token:      []byte("Bearer " + cfg.Token),
+		nodeTTL:    cfg.NodeTTL,
+		logger:     cfg.Logger,
+		instanceID: cfg.InstanceID,
+		now:        cfg.Now,
 	}
 	if s.now == nil {
 		s.now = time.Now
@@ -71,7 +70,21 @@ func New(cfg Config) http.Handler {
 	mux.Handle("GET /v1/enrollments", s.auth(s.listEnrollments))
 	mux.Handle("GET /v1/enrollments/{id}", s.auth(s.getEnrollment))
 	mux.Handle("DELETE /v1/enrollments/{id}", s.auth(s.revokeEnrollment))
+	mux.Handle("GET /v1/events", s.auth(s.listEvents))
 	return s.logRequests(mux)
+}
+
+// adminActor is who the audit trail names for requests that carry the admin
+// token. There is a single shared token today; per-user identities would
+// replace this.
+const adminActor = "admin"
+
+// event builds an audit event for an administrative action.
+func (s *server) event(action, resourceType, resourceID, message string, details map[string]string) store.Event {
+	return store.Event{
+		At: s.now().UTC(), InstanceID: s.instanceID, Actor: adminActor, Action: action,
+		ResourceType: resourceType, ResourceID: resourceID, Message: message, Details: details,
+	}
 }
 
 type statusRecorder struct {
@@ -194,15 +207,11 @@ func (req createWorkloadRequest) validate() string {
 	return ""
 }
 
-func newID() (string, error) {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
-}
-
-// createWorkload records a placement decision. Nothing is started on the node yet.
+// createWorkload records a placement decision (desired state). Nothing is
+// started on the node yet. Reading the cluster, choosing a node, saving the
+// workload and recording the event are one transaction under the cluster-wide
+// placement lock, so concurrent requests cannot overcommit a node, even when
+// they reach different managers sharing the database.
 func (s *server) createWorkload(w http.ResponseWriter, r *http.Request) {
 	var req createWorkloadRequest
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
@@ -216,47 +225,41 @@ func (s *server) createWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.placeMu.Lock()
-	defer s.placeMu.Unlock()
-
-	nodes, err := s.store.ListNodes(r.Context())
-	if err != nil {
-		s.internalError(w, r, err)
-		return
-	}
-	workloads, err := s.store.ListWorkloads(r.Context())
-	if err != nil {
-		s.internalError(w, r, err)
-		return
-	}
-	target, err := scheduler.Place(
-		scheduler.Request{CPUMillis: req.CPUMillis, MemoryBytes: req.MemoryBytes, NodeSelector: req.NodeSelector},
-		scheduler.Candidates(nodes, workloads, s.now(), s.nodeTTL),
-	)
-	if errors.Is(err, scheduler.ErrNoCapacity) {
-		writeError(w, http.StatusConflict, err.Error())
-		return
-	}
-	if err != nil {
-		s.internalError(w, r, err)
-		return
-	}
-	id, err := newID()
-	if err != nil {
-		s.internalError(w, r, err)
-		return
-	}
-	created, err := s.store.CreateWorkload(r.Context(), store.Workload{
-		ID:          id,
-		Name:        req.Name,
-		Image:       req.Image,
-		CPUMillis:   req.CPUMillis,
-		MemoryBytes: req.MemoryBytes,
-		NodeID:      target.ID,
-		State:       store.WorkloadScheduled,
-		CreatedAt:   s.now().UTC(),
+	id := store.NewID()
+	var created store.Workload
+	err := s.store.InTx(r.Context(), func(tx store.Tx) error {
+		ctx := r.Context()
+		if err := tx.LockPlacement(ctx); err != nil {
+			return err
+		}
+		nodes, err := tx.ListNodes(ctx)
+		if err != nil {
+			return err
+		}
+		workloads, err := tx.ListWorkloads(ctx)
+		if err != nil {
+			return err
+		}
+		target, err := scheduler.Place(
+			scheduler.Request{CPUMillis: req.CPUMillis, MemoryBytes: req.MemoryBytes, NodeSelector: req.NodeSelector},
+			scheduler.Candidates(nodes, workloads, s.now(), s.nodeTTL),
+		)
+		if err != nil {
+			return err
+		}
+		now := s.now().UTC()
+		if created, err = tx.CreateWorkload(ctx, store.Workload{
+			ID: id, Name: req.Name, Image: req.Image, CPUMillis: req.CPUMillis, MemoryBytes: req.MemoryBytes,
+			NodeID: target.ID, DesiredState: store.DesiredRunning, CreatedAt: now,
+		}); err != nil {
+			return err
+		}
+		_, err = tx.AppendEvent(ctx, s.event("workload.created", "workload", id, "", map[string]string{"name": req.Name, "node_id": target.ID, "image": req.Image}))
+		return err
 	})
 	switch {
+	case errors.Is(err, scheduler.ErrNoCapacity):
+		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, store.ErrConflict):
 		writeError(w, http.StatusConflict, "a workload with this name already exists")
 	case err != nil:
@@ -290,7 +293,15 @@ func (s *server) createEnrollment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "description must be at most 200 characters")
 		return
 	}
-	created, err := s.store.CreateEnrollment(r.Context(), store.Enrollment{NodeID: req.NodeID, Description: req.Description, CreatedAt: s.now().UTC()})
+	var created store.Enrollment
+	err := s.store.InTx(r.Context(), func(tx store.Tx) error {
+		var err error
+		if created, err = tx.CreateEnrollment(r.Context(), store.Enrollment{NodeID: req.NodeID, Description: req.Description, CreatedAt: s.now().UTC()}); err != nil {
+			return err
+		}
+		_, err = tx.AppendEvent(r.Context(), s.event("enrollment.created", "node", req.NodeID, req.Description, nil))
+		return err
+	})
 	switch {
 	case errors.Is(err, store.ErrConflict):
 		writeError(w, http.StatusConflict, "node is already enrolled")
@@ -327,7 +338,22 @@ func (s *server) getEnrollment(w http.ResponseWriter, r *http.Request) {
 // revokeEnrollment blocks a node from registering. Its running session ends
 // at its next heartbeat. Revoking twice is harmless.
 func (s *server) revokeEnrollment(w http.ResponseWriter, r *http.Request) {
-	e, err := s.store.RevokeEnrollment(r.Context(), r.PathValue("id"), s.now().UTC())
+	var e store.Enrollment
+	err := s.store.InTx(r.Context(), func(tx store.Tx) error {
+		ctx, id := r.Context(), r.PathValue("id")
+		var err error
+		if e, err = tx.GetEnrollment(ctx, id); err != nil {
+			return err
+		}
+		if !e.Active() {
+			return nil // already revoked: nothing changes, so nothing is recorded
+		}
+		if e, err = tx.RevokeEnrollment(ctx, id, s.now().UTC()); err != nil {
+			return err
+		}
+		_, err = tx.AppendEvent(ctx, s.event("enrollment.revoked", "node", id, "", nil))
+		return err
+	})
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "enrollment not found")
@@ -337,6 +363,35 @@ func (s *server) revokeEnrollment(w http.ResponseWriter, r *http.Request) {
 		s.logger.InfoContext(r.Context(), "enrollment revoked", "node_id", e.NodeID)
 		writeJSON(w, http.StatusOK, e)
 	}
+}
+
+// listEvents returns the audit trail, newest first. Query parameters:
+// resource_type, resource_id, before (an event ID, for paging) and limit.
+func (s *server) listEvents(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	f := store.EventFilter{ResourceType: q.Get("resource_type"), ResourceID: q.Get("resource_id")}
+	if raw := q.Get("before"); raw != "" {
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || v < 0 {
+			writeError(w, http.StatusBadRequest, "before must be a non-negative integer")
+			return
+		}
+		f.BeforeID = v
+	}
+	if raw := q.Get("limit"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 1 {
+			writeError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		f.Limit = v
+	}
+	events, err := s.store.ListEvents(r.Context(), f)
+	if err != nil {
+		s.internalError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": events})
 }
 
 func (s *server) listWorkloads(w http.ResponseWriter, r *http.Request) {

@@ -38,9 +38,9 @@ Agents dial the manager; the manager never connects to agents. This keeps nodes 
 - **`cmd/manager`**: loads configuration, opens the store (running migrations for PostgreSQL), binds both listeners, delegates to `internal/manager`. Exits non-zero on startup failure.
 - **`cmd/agent`**: loads configuration, builds the Docker and gRPC clients, runs `internal/agent`.
 - **`internal/manager`**: runs the HTTP and gRPC servers side by side and owns shutdown (below).
-- **`internal/api`**: Go 1.22 `ServeMux` handlers. Request bodies are capped at 1 MiB and decoded strictly (unknown fields rejected). Bearer tokens are compared in constant time. Workload creation lists nodes and workloads, asks the scheduler for a node and stores the result while holding a mutex, so a single manager cannot overcommit a node.
+- **`internal/api`**: Go 1.22 `ServeMux` handlers. Request bodies are capped at 1 MiB and decoded strictly (unknown fields rejected). Bearer tokens are compared in constant time. Workload creation lists nodes and workloads, asks the scheduler for a node, saves the workload and records its audit event in one transaction under a cluster-wide placement lock, so no manager sharing the database can overcommit a node. Administrative changes record events in the same transaction (`GET /v1/events`).
 - **`internal/scheduler`**: pure functions. `Candidates` drops nodes without a recent heartbeat and totals reserved CPU and memory per node; `Place` filters by label selector and free capacity and picks the node with the most free CPU (ties: free memory, then node ID).
-- **`internal/store`**: `Store` interface with PostgreSQL (`pgx` pool, embedded SQL migrations guarded by an advisory lock) and in-memory implementations. Both pass one shared conformance test.
+- **`internal/store`**: small repository interfaces (nodes, enrollments, workloads and their observations, services and revisions, events, leases) combined in `Store`, with `InTx` for transactions. PostgreSQL (`pgx` pool, embedded checksummed migrations guarded by an advisory lock) and in-memory implementations pass one shared conformance suite. Desired and observed state are separate tables with separate writers. See [state.md](state.md).
 - **`internal/protocol`**: `NodeService` (`RegisterNode`, `Heartbeat`, `DeregisterNode`) from `proto/dockfleet/v1/fleet.proto`; protocol version rules; `ProtocolError` details surfaced as `protocol.Error`; a unary interceptor enforcing the agent token and another applying a per-call deadline; a client that attaches the token, refuses plaintext to non-loopback addresses and reconnects with backoff. Optional TLS 1.3. Details in [protocol.md](protocol.md).
 - **`internal/registry`**: the manager-side node registry. `Register` persists the node and starts a session (replacing an older one); `Heartbeat` validates the session, refreshes liveness, applies status reports (writing only changes, ignoring workloads not assigned to the reporting node) and returns the node's complete assignment set; `Deregister` ends the session and backdates the heartbeat. `Register` and every `Heartbeat` also require an active enrollment in the store, so revocation ends a session at its next heartbeat. Sessions are in memory; everything else is in the store.
 - **`internal/netutil`**: `IsLoopbackAddr` and `RequireLoopback`, shared by config validation, the manager and the client.
@@ -53,17 +53,22 @@ Agents dial the manager; the manager never connects to agents. This keeps nodes 
 
 ### Not implemented
 
-Driving the Docker adapter from assignments (the agent does not start workload containers yet and reports them as `pending`), reconciliation of desired versus actual state, workload deletion or rescheduling when a node dies, node removal, per-node identity, leader election or multiple managers (sessions live in one process's memory), metrics.
+Driving the Docker adapter from assignments (the agent does not start workload containers yet and reports them as `pending`), reconciliation of desired versus actual state, workload deletion or rescheduling when a node dies, node removal, per-node identity, running leader election (the lease primitive exists), a controller that turns service definitions into workloads, HTTP endpoints for services, metrics. Agent sessions live in one process's memory, so an agent talks to one manager at a time.
 
 ## Data model
 
-| Table       | Key        | Notes                                                                 |
-| ----------- | ---------- | --------------------------------------------------------------------- |
-| `nodes`     | `id`       | Declared CPU (millicores) and memory, labels (`jsonb`), heartbeat time |
-| `workloads` | `id`       | Unique `name`, resources, `node_id` foreign key, `state`              |
-| `enrollments` | `node_id` | Administrator's permission for a node ID to join; `revoked_at` set on revocation (migration 003) |
+| Table | Key | Kind | Notes |
+| ----- | --- | ---- | ----- |
+| `nodes` | `id` | observed | Declared CPU (millicores) and memory, labels (`jsonb`), heartbeat time |
+| `workload_observations` | `workload_id` | observed | An agent's latest report: phase, message, container ID, exit code, OOM kill, restart count, start/finish times |
+| `enrollments` | `node_id` | desired | Administrator's permission for a node ID to join; `revoked_at` set on revocation |
+| `services` | `id` | desired | Name (unique among live services), desired `replicas`, `current_revision`, optimistic-lock `version`, `deleted_at` |
+| `service_revisions` | `(service_id, revision)` | desired | Immutable spec snapshots (deployment history) |
+| `workloads` | `id` | desired | Placement (`node_id`), unique `name`, resources, `desired_state`, optional service/revision/replica slot |
+| `events` | `id` | audit | Append-only administrative events |
+| `leases` | `name` | coordination | Named leases with fencing tokens for multi-manager duties |
 
-Migrations live in `internal/store/migrations` and are recorded in `schema_migrations`. A workload starts as `scheduled`; agent reports then set `state` (`pending`, `running`, `succeeded`, `failed`, `stopped`) together with `status_message` and `status_updated_at` (migration 002).
+Migrations (001-007) live in `internal/store/migrations`, are recorded with their checksums in `schema_migrations` and are never edited after release. A workload has no observation until its agent reports (`Workload.Phase()` is then `scheduled`); reports set the phase (`pending`, `running`, `succeeded`, `failed`, `stopped`) in `workload_observations` and never touch `workloads`. Details, multi-manager design and the restart guarantee are in [state.md](state.md).
 
 ## Node liveness
 

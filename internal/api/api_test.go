@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -70,7 +71,7 @@ func TestHealthAndReadinessAreOpen(t *testing.T) {
 
 func TestV1RequiresToken(t *testing.T) {
 	h, _ := newTestHandler(t)
-	for _, path := range []string{"/v1/nodes", "/v1/nodes/x", "/v1/workloads", "/v1/workloads/x"} {
+	for _, path := range []string{"/v1/nodes", "/v1/nodes/x", "/v1/workloads", "/v1/workloads/x", "/v1/events"} {
 		rec := do(h, http.MethodGet, path, "", false)
 		if rec.Code != http.StatusUnauthorized || rec.Header().Get("WWW-Authenticate") != "Bearer" {
 			t.Errorf("GET %s without token = %d, want 401 with challenge", path, rec.Code)
@@ -130,8 +131,12 @@ func TestCreateWorkloadSchedulesOnReadyNode(t *testing.T) {
 	}
 	var created store.Workload
 	decode(t, rec, &created)
-	if created.NodeID != "large" || created.State != store.WorkloadScheduled || created.ID == "" {
+	if created.NodeID != "large" || created.DesiredState != store.DesiredRunning || created.Phase() != store.WorkloadScheduled || created.Observed != nil || created.ID == "" {
 		t.Fatalf("unexpected workload: %+v", created)
+	}
+	// Desired and observed state are separate fields in the API too.
+	if body := rec.Body.String(); !strings.Contains(body, `"desired_state":"running"`) || !strings.Contains(body, `"observed":null`) {
+		t.Errorf("response should carry desired_state and an empty observed: %s", body)
 	}
 	if loc := rec.Header().Get("Location"); loc != "/v1/workloads/"+created.ID {
 		t.Errorf("Location = %q", loc)
@@ -297,6 +302,118 @@ func TestEnrollmentValidationAndUnknownNodes(t *testing.T) {
 	}
 	if rec := do(h, http.MethodDelete, "/v1/enrollments/ghost", "", false); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated revoke = %d, want 401", rec.Code)
+	}
+}
+
+type eventList struct {
+	Events []store.Event `json:"events"`
+}
+
+func TestAdministrativeActionsAreRecordedAsEvents(t *testing.T) {
+	h, st := newTestHandler(t)
+	addNode(t, st, "n", 4000, fixedNow, nil)
+
+	do(h, http.MethodPost, "/v1/enrollments", `{"node_id":"worker-1","description":"rack 4"}`, true)
+	created := do(h, http.MethodPost, "/v1/workloads", `{"name":"web","image":"nginx","cpu_millis":1,"memory_bytes":1}`, true)
+	var wl store.Workload
+	decode(t, created, &wl)
+	do(h, http.MethodDelete, "/v1/enrollments/worker-1", "", true)
+	do(h, http.MethodDelete, "/v1/enrollments/worker-1", "", true) // revoking again changes nothing
+
+	var all eventList
+	decode(t, do(h, http.MethodGet, "/v1/events", "", true), &all)
+	var actions []string
+	for _, e := range all.Events {
+		actions = append(actions, e.Action)
+		if e.Actor != "admin" || e.At.IsZero() {
+			t.Errorf("event lacks its actor or time: %+v", e)
+		}
+	}
+	want := []string{"enrollment.revoked", "workload.created", "enrollment.created"} // newest first
+	if strings.Join(actions, ",") != strings.Join(want, ",") {
+		t.Fatalf("actions = %v, want %v (a repeated revocation must not be recorded twice)", actions, want)
+	}
+	if all.Events[1].ResourceType != "workload" || all.Events[1].ResourceID != wl.ID || all.Events[1].Details["node_id"] != "n" {
+		t.Errorf("workload event = %+v", all.Events[1])
+	}
+
+	var one eventList
+	decode(t, do(h, http.MethodGet, "/v1/events?resource_type=node&resource_id=worker-1&limit=1", "", true), &one)
+	if len(one.Events) != 1 || one.Events[0].Action != "enrollment.revoked" {
+		t.Fatalf("filtered events = %+v", one.Events)
+	}
+	var older eventList
+	decode(t, do(h, http.MethodGet, "/v1/events?resource_type=node&before="+strconv.FormatInt(one.Events[0].ID, 10), "", true), &older)
+	if len(older.Events) != 1 || older.Events[0].Action != "enrollment.created" {
+		t.Fatalf("events before the newest = %+v", older.Events)
+	}
+
+	for _, query := range []string{"limit=0", "limit=x", "before=-1", "before=x"} {
+		if rec := do(h, http.MethodGet, "/v1/events?"+query, "", true); rec.Code != http.StatusBadRequest {
+			t.Errorf("GET /v1/events?%s = %d, want 400", query, rec.Code)
+		}
+	}
+}
+
+func TestRefusedRequestsLeaveNoEvents(t *testing.T) {
+	h, st := newTestHandler(t)
+	addNode(t, st, "n", 1000, fixedNow, nil)
+	do(h, http.MethodPost, "/v1/enrollments", `{"node_id":"worker-1"}`, true)
+	// A duplicate enrollment, a workload that fits nowhere, and an unknown revocation.
+	do(h, http.MethodPost, "/v1/enrollments", `{"node_id":"worker-1"}`, true)
+	do(h, http.MethodPost, "/v1/workloads", `{"name":"big","image":"x","cpu_millis":9000,"memory_bytes":1}`, true)
+	do(h, http.MethodDelete, "/v1/enrollments/ghost", "", true)
+
+	events, err := st.ListEvents(context.Background(), store.EventFilter{})
+	if err != nil || len(events) != 1 || events[0].Action != "enrollment.created" {
+		t.Fatalf("events = %+v, %v; only the one successful change may be recorded", events, err)
+	}
+}
+
+func TestPlacementAccountsForDesiredNotObservedState(t *testing.T) {
+	h, st := newTestHandler(t)
+	ctx := context.Background()
+	addNode(t, st, "only", 1000, fixedNow, nil)
+	body := func(name string) string {
+		return `{"name":"` + name + `","image":"x","cpu_millis":800,"memory_bytes":1024}`
+	}
+	rec := do(h, http.MethodPost, "/v1/workloads", body("one"), true)
+	var first store.Workload
+	decode(t, rec, &first)
+
+	// Observed failure does not free the capacity the workload is meant to have...
+	if err := st.RecordObservations(ctx, "only", []store.Observation{{WorkloadID: first.ID, State: store.WorkloadFailed, ObservedAt: fixedNow}}); err != nil {
+		t.Fatal(err)
+	}
+	if rec := do(h, http.MethodPost, "/v1/workloads", body("two"), true); rec.Code != http.StatusConflict {
+		t.Fatalf("second = %d, want 409: a failed container is still desired to run", rec.Code)
+	}
+	// ...but asking for it to be stopped does.
+	if _, err := st.SetWorkloadDesiredState(ctx, first.ID, store.DesiredStopped, fixedNow); err != nil {
+		t.Fatal(err)
+	}
+	if rec := do(h, http.MethodPost, "/v1/workloads", body("two"), true); rec.Code != http.StatusCreated {
+		t.Fatalf("second after stopping the first = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestWorkloadResponsesShowObservedStateSeparately(t *testing.T) {
+	h, st := newTestHandler(t)
+	addNode(t, st, "n", 4000, fixedNow, nil)
+	var wl store.Workload
+	decode(t, do(h, http.MethodPost, "/v1/workloads", `{"name":"web","image":"x","cpu_millis":1,"memory_bytes":1}`, true), &wl)
+	exit := 137
+	if err := st.RecordObservations(context.Background(), "n", []store.Observation{{
+		WorkloadID: wl.ID, State: store.WorkloadFailed, Message: "oom", ExitCode: &exit, OOMKilled: true, ObservedAt: fixedNow,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var got store.Workload
+	decode(t, do(h, http.MethodGet, "/v1/workloads/"+wl.ID, "", true), &got)
+	if got.DesiredState != store.DesiredRunning || got.Observed == nil || got.Observed.State != store.WorkloadFailed ||
+		got.Observed.ExitCode == nil || *got.Observed.ExitCode != 137 || !got.Observed.OOMKilled || got.Phase() != store.WorkloadFailed {
+		t.Fatalf("workload = %+v / %+v", got, got.Observed)
 	}
 }
 

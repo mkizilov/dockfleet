@@ -102,7 +102,7 @@ func TestRegisterHeartbeatDeregister(t *testing.T) {
 		t.Fatalf("stored node = %+v, %v", n, err)
 	}
 
-	_, err = env.store.CreateWorkload(ctx, store.Workload{ID: "w1", Name: "web", Image: "nginx", CPUMillis: 100, MemoryBytes: 1 << 20, NodeID: "node-1", State: store.WorkloadScheduled, CreatedAt: time.Now()})
+	_, err = env.store.CreateWorkload(ctx, store.Workload{ID: "w1", Name: "web", Image: "nginx", CPUMillis: 100, MemoryBytes: 1 << 20, NodeID: "node-1", CreatedAt: time.Now()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,8 +115,11 @@ func TestRegisterHeartbeatDeregister(t *testing.T) {
 		t.Fatalf("assignments = %v", assigned)
 	}
 	w, _ := env.store.GetWorkload(ctx, "w1")
-	if w.State != store.WorkloadRunning || w.StatusMessage != "up" {
-		t.Fatalf("status report was not recorded: %+v", w)
+	if w.Observed == nil || w.Observed.State != store.WorkloadRunning || w.Observed.Message != "up" || w.Observed.NodeID != "node-1" {
+		t.Fatalf("status report was not recorded as an observation: %+v", w.Observed)
+	}
+	if w.DesiredState != store.DesiredRunning {
+		t.Fatalf("a status report must not change the desired state: %+v", w)
 	}
 
 	if err := c.Deregister(ctx, "node-1", session.ID); err != nil {

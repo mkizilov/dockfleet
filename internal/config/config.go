@@ -25,6 +25,10 @@ type Getenv func(string) string
 // Manager is the manager process configuration. Secrets (tokens, database
 // URL) must never be logged.
 type Manager struct {
+	// InstanceID names this manager process in audit events and leases, so
+	// several managers can share one database. It is unique per process
+	// unless set.
+	InstanceID        string
 	LogLevel          string
 	LogFormat         string
 	APIAddr           string
@@ -88,6 +92,10 @@ func LoadManager(get Getenv) (Manager, error) {
 	fail := func(format string, args ...any) { errs = append(errs, fmt.Errorf(format, args...)) }
 
 	var c Manager
+	c.InstanceID = env(get, "DOCKFLEET_INSTANCE_ID", "manager-"+store.NewID()[:8])
+	if !store.ValidName(c.InstanceID) {
+		fail("DOCKFLEET_INSTANCE_ID %q is invalid; use 1-63 characters of [A-Za-z0-9._-] starting with a letter or digit", c.InstanceID)
+	}
 	c.LogLevel = env(get, "DOCKFLEET_LOG_LEVEL", "info")
 	c.LogFormat = env(get, "DOCKFLEET_LOG_FORMAT", "json")
 	c.APIAddr = env(get, "DOCKFLEET_API_ADDR", "127.0.0.1:21280")

@@ -1,6 +1,6 @@
 # DockFleet
 
-DockFleet is a distributed container orchestration system written in Go. A central **manager** keeps cluster state in PostgreSQL and places workloads; **agents** on worker nodes register with the manager, heartbeat, receive their assigned workloads and report status.
+DockFleet is a distributed container orchestration system written in Go. A central **manager** keeps cluster state in PostgreSQL (desired and observed state kept apart) and places workloads; **agents** on worker nodes register with the manager, heartbeat, receive their assigned workloads and report status.
 
 > **Status: early.** The manager-agent gRPC protocol (versioned registration, heartbeats, assignments, status reports) works end to end over mutual TLS with explicit node enrollment, and both processes shut down gracefully. The manager records placement decisions, but **no containers are created, started or stopped yet**: agents acknowledge assignments as `pending`. See [Limitations](#limitations).
 
@@ -14,7 +14,7 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 | `internal/api`       | Administrative HTTP API (nodes, workloads, health)                      |
 | `internal/scheduler` | Workload placement (pure functions, no I/O)                             |
 | `internal/agent`     | Node logic: register, heartbeat, retry, re-register                     |
-| `internal/store`     | Persistence: `Store` interface, PostgreSQL and in-memory implementations |
+| `internal/store`     | Persistence: repository interfaces, transactions, versioned migrations; PostgreSQL and in-memory implementations ([docs/state.md](docs/state.md)) |
 | `internal/protocol`  | gRPC service, client, versioning, errors, bearer-token auth, TLS helpers |
 | `internal/registry`  | Manager-side node registry: sessions, heartbeats, status reports        |
 | `internal/pki`       | CA, certificates, node identity, validation, reloading TLS configs      |
@@ -27,7 +27,7 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 | `proto/`             | Protobuf definitions (`buf` module)                                     |
 | `deploy/`            | Docker Compose file for development dependencies                        |
 | `config/dev.env`     | Development-only configuration                                          |
-| `docs/`              | [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), [Mutual TLS and enrollment](docs/mtls.md), [Docker adapter](docs/docker.md) |
+| `docs/`              | [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), [Mutual TLS and enrollment](docs/mtls.md), [Docker adapter](docs/docker.md), [Control-plane state](docs/state.md) |
 
 ## Prerequisites
 
@@ -86,15 +86,16 @@ Administrators distributing real credentials should read [docs/mtls.md](docs/mtl
 | `GET /readyz`             | no   | Readiness (store reachable)                                         |
 | `GET /v1/nodes`           | yes  | Registered nodes with `ready` / `not_ready` status                  |
 | `GET /v1/nodes/{id}`      | yes  | One node                                                            |
-| `POST /v1/workloads`      | yes  | Choose a node for a workload and record it as `scheduled`          |
-| `GET /v1/workloads`       | yes  | All workloads                                                       |
+| `POST /v1/workloads`      | yes  | Choose a node for a workload (desired state `running`); nothing is observed until its agent reports |
+| `GET /v1/workloads`       | yes  | All workloads, each with its desired state and its `observed` report |
 | `GET /v1/workloads/{id}`  | yes  | One workload                                                        |
+| `GET /v1/events`          | yes  | Audit trail, newest first (`resource_type`, `resource_id`, `before`, `limit`) |
 | `POST /v1/enrollments`    | yes  | Enroll a node ID (`{"node_id":"...","description":"..."}`); `409` if already enrolled |
 | `GET /v1/enrollments`     | yes  | All enrollments                                                     |
 | `GET /v1/enrollments/{id}` | yes | One enrollment                                                      |
 | `DELETE /v1/enrollments/{id}` | yes | Revoke an enrollment; the node's session ends at its next heartbeat |
 
-Errors are `{"error": "..."}`. A workload request that fits on no ready node returns `409`. Once the target node's agent reports on a workload, its `state` changes from `scheduled` to the reported state (`pending`, `running`, `succeeded`, `failed`, `stopped`) and `status_message` / `status_updated_at` are filled in.
+Errors are `{"error": "..."}`. A workload request that fits on no ready node returns `409`. A workload shows what was asked for (`desired_state`, `node_id`, ...) and, separately, what its agent reported (`observed`, `null` until the first report: `state` is one of `pending`, `running`, `succeeded`, `failed`, `stopped`, plus message, container ID, exit code, OOM kill, restart count and times). The two are never mixed: a report never changes what is wanted. See [docs/state.md](docs/state.md).
 
 ## Manager-agent protocol
 
@@ -121,7 +122,8 @@ All settings are environment variables. The manager and agent refuse to start on
 | `DOCKFLEET_API_TOKEN`            | manager | **required**                 | Admin bearer token, at least 16 characters                 |
 | `DOCKFLEET_AGENT_TOKEN`          | both    | required without TLS         | Plaintext loopback development only; at least 16 characters, differs from the API token |
 | `DOCKFLEET_STORE`                | manager | `postgres`                   | `postgres` or `memory` (state lost on exit)                |
-| `DOCKFLEET_DATABASE_URL`         | manager | required for `postgres`      | Migrations run at startup                                  |
+| `DOCKFLEET_DATABASE_URL`         | manager | required for `postgres`      | Migrations run at startup (safe with several managers starting at once) |
+| `DOCKFLEET_INSTANCE_ID`          | manager | `manager-<random>`           | Names this manager in audit events and leases; set it for a stable identity |
 | `DOCKFLEET_TLS_CERT_FILE`, `DOCKFLEET_TLS_KEY_FILE`, `DOCKFLEET_TLS_CLIENT_CA_FILE` | manager | unset | Set all three to enable TLS 1.3: HTTPS admin API and mutual TLS for agents (`DOCKFLEET_AGENT_TOKEN` is then ignored) |
 | `DOCKFLEET_HEARTBEAT_INTERVAL`   | manager | `10s`                        | Sent to agents on registration                             |
 | `DOCKFLEET_NODE_TTL`             | manager | `30s`                        | Node is `not_ready` after this long without a heartbeat; at least 2x the interval |
@@ -149,15 +151,16 @@ make test-integration   # PostgreSQL store tests; needs `make compose-up`
 make test-docker        # Docker Engine tests; needs DOCKFLEET_TEST_DOCKER_HOST
 ```
 
-Unit tests need no Docker, database or network. `internal/integration` runs real agent loops against a real manager over gRPC on an in-memory transport (registration, heartbeats, assignments and status reports, manager restart and reconnection, long outages, graceful deregistration, superseded sessions, incompatible protocol versions, bad credentials) and over real TLS handshakes: trusted nodes, untrusted client and server certificates, wrong server names, wrong node identity, expired and not-yet-valid certificates, certificates expiring on an open connection, missing client certificates, unenrolled and revoked nodes, certificate renewal, and the absence of any plaintext fallback. Other network-style tests use `bufconn`, fake HTTP round-trippers, or loopback ports 21290-21295 (`internal/manager`). PostgreSQL tests are behind the `integration` build tag and read `DOCKFLEET_TEST_DATABASE_URL`.
+Unit tests need no Docker, database or network. `internal/integration` runs real agent loops against a real manager over gRPC on an in-memory transport (registration, heartbeats, assignments and status reports, manager restart and reconnection, long outages, graceful deregistration, superseded sessions, incompatible protocol versions, bad credentials) and over real TLS handshakes: trusted nodes, untrusted client and server certificates, wrong server names, wrong node identity, expired and not-yet-valid certificates, certificates expiring on an open connection, missing client certificates, unenrolled and revoked nodes, certificate renewal, and the absence of any plaintext fallback. Other network-style tests use `bufconn`, fake HTTP round-trippers, or loopback ports 21290-21295 (`internal/manager`). PostgreSQL tests are behind the `integration` build tag and read `DOCKFLEET_TEST_DATABASE_URL`: they create and drop a throwaway database per test on that server, so no data is shared or touched (migrations, upgrade from the previous schema, restart persistence, two managers on one database, constraints and index use; see [docs/state.md](docs/state.md)).
 
 Generated protobuf code is not committed, so run `make generate` after a fresh clone and `make proto` after editing `proto/`.
 
 ## Limitations
 
 - The Docker adapter (create, start, stop, remove, inspect, logs, stats) is implemented and tested, but the agent does not use it to run assigned workloads yet, so agents still report them `pending` and nothing reconciles failures. Workload assignments carry no ports, mounts or environment yet.
-- Sessions are held in manager memory (one manager only); two agents configured with the same node ID will keep superseding each other.
-- Scheduling is a single-manager spread strategy; a lock serializes placement in one process only.
+- Sessions are held in manager memory: an agent talks to one manager at a time and registers again if that manager forgets it. Two agents configured with the same node ID will keep superseding each other.
+- The database is ready for several managers (placement lock, optimistic versions, leases, migration lock), but no leader election runs yet and nothing reconciles service definitions into workloads; services, replica counts and deployment revisions are stored and tested, with no HTTP endpoints yet.
+- Scheduling is a spread strategy that places one workload per request.
 - Node capacity is declared by the agent, not measured.
 - Registered nodes are never deleted; dead nodes stay listed as `not_ready`.
 - The admin API is authenticated by one shared bearer token (over HTTPS when TLS is configured). Certificate revocation is by enrollment only (no CRL/OCSP), and the development CA is not a production PKI.
