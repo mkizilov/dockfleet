@@ -1,20 +1,18 @@
-# DockFleet: project boundaries and working agreement
+# DockFleet: repository working agreement
 
-- Work only in `/Users/mk-rune/test_projects/03-dockfleet`. This is one of fourteen independent repositories.
-- Do not read, modify, clean up, or run commands in sibling repositories or the user's configuration.
-- Work autonomously: choose sensible defaults and document assumptions; do not ask questions or delegate.
-- Never install anything globally or use sudo, Homebrew, launchd, host credentials, or host Docker sockets.
-- Dependencies, toolchains, caches, browser binaries, SDKs, temporary files and test data stay in this repository. Preserve the supplied project-local environment. Python packages go in `.venv`.
-- `.agent-local/` is ignored, project-local build/runtime state. `.opencode/` is managed orchestration configuration; do not change or remove it or bypass the sandbox.
-- Use existing system tools read-only, or install pinned tools under this repository. Do not change shell profiles, user settings, Keychain, or global Git settings.
-- Bind test servers to loopback; use ports 21200–21299. Limit build/test workers to two unless a required benchmark explicitly needs more.
-- Docker-dependent integration tests must remain reproducible but be reported as unverified here if they require access outside this repository. Do not bypass this boundary.
-- Do not touch attached hardware, enroll services, flash firmware, install agents, or alter OS settings. Supply manual checklists for such steps.
-- Implement only the current numbered prompt, preserving prior behavior. Run appropriate checks, fix failures, and report genuine limitations without fabricating test or benchmark results.
-- Before finishing every numbered turn: stop its servers/watchers, remove scratch outputs, update relevant documentation, and make a local conventional-commit Git commit. Do not push.
-- End each turn with a short summary of changes, checks actually run, remaining limitations, and commit hash. The orchestrator will provide the next prompt only after this turn ends.
+How to work in this repository. The rules are about the repository and the safety of the machine it is built on, not about any one task.
 
-Extend this file with the project's language-specific architecture and verification commands while retaining these boundaries.
+## Boundaries
+
+- Work inside this repository only. Do not read, modify or run commands in other repositories or in user-level configuration.
+- Keep every tool, dependency, cache, toolchain, temporary file and piece of test data inside the repository: pinned tools under `.tools/`, local state under `.agent-local/` (both git-ignored), Python packages in `.venv`. Use existing system tools read-only, or install pinned tools under this repository.
+- Never install anything globally. Do not use sudo, Homebrew, launchd, host credentials or the host's Docker socket, and do not change shell profiles, user settings, the keychain, global Git settings or operating-system settings.
+- Bind test servers to loopback and use ports 21200–21299 only (the allocation is listed under Test coverage). Limit build and test workers to two (`GOFLAGS=-p=2`).
+- Docker-dependent tests must stay reproducible, and are reported as unverified when they cannot run where you are working. Never run them against the host's own Docker.
+- Choose sensible defaults and document the assumption instead of stopping for small decisions.
+- Implement what was asked, keep earlier behavior, run the checks below, fix failures rather than weakening tests, and report real limitations without inventing test or benchmark results.
+- Before finishing a piece of work: stop the servers and watchers you started, remove scratch output, update the documentation the change touches, and commit with a conventional-commit message. Do not push unless asked to.
+- Report what changed, the checks actually run and their results, what is unverified or limited, and the commit hash.
 
 ## Project: DockFleet (Go)
 
@@ -50,12 +48,13 @@ DockFleet is a distributed container orchestration system: a manager (control pl
 - Database changes are new numbered files in `internal/store/migrations/` (`NNN_description.sql`, no gaps); never edit a released migration (checksums are recorded and `TestReleasedMigrationsAreUnchanged` pins them). Add new migrations to the list in `docs/state.md`.
 - Keep desired state (what an administrator asked for) and observed state (what agents reported) apart: separate tables, separate writers, separate fields. Observations are written only through `RecordObservations`; intent is never derived from a report. Anything that must be consistent across several writes goes in one `InTx`; placement takes `Tx.LockPlacement`; concurrent edits of a service use its version (`ErrVersionConflict`). Nothing may keep cluster state only in process memory, because several managers may share the database.
 - Public behavior changes (API routes, env vars, RPCs, schema) update `README.md` and `docs/architecture.md` in the same change.
+- `docs/verification.md` is the one place that says what is implemented, verified, partial and unverified. Change a row only with the command and the result that justify it, and never write "verified" for something that did not run. `ROADMAP.md` lists the known gaps in priority order; take a step out only when its acceptance criteria are met. `deploy/roadmap_test.go` and `deploy/docs_test.go` keep the roadmap's arithmetic and every relative link and anchor in the documents honest.
 
 ### Test coverage
 
 - Every new package or behavior ships with tests in the same change; bug fixes include a regression test that fails without the fix.
 - Test through interfaces with fakes. Use `bufconn` for gRPC and `httptest` recorders or fake `http.RoundTripper`s for HTTP and Docker; open a real socket only when the test is about the socket, and then only on `127.0.0.1` in ports 21200–21299 (currently 21288–21295 and 21298–21299 in `internal/manager`; 21240–21259 for the servers tests start with `internal/testnet` (also `etcdfake.Listen`); 21260–21269 for the managers of the multi-manager tests in `internal/integration` (two ports each), which otherwise use an in-memory transport; 21270–21279 for `internal/e2e` (managers 21270–21273, agent health endpoints 21274–21276, a cuttable proxy 21277, etcd 21278–21279) and 21236 for the PostgreSQL it starts, 21279 for one refusal test; 21234 for `make etcd-test-up`). Use `t.TempDir()` for files.
-- Tests must not need Docker, a database or the internet. PostgreSQL tests are tagged `integration` and read `DOCKFLEET_TEST_DATABASE_URL` (a server whose role may `CREATE DATABASE`; every test makes and drops its own database and never writes to the one in the URL); Docker daemon tests are tagged `dockerintegration` and read `DOCKFLEET_TEST_DOCKER_HOST` (never run against the host's Docker from this development sandbox); both stores must keep passing `runStoreConformance`.
+- Tests must not need Docker, a database or the internet. PostgreSQL tests are tagged `integration` and read `DOCKFLEET_TEST_DATABASE_URL` (a server whose role may `CREATE DATABASE`; every test makes and drops its own database and never writes to the one in the URL); Docker daemon tests are tagged `dockerintegration` and read `DOCKFLEET_TEST_DOCKER_HOST` (never against the host's own Docker; `make docker-test-up` starts a disposable daemon); both stores must keep passing `runStoreConformance`.
 - Tests must be deterministic: no fixed sleeps as synchronization (poll with a deadline), injected clocks where time matters, and `-race` clean.
 - Cover failure paths (bad input, auth failure, dependency errors, cancellation), not only success.
 
@@ -71,12 +70,12 @@ DockFleet is a distributed container orchestration system: a manager (control pl
 - Bind to loopback by default; a non-loopback bind requires TLS, and TLS on the agent listener means mutual TLS with a verified, identity-bound, enrolled client. Never add a plaintext fallback or a TLS mode without client certificates. Tokens are never defaulted, logged, echoed in errors or committed. The only credentials in the repository are the labeled throwaway tokens in `config/dev.env`.
 - Private keys and certificates for development live in the git-ignored `.dev-pki/` (`make dev-pki`), are written owner-only and are never printed, logged or committed; `make check-secrets` (part of `make check`) must pass. Test keys are generated in memory or `t.TempDir()`.
 - Validate all external input (HTTP, gRPC, env, files) at the boundary and bound its size. Compare secrets in constant time. Use parameterized SQL only.
-- Never expose the Docker Engine API over non-loopback TCP. Do not mount or use the host Docker socket from this development environment; Docker-dependent steps are written but reported as unverified here.
+- Never expose the Docker Engine API over non-loopback TCP. Do not mount or use the host's Docker socket from development or test code; use the disposable daemon. Docker-dependent steps that cannot run are reported as unverified.
 - Do not log secrets, tokens, database URLs or request bodies.
 
 ### Verification commands
 
-Run from the repository root with the Go release `go.mod` names (1.26.10 or newer on the 1.26 line), installed under this repository (for example in `.tools/` or `.agent-local/`) when working in the sandbox.
+Run from the repository root with the Go release `go.mod` names (1.26.10 or newer on the 1.26 line), installed under this repository (for example in `.tools/` or `.agent-local/`).
 
 ```sh
 make generate           # pinned buf + protoc plugins into .tools/bin, lint, generate code (needs network once)
@@ -90,7 +89,7 @@ make docker-test-up     # a disposable Docker daemon on 127.0.0.1:21297 for thos
 make test-etcd          # the election client and the managers' election against a real etcd; needs DOCKFLEET_TEST_ETCD_ENDPOINTS (`make etcd-test-up` starts a disposable etcd on 127.0.0.1:21234; make etcd-test-down removes it)
 make test-e2e           # the real binaries over mutual TLS with PostgreSQL and etcd, failures injected (build tag e2e); starts its own PostgreSQL and etcd from .tools/ or DOCKFLEET_E2E_POSTGRES_BIN / DOCKFLEET_E2E_ETCD_BIN, or uses DOCKFLEET_TEST_DATABASE_URL / DOCKFLEET_TEST_ETCD_ENDPOINTS
 make tidy-check cross-build   # go.mod/go.sum are tidy; the released platforms compile
-make docker-build       # the manager and agent images (needs a Docker daemon: not run in the sandbox)
+make docker-build       # the manager and agent images (needs a Docker daemon)
 make vuln               # govulncheck through scripts/vuln-check.sh (needs network)
 ```
 
@@ -101,6 +100,6 @@ At most two build/test workers (`GOFLAGS=-p=2`).
 ### Verification reporting
 
 - Report only checks you actually ran, with the command and its real result (pass/fail, counts). Never paste or invent output you did not see.
-- State what could not be run and why (no toolchain, no network, Docker not reachable from the sandbox) and mark those items **unverified**. A change is not "tested" if its tests did not execute.
+- State what could not be run and why (no toolchain, no network, no Docker daemon, no Linux host) and mark those items **unverified**. A change is not "tested" if its tests did not execute.
 - Report failures you could not fix, flaky tests, skipped tests and known gaps instead of weakening tests to pass.
-- End every task with: summary of changes, checks run and results, unverified items and limitations, commit hash.
+- A report ends with: summary of changes, checks run and results, unverified items and limitations, commit hash.

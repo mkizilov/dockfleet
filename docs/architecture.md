@@ -66,7 +66,9 @@ The manager above is one process, and that is how it runs by default. Optionally
 
 ### Not implemented
 
-Rescheduling a replica whose container failed beyond its restart limit, deleting a node that is gone for good (its stopped workloads stay on record), fencing a crashed agent's containers, per-service fencing, node removal, per-node identity, automatic failback (whoever wins the next election leads). Agent sessions live in one process's memory, so an agent talks to one manager at a time, the leader in a cluster of managers; the limits of leader election, partitions included, are in [high-availability.md](high-availability.md#remaining-limitations-partitions-included).
+Known gaps, each with a step in [ROADMAP.md](../ROADMAP.md): measured CPU and memory use (resources are declared and reserved, not measured); replacing a replica whose container failed beyond its restart limit, and noticing a node that fails every container; removing a node that is gone for good (its stopped workloads stay on record) and pruning old audit events; keeping an agent's highest epoch and restart counts across its restarts; per-user access control and a secret store (one shared admin token, environment values in plain text); an image and user policy; measurements above three nodes; and the verification, against a real Docker daemon and on Linux, of what has so far only run against an in-memory engine ([verification.md](verification.md)).
+
+Not possible by design: a crashed agent *process* cannot stop its own containers, so only a live agent with a lapsed lease can fence itself. Agent sessions live in one process's memory, so an agent talks to one manager at a time, the leader in a cluster of managers; the limits of leader election, partitions included, are in [high-availability.md](high-availability.md#remaining-limitations-partitions-included). There is no automatic failback (whoever wins the next election leads), and per-service fencing is not configurable. Deliberately absent, because DockFleet is smaller than Kubernetes on purpose: pods, an overlay network, service discovery, autoscaling ([limitations.md](limitations.md)).
 
 ## Data model
 
@@ -139,7 +141,9 @@ The short version; the table and the reasons are in [limitations.md](limitations
 - **A security policy that cannot be loosened per service**: no privileged containers, all capabilities dropped, no host namespaces, no Docker socket or system path mounts, mandatory limits.
 - **Not benchmarked at scale.** The tests use up to three nodes.
 
-## Extension points for the next stages
+## Extension points
+
+The prioritized plan for what to build and fix next is [ROADMAP.md](../ROADMAP.md). Ideas that are not steps of it, and the design hooks that already exist:
 
 - Assignment delivery and status reporting already ride on `Heartbeat`; if latency matters, add a server-streaming `Watch` RPC next to it and bump the protocol minor version.
 - Measured usage: the adapter can already sample `Stats`; the runner does not report it yet, so the metrics and the dashboard show what is promised to workloads (their declared limits), not what they use.

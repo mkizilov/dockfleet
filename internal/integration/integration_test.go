@@ -228,10 +228,18 @@ func nodeInfo(id string) protocol.NodeInfo {
 // in-memory Docker engine.
 type simAgent struct {
 	t      *testing.T
+	agent  *agent.Agent
 	cancel context.CancelFunc
 	exited chan struct{}
 	result error
 	engine *dockerfake.Fake
+}
+
+// registered reports whether the agent itself holds a session. The manager has
+// one a moment earlier, as soon as it has handled the request; an agent that is
+// stopped in between has not yet been told its session ID and cannot end it.
+func (s *simAgent) registered() bool {
+	return s.agent.Readiness(context.Background()).Registered
 }
 
 func (m *manager) startAgent(id string, mutate func(*protocol.ClientConfig)) *simAgent {
@@ -266,7 +274,7 @@ func (m *manager) runAgent(rt docker.Runtime, id string, mutate func(*protocol.C
 		BackoffMax:       4 * m.backoff,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &simAgent{t: m.t, cancel: cancel, exited: make(chan struct{})}
+	s := &simAgent{t: m.t, agent: a, cancel: cancel, exited: make(chan struct{})}
 	go func() {
 		s.result = a.Run(ctx)
 		close(s.exited)
@@ -599,7 +607,7 @@ func TestCleanShutdownDeregistersNode(t *testing.T) {
 	m := newManager(t, nil)
 	m.start()
 	a := m.startAgent("sim-1", nil)
-	waitFor(t, "registration", func() bool { return m.sessionID("sim-1") != "" })
+	waitFor(t, "the agent to hold its session", func() bool { return m.sessionID("sim-1") != "" && a.registered() })
 
 	if err := a.stop(); err != nil {
 		t.Fatalf("Run returned %v after a requested shutdown, want nil", err)

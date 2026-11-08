@@ -64,4 +64,4 @@ A way to think about it: DockFleet takes the part of Kubernetes that most small 
 
 ## What has and has not been verified
 
-See [deployment.md](deployment.md#what-has-and-has-not-been-verified) for the list: what ran (the binaries end to end over mutual TLS with PostgreSQL and etcd, with failures injected; the unit, PostgreSQL and etcd suites) and what is written but was not run in the environment this was built in (the container images, Compose, systemd units, the CI workflow, the Docker-daemon tests, a multi-member etcd, more than a few nodes, Linux itself).
+[verification.md](verification.md) has the matrix and the commands behind it, and [ROADMAP.md](../ROADMAP.md) the plan for the gaps. [deployment.md](deployment.md#what-has-and-has-not-been-verified) has the short list: what ran (the binaries end to end over mutual TLS with PostgreSQL and etcd, with failures injected; the unit, PostgreSQL and etcd suites) and what is written but was not run in the environment this was built in (the container images, Compose, systemd units, the CI workflow, the Docker-daemon tests, a multi-member etcd, more than a few nodes, Linux itself).

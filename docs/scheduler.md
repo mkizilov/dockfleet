@@ -6,7 +6,7 @@ The scheduler decides which node runs each replica of a service. It decides and 
 | ------- | --- | ------- |
 | `internal/scheduler` | Decide where replicas go, or why they cannot go anywhere | Nothing: a function of a snapshot |
 | `internal/placement` | Read the cluster, ask the scheduler, save the answer | The store |
-| `internal/agent`, `internal/docker` | Run the containers (not yet implemented for workloads) | The node's Docker Engine |
+| `internal/agent`, `internal/docker` | Run the containers the manager assigned ([reconciliation.md](reconciliation.md)) | The node's Docker Engine |
 
 `TestSchedulerStaysPure` pins the scheduler's imports to a short list (standard library and the store's data types) and fails if it reads the clock. `TestManagerSideNeverImportsDocker` keeps Docker out of everything the manager is built from, `internal/placement` included.
 

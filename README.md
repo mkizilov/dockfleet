@@ -2,7 +2,19 @@
 
 DockFleet is a distributed container orchestration system written in Go. A central **manager** keeps cluster state in PostgreSQL (desired and observed state kept apart) and schedules workloads onto nodes by their free CPU and memory; **agents** on worker nodes register with the manager, heartbeat, receive their assigned workloads, run them as Docker containers and report status.
 
-> **Status: early.** The manager-agent gRPC protocol (versioned registration, heartbeats, assignments, status reports) works end to end over mutual TLS with explicit node enrollment, and both processes shut down gracefully. A service definition now becomes running containers: the scheduler assigns its replicas to nodes, the reconciler retires the ones that should go (scale down, deletion, rollouts), and agents create, start, stop and remove the containers they are told about, restarting them per policy and reporting back. A change of spec is a rolling deployment ([docs/rollouts.md](docs/rollouts.md)): replicas of the new revision are created a few at a time within the service's `rollout` policy (`max_surge` extra replicas, `max_unavailable` missing ones), a replica counts as ready only when it runs and its health check passes, a rollout that has no room or no ready replacement waits and says why instead of breaking its policy, one that makes no progress for its deadline is reported failed, and it can be paused, resumed and rolled back. Replica counts are changed through the API: new replicas are created where there is room, a scale-down stops the replicas doing the least good (failed, unhealthy, on a quiet node) and keeps the healthy ones untouched, and `GET /v1/services/{name}/scale` reports the progress. Failures are handled too: containers are restarted with a growing wait and a limit, and when their health check fails; a node that goes quiet is first doubted (`suspect`) and then given up on (`unavailable`), its replicas are started on other nodes, and a lease and workload generations keep the old and the new copy from both being in charge; every step is visible in the API. The whole loop is tested against in-memory Docker engines; the tests against a real Docker daemon exist but need one ([docs/docker.md](docs/docker.md#tests)). See [docs/reconciliation.md](docs/reconciliation.md), [docs/failure-handling.md](docs/failure-handling.md) and [Limitations](#limitations).
+> **Status.** DockFleet runs small fleets of Docker hosts: you describe a service, and the manager places its replicas on nodes by their free CPU and memory, the agents run them as containers, restart them per policy and report back, and the manager updates them in rolling deployments, scales them, replaces them when a node is lost, streams their logs, exports metrics and shows a dashboard. Several managers can share one PostgreSQL and elect a leader through etcd. All of it has been built and tested on **one machine**, and how far each part can be trusted is written down in [docs/verification.md](docs/verification.md), which distinguishes what is implemented, verified, partial and unverified. The short version is in the table below, and [ROADMAP.md](ROADMAP.md) is the prioritized plan for the gaps.
+>
+> | Part | Status |
+> | --- | --- |
+> | Control plane: API, scheduler, reconciler, scaling, rolling updates and rollback, failure handling, logs, metrics, dashboard, audit trail | Implemented; **verified** end to end with the real binaries over mutual TLS against PostgreSQL and etcd, but with an **in-memory container engine** |
+> | Mutual TLS, node enrollment, credentials as files, health checks | Implemented and **verified** |
+> | High availability (etcd leader election, fencing epochs) | Implemented; **verified** with one etcd member; multi-member etcd and network faults are unverified |
+> | Docker Engine adapter and its hardening policy | Implemented; the request it sends is verified, but it has **never run against a real Docker daemon** |
+> | Container images, Compose file, systemd units, CI workflow | Written and statically checked; **unverified** (never built, loaded or run) |
+> | CPU and memory use | **Partial**: declared and reserved, not measured |
+> | Scale | **Unverified**: nothing has been run above three nodes |
+>
+> Everything ran on macOS (darwin/arm64); the Linux binaries are cross-compiled but not run. No license file has been added yet. See [Limitations](#limitations).
 
 ## Layout
 
@@ -39,7 +51,7 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 | `Dockerfile`         | Two images, `manager` and `agent` targets: one static binary each, non-root, with a built-in health check ([docs/deployment.md](docs/deployment.md)) |
 | `deploy/`            | Docker Compose files: development PostgreSQL, a disposable Docker daemon and a disposable etcd for tests; `deploy/examples/` holds example manager and worker configuration, Compose files and systemd units |
 | `config/dev.env`     | Development-only configuration                                          |
-| `docs/`              | [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), [Mutual TLS and enrollment](docs/mtls.md), [Docker adapter](docs/docker.md), [Control-plane state](docs/state.md), [Services API](docs/api.md), [Scheduler](docs/scheduler.md), [Reconciliation](docs/reconciliation.md), [Failure handling](docs/failure-handling.md), [Rolling deployments](docs/rollouts.md), [Container logs](docs/logs.md), [Metrics, dashboard and audit trail](docs/observability.md), [High availability](docs/high-availability.md), [Deployment guide](docs/deployment.md), [Credentials](docs/credentials.md), [Security audit](docs/security-audit.md), [Limitations and differences from Kubernetes](docs/limitations.md) |
+| `docs/`              | [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), [Mutual TLS and enrollment](docs/mtls.md), [Docker adapter](docs/docker.md), [Control-plane state](docs/state.md), [Services API](docs/api.md), [Scheduler](docs/scheduler.md), [Reconciliation](docs/reconciliation.md), [Failure handling](docs/failure-handling.md), [Rolling deployments](docs/rollouts.md), [Container logs](docs/logs.md), [Metrics, dashboard and audit trail](docs/observability.md), [High availability](docs/high-availability.md), [Deployment guide](docs/deployment.md), [Credentials](docs/credentials.md), [Security audit](docs/security-audit.md), [Limitations and differences from Kubernetes](docs/limitations.md), [Verification status](docs/verification.md); the plan for what comes next is [ROADMAP.md](ROADMAP.md) |
 
 ## Prerequisites
 
@@ -52,9 +64,8 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 ```sh
 make generate       # pinned buf + protoc plugins into .tools/bin, lint, generate gRPC code
                     # (output: internal/protocol/dockfleet/, not committed)
-make tidy           # resolve modules and write go.sum
-make check          # gofmt check, go vet, unit tests with -race
-make build          # bin/dockfleet-manager and bin/dockfleet-agent
+make check          # gofmt check, go vet (with every test tag), secret scan, unit tests with -race
+make build          # bin/dockfleet-manager, bin/dockfleet-agent and bin/dockfleet-pki
 ```
 
 Run a local cluster:
@@ -205,7 +216,10 @@ All settings are environment variables. The manager and agent refuse to start on
 
 ## Testing
 
+What ran, with the commands and the results, and what has never run, is in [docs/verification.md](docs/verification.md). In short:
+
 ```sh
+make check              # formatting, vet with every test tag, secret scan, unit tests with -race (no external services)
 make test               # unit tests, -race, no external services
 make cover              # per-package coverage
 make test-integration   # PostgreSQL store, API, scheduling, reconciliation and multi-manager tests; needs `make compose-up`
@@ -237,13 +251,14 @@ Generated protobuf code is not committed, so run `make generate` after a fresh c
 - High availability is optional and needs etcd; a single manager needs neither. An etcd outage longer than the node lease stops every container of the fleet while agents fence themselves; leadership does not depend on the database being reachable; an agent remembers the highest epoch only while it runs. See [docs/high-availability.md](docs/high-availability.md#remaining-limitations-partitions-included).
 - Container logs come from Docker's own `json-file` logs (rotated, 3 × 10 MiB), are not stored by the manager, and a following request ends when the container stops; a query sees only the nodes connected to the manager that serves it. See [docs/logs.md](docs/logs.md#limitations).
 - Failover has limits ([docs/failure-handling.md](docs/failure-handling.md#limitations)): a crashed agent process cannot stop its own containers, so a replica started elsewhere runs beside them until it returns; with fencing on (the default) a manager outage longer than the lease stops every container in the fleet until the manager is back; a replica whose container failed beyond its restart limit is not moved to another node; standalone workloads are not moved.
-- Sessions are held in manager memory: an agent talks to one manager at a time and registers again if that manager forgets it. Two agents configured with the same node ID will keep superseding each other.
-- The database is ready for several managers (placement lock, optimistic versions, leases, migration lock), but no leader election runs yet; scheduling and reconciliation passes on several managers queue on the placement lock instead. Service definitions have a REST API ([docs/api.md](docs/api.md)); the scheduler assigns their replicas ([docs/scheduler.md](docs/scheduler.md)), the reconciler retires the ones that should go, and a rollout replaces replicas within its policy ([docs/rollouts.md](docs/rollouts.md)). A node that is silent for `DOCKFLEET_NODE_UNAVAILABLE_AFTER` loses its replicas to other nodes, and its stopped workloads stay on record until it returns.
+- Sessions are held in manager memory: an agent talks to one manager at a time (in a high-availability cluster, the leader) and registers again if that manager forgets it. Two agents configured with the same node ID will keep superseding each other. An agent stopped in the instant between the manager creating its session and the answer reaching it cannot deregister; the node then looks alive until its TTL runs out ([docs/failure-handling.md](docs/failure-handling.md#limitations)).
+- Service definitions have a REST API ([docs/api.md](docs/api.md)); the scheduler assigns their replicas ([docs/scheduler.md](docs/scheduler.md)), the reconciler retires the ones that should go, and a rollout replaces replicas within its policy ([docs/rollouts.md](docs/rollouts.md)). A node that is silent for `DOCKFLEET_NODE_UNAVAILABLE_AFTER` loses its replicas to other nodes, and its stopped workloads stay on record until it returns. With several managers only the elected leader schedules and reconciles; the others serve the API.
 - Scheduling reserves each workload's declared CPU and memory limits (it does not measure usage), has no priorities, preemption or affinities, and checks only fixed host-port conflicts.
 - Node capacity is declared by the agent, not measured.
-- Registered nodes are never deleted; dead nodes stay listed as `not_ready`.
+- Registered nodes are never deleted; dead nodes stay listed as `not_ready`. Audit events are never pruned.
+- Nothing has been measured above three nodes. Each scheduling and reconciliation pass reads the whole cluster, and the service, workload and node lists are not paginated.
 - The admin API is authenticated by one shared bearer token (over HTTPS when TLS is configured). Certificate revocation is by enrollment only (no CRL/OCSP), and the development CA is not a production PKI.
-- `go.sum` is generated by `make tidy`, which needs network access.
+- The Docker Engine adapter, the images, the Compose file, the systemd units and the CI workflow have never run for real; see [docs/verification.md](docs/verification.md) and the first step of [ROADMAP.md](ROADMAP.md).
 
 ## License
 
