@@ -43,6 +43,31 @@ func UnaryIdentityInterceptor(now func() time.Time) grpc.UnaryServerInterceptor 
 	}
 }
 
+// StreamIdentityInterceptor is UnaryIdentityInterceptor for streaming calls.
+// The certificate is checked when the stream opens; a stream cannot outlive its
+// connection, and the manager ends connections after a bounded age, so a
+// certificate that expires is not accepted for long.
+func StreamIdentityInterceptor(now func() time.Time) grpc.StreamServerInterceptor {
+	if now == nil {
+		now = time.Now
+	}
+	return func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		id, err := peerIdentity(ss.Context(), now())
+		if err != nil {
+			return err
+		}
+		return handler(srv, &identityStream{ServerStream: ss, ctx: context.WithValue(ss.Context(), identityKey{}, id)})
+	}
+}
+
+// identityStream is a server stream whose context carries the caller's identity.
+type identityStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (s *identityStream) Context() context.Context { return s.ctx }
+
 func peerIdentity(ctx context.Context, now time.Time) (string, error) {
 	p, ok := peer.FromContext(ctx)
 	if !ok {

@@ -42,6 +42,10 @@ type entry struct {
 	Info
 	nodeID string
 	spec   docker.ContainerSpec
+
+	// logs is everything the container wrote, in order, and gone says it was removed.
+	logs []docker.LogLine
+	gone bool
 }
 
 // Journal records the changes made on several engines in one order, so a test
@@ -93,14 +97,25 @@ type Fake struct {
 	calls     []string
 	failures  map[string][]error
 	behaviors map[string]ImageBehavior
+	// wake is closed, and replaced, whenever a container writes a line or
+	// changes state, to wake the readers that follow container output; readers
+	// counts the log readers that are open.
+	wake    chan struct{}
+	readers int
 }
 
 // New returns an engine for the node with no images and no containers.
 func New(nodeID string) *Fake {
 	return &Fake{
 		nodeID: nodeID, policy: docker.DefaultPolicy(), images: map[string]bool{}, failures: map[string][]error{},
-		behaviors: map[string]ImageBehavior{},
+		behaviors: map[string]ImageBehavior{}, wake: make(chan struct{}),
 	}
+}
+
+// broadcast wakes the readers that follow container output. The caller holds the lock.
+func (f *Fake) broadcast() {
+	close(f.wake)
+	f.wake = make(chan struct{})
 }
 
 // SetImageBehavior makes containers started from the image behave as b says.
@@ -146,7 +161,7 @@ func (f *Fake) AddUnmanaged(name, image string, labels map[string]string) string
 }
 
 // FailNext makes the next n calls of an operation ("ping", "list", "pull",
-// "create", "start", "stop", "remove" or "inspect") return err.
+// "create", "start", "stop", "remove", "inspect" or "logs") return err.
 func (f *Fake) FailNext(op string, err error, n int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -168,6 +183,7 @@ func (f *Fake) Crash(workloadID string, exitCode int) {
 	defer f.mu.Unlock()
 	if e := f.managed(workloadID); e != nil && e.State == docker.StateRunning {
 		e.State, e.ExitCode = docker.StateExited, exitCode
+		f.broadcast()
 	}
 }
 
@@ -188,6 +204,7 @@ func (f *Fake) OOMKill(workloadID string) {
 	defer f.mu.Unlock()
 	if e := f.managed(workloadID); e != nil && e.State == docker.StateRunning {
 		e.State, e.ExitCode, e.OOMKilled = docker.StateExited, 137, true
+		f.broadcast()
 	}
 }
 
@@ -362,6 +379,7 @@ func (f *Fake) Start(_ context.Context, workloadID string) error {
 		return fmt.Errorf("%w: %s", docker.ErrNotFound, workloadID)
 	}
 	f.record("start", workloadID)
+	f.broadcast()
 	e.State, e.ExitCode, e.OOMKilled = docker.StateRunning, 0, false
 	e.Health = ""
 	if e.spec.HealthCheck != nil {
@@ -391,6 +409,7 @@ func (f *Fake) Stop(_ context.Context, workloadID string, _ time.Duration) error
 	f.record("stop", workloadID)
 	if e.State == docker.StateRunning {
 		e.State, e.ExitCode = docker.StateExited, 137
+		f.broadcast()
 	}
 	return nil
 }
@@ -409,6 +428,8 @@ func (f *Fake) Remove(_ context.Context, workloadID string, force bool) error {
 			return fmt.Errorf("%w: %s is running", docker.ErrStateConflict, workloadID)
 		}
 		f.record("remove", workloadID)
+		e.gone = true
+		f.broadcast()
 		f.entries = append(f.entries[:i], f.entries[i+1:]...)
 		return nil
 	}

@@ -24,6 +24,7 @@ import (
 	"github.com/dockfleet/dockfleet/internal/agent"
 	"github.com/dockfleet/dockfleet/internal/docker"
 	"github.com/dockfleet/dockfleet/internal/dockerfake"
+	"github.com/dockfleet/dockfleet/internal/logstream"
 	"github.com/dockfleet/dockfleet/internal/placement"
 	"github.com/dockfleet/dockfleet/internal/protocol"
 	dockfleetv1 "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/v1"
@@ -67,6 +68,7 @@ type manager struct {
 	lis *bufconn.Listener
 	srv *grpc.Server
 	reg *registry.Registry
+	hub *logstream.Hub
 }
 
 // newManager returns a stopped manager; call start to bring it up. The nodes
@@ -127,7 +129,8 @@ func (m *manager) start() {
 		logger = slog.New(m.logs)
 	}
 	reg := registry.New(m.store, logger)
-	node := protocol.NewNodeServer(reg, heartbeatEvery, logger).WithLease(time.Duration(m.lease.Load()))
+	hub := logstream.NewHub(logstream.HubConfig{Logger: logger, ReconnectWait: 5 * time.Second})
+	node := protocol.NewNodeServer(reg, heartbeatEvery, logger).WithLease(time.Duration(m.lease.Load())).WithLogs(hub, 10*time.Millisecond)
 	if m.version != nil {
 		node.WithVersion(m.version)
 	}
@@ -145,15 +148,18 @@ func (m *manager) start() {
 	go func() { _ = srv.Serve(lis) }()
 
 	m.mu.Lock()
-	m.lis, m.srv, m.reg = lis, srv, reg
+	m.lis, m.srv, m.reg, m.hub = lis, srv, reg, hub
 	m.mu.Unlock()
 }
 
 func (m *manager) stop() {
 	m.mu.Lock()
-	srv := m.srv
-	m.lis, m.srv = nil, nil
+	srv, hub := m.srv, m.hub
+	m.lis, m.srv, m.hub = nil, nil, nil
 	m.mu.Unlock()
+	if hub != nil {
+		hub.Shutdown()
+	}
 	if srv != nil {
 		srv.Stop()
 	}

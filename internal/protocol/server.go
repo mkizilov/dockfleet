@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 
+	"github.com/dockfleet/dockfleet/internal/logstream"
 	dockfleetv1 "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/v1"
 	"github.com/dockfleet/dockfleet/internal/registry"
 	"github.com/dockfleet/dockfleet/internal/store"
@@ -58,6 +59,9 @@ type Registry interface {
 	Register(ctx context.Context, n store.Node) (registry.Session, []store.Workload, error)
 	Heartbeat(ctx context.Context, nodeID, sessionID string, reports []registry.StatusReport) ([]store.Workload, error)
 	Deregister(ctx context.Context, nodeID, sessionID string) error
+	// CheckSession reports whether the session is the node's current one and
+	// the node is still enrolled, without changing anything.
+	CheckSession(ctx context.Context, nodeID, sessionID string) error
 }
 
 // NodeServer implements the agent-facing NodeService.
@@ -68,11 +72,18 @@ type NodeServer struct {
 	lease    time.Duration
 	logger   *slog.Logger
 	version  *dockfleetv1.ProtocolVersion
+
+	// logs receives the container logs agents stream; nil means the manager
+	// does not serve them. logCheck is how often an open log stream is checked
+	// against its session, and helloWait how long a new one may take to say who it is.
+	logs      *logstream.Hub
+	logCheck  time.Duration
+	helloWait time.Duration
 }
 
 // NewNodeServer tells registering agents to heartbeat every interval.
 func NewNodeServer(reg Registry, interval time.Duration, logger *slog.Logger) *NodeServer {
-	return &NodeServer{registry: reg, interval: interval, logger: logger, version: CurrentVersion()}
+	return &NodeServer{registry: reg, interval: interval, logger: logger, version: CurrentVersion(), helloWait: defaultHelloWait}
 }
 
 // WithLease makes the server grant each session a lease of d, renewed by every
@@ -123,20 +134,25 @@ func NewGRPCServer(nodes *NodeServer, opts ServerOptions) (*grpc.Server, error) 
 	}
 
 	var auth grpc.UnaryServerInterceptor
+	var streamAuth grpc.StreamServerInterceptor
 	serverOpts := []grpc.ServerOption{grpc.MaxRecvMsgSize(maxMessageBytes)}
 	if opts.TLS != nil {
 		if opts.TLS.ClientAuth != tls.RequireAndVerifyClientCert {
 			return nil, ErrClientAuthRequired
 		}
 		auth = UnaryIdentityInterceptor(opts.Now)
+		streamAuth = StreamIdentityInterceptor(opts.Now)
 		serverOpts = append(serverOpts, grpc.Creds(credentials.NewTLS(opts.TLS)))
 	} else {
 		if opts.Token == "" {
 			return nil, errors.New("a bearer token is required without TLS")
 		}
 		auth = UnaryTokenInterceptor(opts.Token)
+		streamAuth = StreamTokenInterceptor(opts.Token)
 	}
-	serverOpts = append(serverOpts, grpc.ChainUnaryInterceptor(auth, unaryDeadline(wait)))
+	// Streams get the same authentication as calls, but no deadline: a log
+	// stream lives as long as the agent's session.
+	serverOpts = append(serverOpts, grpc.ChainUnaryInterceptor(auth, unaryDeadline(wait)), grpc.ChainStreamInterceptor(streamAuth))
 	if opts.MaxConnectionAge > 0 {
 		serverOpts = append(serverOpts, grpc.KeepaliveParams(keepalive.ServerParameters{
 			MaxConnectionAge:      opts.MaxConnectionAge,

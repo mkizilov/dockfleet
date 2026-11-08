@@ -25,6 +25,8 @@ A node certificate carries one URI SAN: `spiffe://dockfleet/node/<node-id>`. The
 
 The manager derives the caller's identity from the verified client certificate, never from the request. `RegisterNode`, `Heartbeat` and `DeregisterNode` fail with `PERMISSION_DENIED` / `IDENTITY_MISMATCH` when the `node_id` differs from it. An agent whose configured `DOCKFLEET_NODE_ID` differs from its certificate refuses to start.
 
+The agent's container-log stream (`Logs`, [logs.md](logs.md)) is bound the same way: the certificate is verified when the stream opens, and the `node_id` in its first message must equal the identity in it, so an agent cannot receive the log requests of another node. The stream also needs the node's current session and an active enrollment, which the manager keeps checking while it is open.
+
 ## Enrollment
 
 Enrollment is the administrator's statement "this node ID may join". It does not depend on certificates and is checked on every registration and every heartbeat, so revoking it takes effect at the node's next heartbeat.
@@ -119,7 +121,7 @@ Guidelines for administrators:
 
 ## Expiration and renewal
 
-- Expired and not-yet-valid certificates are rejected in the TLS handshake. The manager also re-checks the validity window on every call, so a connection opened with a valid certificate cannot outlive it (`UNAUTHENTICATED` / `CERTIFICATE_INVALID`). The agent treats that as temporary and keeps running.
+- Expired and not-yet-valid certificates are rejected in the TLS handshake. The manager also re-checks the validity window on every call, so a connection opened with a valid certificate cannot outlive it (`UNAUTHENTICATED` / `CERTIFICATE_INVALID`). The agent treats that as temporary and keeps running. A stream such as the log stream is checked when it opens; it ends with its connection, which the manager closes after at most 10 minutes.
 - The agent refuses to start with an expired certificate or one for another node. Both processes check their own certificate at startup and every hour afterwards: a warning once it is within 30 days of expiry, an error once it has expired.
 - Certificates and the CA bundle are re-read when the files change, so renewal needs no restart: replace the files (atomically, e.g. `dockfleet-pki sign-agent ... -force`, which writes through a temporary file and rename), and the next connection uses them. The manager closes agent connections after at most 10 minutes (plus jitter), so even a quiet connection moves to the new certificate soon. If a new file is unreadable or does not match its key, the process logs one error and keeps the previous certificate.
 - Renew agent certificates by running `new-csr`/`sign-agent` again (with `-force`) well before expiry; the default validity is 90 days.
@@ -127,7 +129,7 @@ Guidelines for administrators:
 
 ## Revoking access
 
-There is no CRL. To stop a compromised node: revoke its enrollment (immediate effect at the next heartbeat) and stop issuing certificates for its ID. Because enrollment is by node ID, a leaked key for an ID that stays enrolled can still be used until the certificate expires; to close that gap, revoke the enrollment and then enroll a replacement under a new node ID (and new certificate). If the CA key leaks, replace the CA and every certificate.
+There is no CRL. To stop a compromised node: revoke its enrollment (immediate effect at the next heartbeat; its log stream, which is checked every few seconds, ends too, and its containers' logs can no longer be read through the manager) and stop issuing certificates for its ID. Because enrollment is by node ID, a leaked key for an ID that stays enrolled can still be used until the certificate expires; to close that gap, revoke the enrollment and then enroll a replacement under a new node ID (and new certificate). If the CA key leaks, replace the CA and every certificate.
 
 ## Troubleshooting
 

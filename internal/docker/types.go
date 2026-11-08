@@ -155,6 +155,37 @@ type Logs struct {
 	Truncated bool // output beyond MaxBytes was dropped
 }
 
+// LogStreamOptions says which part of a container's output StreamLogs reads.
+type LogStreamOptions struct {
+	// Tail is how many of the last lines to start with, counted after Since:
+	// negative means all of them, 0 none.
+	Tail int
+	// Since excludes lines written before this time; zero means no bound.
+	Since time.Time
+	// Follow keeps reading as the container writes, until it stops.
+	Follow bool
+	// MaxLineBytes cuts longer lines; 0 means 16 KiB, at most 64 KiB.
+	MaxLineBytes int
+}
+
+// LogLine is one line of container output, with the time the daemon recorded it.
+type LogLine struct {
+	Time      time.Time
+	Stream    string // "stdout" or "stderr"
+	Text      string // valid UTF-8, without the line break
+	Truncated bool   // the line was longer than MaxLineBytes; the rest was dropped
+}
+
+// LogReader reads a container's output a line at a time, holding at most one
+// line and one read buffer in memory: what the caller does not read stays in
+// the daemon. Next blocks until a line is available and returns io.EOF at the
+// end of the output (for a following reader, when the container stops). Close
+// ends a read that is blocked in Next.
+type LogReader interface {
+	Next() (LogLine, error)
+	Close() error
+}
+
 // Usage is one resource sample of a running container.
 type Usage struct {
 	ReadAt time.Time

@@ -38,7 +38,7 @@ func newScaleAdmin(t *testing.T, m *manager, timing scheduler.Timing, lease time
 		nodeTTL = timing.SuspectAfter
 	}
 	return &scaleAdmin{t: t, m: m, h: api.New(api.Config{
-		Store: m.store, Token: adminToken, NodeTTL: nodeTTL, Timing: timing, NodeLease: lease, Logger: discardLogger(),
+		Store: m.store, Token: adminToken, NodeTTL: nodeTTL, Timing: timing, NodeLease: lease, Logger: discardLogger(), Logs: managerLogs{m: m},
 	})}
 }
 

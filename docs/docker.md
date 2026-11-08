@@ -23,6 +23,7 @@ Only the agent. The manager never connects to Docker and never needs a Docker so
 | `Start`, `Stop`, `Remove` | By workload ID; `Stop` takes a timeout, `Remove` a `force` flag and also deletes the container's anonymous volumes |
 | `Inspect` | Running/exit state, OOM kill, restart count, health, start/finish times |
 | `Logs` | Demultiplexed stdout/stderr chunks in order, bounded: at most 10000 lines (default 100) and 8 MiB (default 1 MiB), `Truncated` set when output was dropped |
+| `StreamLogs` | A `LogReader` over the container's output, a line at a time, each with the time the daemon recorded (the request always asks Docker for timestamps), the stream it came from and a `Truncated` flag. Options: the last `Tail` lines (negative: all), `Since`, `Follow` (the reader waits for new output until the container stops) and the longest line (default 16 KiB, at most 64 KiB; longer lines are cut at a character boundary and the rest of the line is skipped without being buffered). It holds one chunk (32 KiB), one partial line per output stream and one line at hand, whatever the container writes; what the caller does not read stays in the daemon. `Close` ends a read that is waiting. See [logs.md](logs.md) |
 | `Stats` | One sample: CPU time and percentage (when the daemon supplies a previous sample), working-set memory and limit, PIDs, network bytes. It takes about a second because the daemon samples twice |
 
 Errors are sentinels to test with `errors.Is`: `ErrNotFound`, `ErrConflict`, `ErrStateConflict`, `ErrImageNotFound`, `ErrAmbiguous`, `ErrInvalid`, and `ErrRejected` for policy violations.
@@ -82,6 +83,7 @@ The adapter uses `github.com/docker/docker` (pinned in `go.mod`, with `github.co
 - `adapter_test.go`: the adapter against an in-memory fake backend that deliberately ignores label filters: ownership, unrelated containers, ambiguity, conflicts, validation, defaults.
 - `policy_test.go`: every rejection, socket and symlink tricks, allowed roots and capabilities.
 - `logs_stats_test.go`: log demultiplexing and limits, stats parsing (cgroup v1 and v2).
+- `logs_stream_test.go`: the line reader (timestamps, partial lines per stream, long lines, a 40 MiB frame, bad UTF-8, errors, `Close` ending a blocked read) and `StreamLogs` through the adapter and the SDK; a `dockerintegration` test reads a real container's output.
 - `sdk_test.go`: the real SDK code against a fake Docker Engine HTTP transport (no daemon, socket or port): request shapes, label filters, the hardened create body, error mapping.
 - `boundary_test.go`: the manager side never imports Docker.
 - `docker_integration_test.go` (build tag `dockerintegration`): the full lifecycle against a real daemon, including a bystander container that must survive untouched. `internal/integration/docker_test.go` (same tag) deploys a service through the whole control loop on a real daemon. Neither is part of `make test`:

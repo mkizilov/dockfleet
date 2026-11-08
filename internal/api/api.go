@@ -40,6 +40,11 @@ type Config struct {
 	// Overcommit is how far nodes may be promised beyond their capacity when a
 	// workload is placed; the zero value is none.
 	Overcommit scheduler.Overcommit
+	// Logs serves container logs; nil turns the log endpoints off.
+	Logs LogSource
+	// LogWriteTimeout is how long a log response waits for its client to take
+	// data before the stream is closed; zero means 30 seconds.
+	LogWriteTimeout time.Duration
 	// Now defaults to time.Now; tests override it.
 	Now func() time.Time
 }
@@ -54,6 +59,11 @@ type server struct {
 	instanceID string
 	overcommit scheduler.Overcommit
 	now        func() time.Time
+
+	// logs serves container logs (nil: off); a log response gives up on a
+	// client that takes no data for logWriteTimeout.
+	logs            LogSource
+	logWriteTimeout time.Duration
 }
 
 // New returns the administrative HTTP handler. /healthz and /readyz are open;
@@ -73,6 +83,10 @@ func New(cfg Config) http.Handler {
 	if s.now == nil {
 		s.now = time.Now
 	}
+	s.logs, s.logWriteTimeout = cfg.Logs, cfg.LogWriteTimeout
+	if s.logWriteTimeout <= 0 {
+		s.logWriteTimeout = defaultLogWriteTimeout
+	}
 	if s.timing.SuspectAfter <= 0 {
 		s.timing.SuspectAfter = cfg.NodeTTL
 	}
@@ -85,6 +99,8 @@ func New(cfg Config) http.Handler {
 	mux.Handle("POST /v1/workloads", s.auth(s.createWorkload))
 	mux.Handle("GET /v1/workloads", s.auth(s.listWorkloads))
 	mux.Handle("GET /v1/workloads/{id}", s.auth(s.getWorkload))
+	mux.Handle("GET /v1/workloads/{id}/logs", s.auth(s.workloadLogs))
+	mux.Handle("GET /v1/services/{name}/logs", s.auth(s.serviceLogs))
 	mux.Handle("POST /v1/enrollments", s.auth(s.createEnrollment))
 	mux.Handle("GET /v1/enrollments", s.auth(s.listEnrollments))
 	mux.Handle("GET /v1/enrollments/{id}", s.auth(s.getEnrollment))
@@ -127,6 +143,10 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
 }
+
+// Unwrap lets http.ResponseController reach the real writer, which streaming
+// responses need to flush and to set deadlines on.
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
 func (s *server) logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

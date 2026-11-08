@@ -49,6 +49,9 @@ type Runtime interface {
 	Remove(ctx context.Context, workloadID string, force bool) error
 	Inspect(ctx context.Context, workloadID string) (ContainerState, error)
 	Logs(ctx context.Context, workloadID string, opts LogOptions) (Logs, error)
+	// StreamLogs reads the container's output line by line, optionally
+	// following it. The reader is closed by the caller.
+	StreamLogs(ctx context.Context, workloadID string, opts LogStreamOptions) (LogReader, error)
 	// Stats takes one resource sample. The daemon samples twice, so it takes about a second.
 	Stats(ctx context.Context, workloadID string) (Usage, error)
 }

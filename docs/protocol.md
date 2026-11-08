@@ -18,7 +18,7 @@ Changing the protocol means editing the `.proto`, bumping the version if require
 
 ## Connection model
 
-Agents dial the manager (gRPC, unary calls only). The manager never connects to agents. Every call has a server-side deadline (`DOCKFLEET_REQUEST_TIMEOUT`, default 10s) and the agent applies its own per-call deadline (`DOCKFLEET_RPC_TIMEOUT`, default 5s).
+Agents dial the manager (gRPC: unary calls, and one long-lived stream for container logs, below). The manager never connects to agents. Every unary call has a server-side deadline (`DOCKFLEET_REQUEST_TIMEOUT`, default 10s) and the agent applies its own per-call deadline (`DOCKFLEET_RPC_TIMEOUT`, default 5s).
 
 ### Transport security and authentication
 
@@ -61,7 +61,7 @@ agent                                          manager
 
 ## Versioning
 
-`ProtocolVersion {major, minor}` is sent in `RegisterNodeRequest` and returned in `RegisterNodeResponse`. This build speaks `1.3` (`protocol.VersionMajor` / `protocol.VersionMinor`). 1.1 added the `NOT_ENROLLED`, `IDENTITY_MISMATCH` and `CERTIFICATE_INVALID` error codes. 1.2 made assignments instructions: `WorkloadAssignment` gained `generation`, `desired_state`, `command`, `env`, `ports` and `restart_policy`, and `WorkloadStatus` gained `acknowledged_generation`, `container_id`, `exit_code`, `oom_killed` and `restart_count`. 1.3 added failure handling: `RegisterNodeResponse.lease_ms`, `RestartPolicy.backoff_seconds` and `max_backoff_seconds`, the `HealthCheck` message in `WorkloadAssignment.health_check`, and `WorkloadStatus.health`. All are optional fields, so older peers ignore them; an unspecified `desired_state` means `RUNNING`, and an agent that is not sent a lease never fences itself.
+`ProtocolVersion {major, minor}` is sent in `RegisterNodeRequest` and returned in `RegisterNodeResponse`. This build speaks `1.4` (`protocol.VersionMajor` / `protocol.VersionMinor`). 1.1 added the `NOT_ENROLLED`, `IDENTITY_MISMATCH` and `CERTIFICATE_INVALID` error codes. 1.2 made assignments instructions: `WorkloadAssignment` gained `generation`, `desired_state`, `command`, `env`, `ports` and `restart_policy`, and `WorkloadStatus` gained `acknowledged_generation`, `container_id`, `exit_code`, `oom_killed` and `restart_count`. 1.3 added failure handling: `RegisterNodeResponse.lease_ms`, `RestartPolicy.backoff_seconds` and `max_backoff_seconds`, the `HealthCheck` message in `WorkloadAssignment.health_check`, and `WorkloadStatus.health`. 1.4 added container logs: the `Logs` RPC and its messages (`LogsRequest`, `LogsResponse` and what they carry). All are optional fields or new calls, so older peers ignore them; an unspecified `desired_state` means `RUNNING`, and an agent that is not sent a lease never fences itself.
 
 | Rule | Who checks |
 | ---- | ---------- |
@@ -70,6 +70,24 @@ agent                                          manager
 | A newer manager minor is accepted by an older agent | agent |
 
 Bump the minor for backward-compatible additions (new optional fields or RPCs) and the major for breaking changes; upgrade managers before agents. A missing version counts as incompatible.
+
+## Container logs
+
+`Logs` is a bidirectional stream the agent opens after it registered and keeps open for the session ([logs.md](logs.md) describes what it is for and the limits that bound it). The manager never connects to agents, so the requests for logs travel down the stream the agent opened.
+
+| Direction | Message | Meaning |
+| --------- | ------- | ------- |
+| agent → manager | `LogsHello` | First, and only first: the `node_id` and `session_id` the stream speaks for. |
+| agent → manager | `LogBatch` | Lines of one request (`request_id`), oldest first, each with its time, stream and text; `history_complete` marks the last batch of the history. |
+| agent → manager | `LogEnd` | The request is over: `COMPLETE`, `NOT_FOUND`, `CANCELED`, `BUSY` or `ERROR`. |
+| manager → agent | `LogOpen` | Read the logs of `workload_id`: `tail` lines (negative: all) after `after_unix_nano`, `follow`, at most `max_line_bytes` per line, with `credit_bytes` of credit. |
+| manager → agent | `LogCredit` | The agent may send `bytes` more of a request. A line costs its text plus 64 bytes. |
+| manager → agent | `LogCancel` | End a request. |
+
+- **Authentication.** The stream is authenticated like every call: the bearer token without TLS, the verified client certificate with mutual TLS (`UNAUTHENTICATED` otherwise). The hello's `node_id` must equal the certificate's identity (`PERMISSION_DENIED` / `IDENTITY_MISMATCH`), the node must be enrolled and `session_id` must be its current session (`NOT_ENROLLED`, `NOT_REGISTERED`, `SESSION_SUPERSEDED`). A stream that sends no hello within 10 seconds, or starts with anything else, is ended with `INVALID_REQUEST`.
+- **Bound to the session.** The manager checks the session and the enrollment every 5 seconds and ends the stream with the matching error when they no longer hold. The agent opens a new stream after it registers again; an error that says the session is over (or `UNIMPLEMENTED`: an older manager, or one with logs off) is not retried within the session.
+- **Flow control.** The agent sends a request's lines only while it has credit for them; the manager returns credit as the reader takes lines out. Lines beyond the credit end the request. Streams have no deadline, and the manager's periodic recycling of connections ends them like any other: the agent opens the stream again and the manager resumes the requests that follow.
+- **One stream per node.** A newer stream of the same node replaces the older one. The manager only accepts lines and ends for requests it opened on that very stream.
 
 ## Errors
 
@@ -91,5 +109,7 @@ Failures an agent can act on carry a `ProtocolError` in the gRPC status details 
 An agent that exits on a fatal error leaves restarting it to its supervisor, which makes version skew and bad credentials loud instead of an endless retry loop.
 
 ## Limits
+
+On the log stream a batch carries at most 256 lines and 256 KiB (a line's text at most 64 KiB), identifiers are 1-64 characters, and a request starts with at most the window the manager grants (256 KiB by default).
 
 gRPC messages are capped at 1 MiB on the server (requests). Per request: at most 32 labels (keys and values up to 128 bytes), 1000 workload statuses, status messages up to 512 bytes, workload IDs up to 64 bytes, container IDs up to 128 bytes, node names up to 255 bytes. An agent accepts a response of up to 32 MiB, which bounds the assignments of one node, environments included.

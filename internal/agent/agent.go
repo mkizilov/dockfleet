@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/dockfleet/dockfleet/internal/docker"
+	"github.com/dockfleet/dockfleet/internal/logstream"
 	"github.com/dockfleet/dockfleet/internal/protocol"
 	dockfleetv1 "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/v1"
 )
@@ -25,6 +26,8 @@ type Manager interface {
 	Register(ctx context.Context, n protocol.NodeInfo) (protocol.Session, error)
 	Heartbeat(ctx context.Context, nodeID, sessionID string, statuses []*dockfleetv1.WorkloadStatus) ([]*dockfleetv1.WorkloadAssignment, error)
 	Deregister(ctx context.Context, nodeID, sessionID string) error
+	// Logs opens the stream the agent serves container logs on for its session.
+	Logs(ctx context.Context, nodeID, sessionID string) (logstream.AgentConn, error)
 }
 
 // Config assembles an Agent.
@@ -51,6 +54,10 @@ type Config struct {
 	// replica the manager has started on another node does not also run here.
 	// Off, containers keep running through any outage of the manager.
 	FenceOnLeaseLoss bool
+	// LogRequests is how many log requests the agent serves at once for the
+	// manager, which reads containers' logs through it; zero means 16 and a
+	// negative number means none (the agent serves no logs).
+	LogRequests int
 	// StableAfter is how long a restarted container must run before its
 	// restarts in a row are forgotten; zero means 30 seconds.
 	StableAfter time.Duration
@@ -70,6 +77,7 @@ type Config struct {
 type Agent struct {
 	cfg    Config
 	runner *runner
+	logs   *logServer
 }
 
 func New(cfg Config) *Agent {
@@ -82,10 +90,14 @@ func New(cfg Config) *Agent {
 	if cfg.RetryMax <= 0 {
 		cfg.RetryMax = defaultRetryMax
 	}
-	return &Agent{cfg: cfg, runner: newRunner(cfg.Docker, cfg.Logger, runnerConfig{
-		Resync: cfg.Resync, OrphanGrace: cfg.OrphanGrace, StableAfter: cfg.StableAfter, Fencing: cfg.FenceOnLeaseLoss, Now: cfg.Now,
-		BackoffBase: cfg.BackoffBase, BackoffMax: cfg.BackoffMax,
-	})}
+	return &Agent{
+		cfg: cfg,
+		runner: newRunner(cfg.Docker, cfg.Logger, runnerConfig{
+			Resync: cfg.Resync, OrphanGrace: cfg.OrphanGrace, StableAfter: cfg.StableAfter, Fencing: cfg.FenceOnLeaseLoss, Now: cfg.Now,
+			BackoffBase: cfg.BackoffBase, BackoffMax: cfg.BackoffMax,
+		}),
+		logs: newLogServer(cfg.Docker, cfg.Logger, cfg.LogRequests, cfg.RetryMin, cfg.RetryMax, cfg.Now),
+	}
 }
 
 // renewLease extends the lease the manager granted with the session, counted
@@ -199,6 +211,23 @@ func (a *Agent) register(ctx context.Context) (protocol.Session, time.Time, erro
 func (a *Agent) serve(ctx context.Context, session protocol.Session, registeredAt time.Time) (sessionLost bool, err error) {
 	a.renewLease(registeredAt, session)
 	a.runner.Assign(session.Assignments)
+
+	// The manager reads container logs through a stream the agent keeps open
+	// for as long as the session lasts.
+	if a.logs.enabled() {
+		logCtx, stopLogs := context.WithCancel(ctx)
+		var logsDone sync.WaitGroup
+		logsDone.Add(1)
+		go func() {
+			defer logsDone.Done()
+			a.logs.run(logCtx, a.cfg.Manager, a.cfg.Node.ID, session.ID)
+		}()
+		defer func() {
+			stopLogs()
+			logsDone.Wait()
+		}()
+	}
+
 	interval := session.HeartbeatInterval
 	if interval <= 0 {
 		interval = defaultHeartbeat

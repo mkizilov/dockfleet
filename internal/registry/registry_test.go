@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -162,6 +163,58 @@ func TestRevocationEndsTheSessionOnTheNextHeartbeat(t *testing.T) {
 	}
 	if _, _, err := f.reg.Register(ctx, node("n1")); err != nil {
 		t.Fatalf("register after re-enrollment: %v", err)
+	}
+}
+
+// CheckSession is what a long-lived stream bound to a session asks. It changes
+// nothing but the end of a session whose enrollment was revoked.
+func TestCheckSessionFollowsTheSessionAndTheEnrollment(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	if err := f.reg.CheckSession(ctx, "n1", "nope"); !errors.Is(err, ErrNotRegistered) {
+		t.Fatalf("before registering: %v, want ErrNotRegistered", err)
+	}
+	s, _, err := f.reg.Register(ctx, node("n1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := f.store.observationWrites
+	if err := f.reg.CheckSession(ctx, "n1", s.ID); err != nil {
+		t.Fatalf("the current session: %v", err)
+	}
+	if err := f.reg.CheckSession(ctx, "n1", "another"); !errors.Is(err, ErrSessionSuperseded) {
+		t.Fatalf("another session: %v, want ErrSessionSuperseded", err)
+	}
+	if err := f.reg.CheckSession(ctx, "n2", s.ID); !errors.Is(err, ErrNotRegistered) {
+		t.Fatalf("another node: %v, want ErrNotRegistered", err)
+	}
+	n, _ := f.store.GetNode(ctx, "n1")
+	if f.store.observationWrites != before || !n.LastHeartbeat.Equal(t0) {
+		t.Fatal("checking a session must not write observations or refresh liveness")
+	}
+
+	newer, _, err := f.reg.Register(ctx, node("n1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.reg.CheckSession(ctx, "n1", s.ID); !errors.Is(err, ErrSessionSuperseded) {
+		t.Fatalf("the replaced session: %v, want ErrSessionSuperseded", err)
+	}
+
+	if _, err := f.store.RevokeEnrollment(ctx, "n1", t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.reg.CheckSession(ctx, "n1", newer.ID); !errors.Is(err, ErrNotEnrolled) {
+		t.Fatalf("after revocation: %v, want ErrNotEnrolled", err)
+	}
+	if len(f.reg.Sessions()) != 0 {
+		t.Fatalf("a revoked node keeps its session: %+v", f.reg.Sessions())
+	}
+	if err := f.reg.CheckSession(ctx, "n1", newer.ID); !errors.Is(err, ErrNotRegistered) {
+		t.Fatalf("after the session ended: %v, want ErrNotRegistered", err)
+	}
+	if !strings.Contains(strings.Join(f.events(t), " "), "node.session_ended") {
+		t.Fatalf("events = %v; ending the session must be recorded", f.events(t))
 	}
 }
 

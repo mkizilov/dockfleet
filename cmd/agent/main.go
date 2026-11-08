@@ -121,6 +121,12 @@ func run() error {
 		AgentVersion: version.Version,
 	}
 	logger.Info("starting dockfleet agent", "version", version.Version, "node_id", cfg.NodeID, "manager_addr", cfg.ManagerAddr, "mutual_tls", cfg.TLSEnabled())
+	// The agent treats zero as "the default" and a negative number as "none";
+	// in the environment zero means none.
+	logRequests := cfg.LogRequests
+	if logRequests == 0 {
+		logRequests = -1
+	}
 	return agent.New(agent.Config{
 		Node:             node,
 		Manager:          client,
@@ -128,5 +134,6 @@ func run() error {
 		Logger:           logger,
 		RPCTimeout:       cfg.RPCTimeout,
 		FenceOnLeaseLoss: cfg.FenceOnLeaseLoss,
+		LogRequests:      logRequests,
 	}).Run(ctx)
 }

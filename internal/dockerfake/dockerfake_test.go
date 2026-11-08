@@ -3,8 +3,13 @@ package dockerfake
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/dockfleet/dockfleet/internal/docker"
 )
@@ -193,5 +198,227 @@ func TestImageBehavior(t *testing.T) {
 	}
 	if st, _ := f.Inspect(ctx, "bad"); !st.Running {
 		t.Fatalf("after clearing the behavior = %+v", st)
+	}
+}
+
+func logsOf(t *testing.T, r docker.LogReader) []string {
+	t.Helper()
+	var out []string
+	for {
+		l, err := r.Next()
+		if errors.Is(err, io.EOF) {
+			return out
+		}
+		if err != nil {
+			t.Fatalf("Next after %v: %v", out, err)
+		}
+		out = append(out, l.Text)
+	}
+}
+
+func startedContainer(t *testing.T, f *Fake, id string) {
+	t.Helper()
+	ctx := context.Background()
+	f.AddImage("img:1")
+	if _, err := f.Create(ctx, spec(id)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Start(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStreamLogsServesTailAndSince(t *testing.T) {
+	ctx := context.Background()
+	f := New("node-1")
+	startedContainer(t, f, "w1")
+	base := time.Date(2026, 3, 1, 9, 0, 0, 0, time.UTC)
+	for i := 1; i <= 5; i++ {
+		f.AppendLog("w1", "stdout", fmt.Sprintf("line %d", i), base.Add(time.Duration(i)*time.Second))
+	}
+	tests := []struct {
+		name string
+		opts docker.LogStreamOptions
+		want []string
+	}{
+		{"everything", docker.LogStreamOptions{Tail: -1}, []string{"line 1", "line 2", "line 3", "line 4", "line 5"}},
+		{"the last two", docker.LogStreamOptions{Tail: 2}, []string{"line 4", "line 5"}},
+		{"none", docker.LogStreamOptions{Tail: 0}, nil},
+		{"more than there are", docker.LogStreamOptions{Tail: 99}, []string{"line 1", "line 2", "line 3", "line 4", "line 5"}},
+		{"since is inclusive", docker.LogStreamOptions{Tail: -1, Since: base.Add(3 * time.Second)}, []string{"line 3", "line 4", "line 5"}},
+		{"the last one since a time", docker.LogStreamOptions{Tail: 1, Since: base.Add(2 * time.Second)}, []string{"line 5"}},
+		{"since after the end", docker.LogStreamOptions{Tail: -1, Since: base.Add(time.Hour)}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, err := f.StreamLogs(ctx, "w1", tt.opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			if got := logsOf(t, r); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("lines = %v, want %v", got, tt.want)
+			}
+		})
+	}
+	if f.OpenLogReaders() != 0 {
+		t.Fatalf("%d readers left open", f.OpenLogReaders())
+	}
+}
+
+func TestStreamLogsFollowsUntilTheContainerStops(t *testing.T) {
+	ctx := context.Background()
+	f := New("node-1")
+	startedContainer(t, f, "w1")
+	f.Log("w1", "before")
+	r, err := f.StreamLogs(ctx, "w1", docker.LogStreamOptions{Tail: 0, Follow: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	got := make(chan string, 4)
+	done := make(chan error, 1)
+	go func() {
+		for {
+			l, err := r.Next()
+			if err != nil {
+				done <- err
+				return
+			}
+			got <- l.Text
+		}
+	}()
+	f.Log("w1", "one")
+	f.Log("w1", "two")
+	for _, want := range []string{"one", "two"} {
+		select {
+		case text := <-got:
+			if text != want {
+				t.Fatalf("line = %q, want %q", text, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%q did not arrive", want)
+		}
+	}
+	f.Crash("w1", 1)
+	select {
+	case err := <-done:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("a stopped container ends the follow with %v, want io.EOF", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the follow did not end when the container stopped")
+	}
+}
+
+func TestStreamLogsCloseAndRemoveEndAFollow(t *testing.T) {
+	ctx := context.Background()
+	f := New("node-1")
+	startedContainer(t, f, "w1")
+
+	closing, err := f.StreamLogs(ctx, "w1", docker.LogStreamOptions{Follow: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := closing.Next()
+		result <- err
+	}()
+	time.Sleep(10 * time.Millisecond)
+	closing.Close()
+	select {
+	case err := <-result:
+		if !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("Next after Close = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not end the blocked read")
+	}
+
+	removed, err := f.StreamLogs(ctx, "w1", docker.LogStreamOptions{Follow: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer removed.Close()
+	go func() {
+		_, err := removed.Next()
+		result <- err
+	}()
+	time.Sleep(10 * time.Millisecond)
+	if err := f.Stop(ctx, "w1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Remove(ctx, "w1", true); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("Next after the container was removed = %v, want io.EOF", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("removing the container did not end the follow")
+	}
+}
+
+func TestStreamLogsContextEndsTheReader(t *testing.T) {
+	f := New("node-1")
+	startedContainer(t, f, "w1")
+	ctx, cancel := context.WithCancel(context.Background())
+	r, err := f.StreamLogs(ctx, "w1", docker.LogStreamOptions{Follow: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	result := make(chan error, 1)
+	go func() {
+		_, err := r.Next()
+		result <- err
+	}()
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("Next after the context ended = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("canceling the context did not end the blocked read")
+	}
+}
+
+func TestStreamLogsOnlyReachesManagedContainers(t *testing.T) {
+	f := New("node-1")
+	startedContainer(t, f, "w1")
+	f.AddUnmanaged("bystander", "img:1", map[string]string{"app": "shop"})
+	ctx := context.Background()
+	if _, err := f.StreamLogs(ctx, "bystander", docker.LogStreamOptions{}); !errors.Is(err, docker.ErrNotFound) {
+		t.Fatalf("a container that is not DockFleet's: %v, want ErrNotFound", err)
+	}
+	if _, err := f.StreamLogs(ctx, "nobody", docker.LogStreamOptions{}); !errors.Is(err, docker.ErrNotFound) {
+		t.Fatalf("an unknown workload: %v, want ErrNotFound", err)
+	}
+	if f.AppendLog("bystander", "stdout", "x", time.Now()) {
+		t.Fatal("a line was written to a container that is not DockFleet's")
+	}
+	f.FailNext("logs", errors.New("daemon down"), 1)
+	if _, err := f.StreamLogs(ctx, "w1", docker.LogStreamOptions{}); err == nil || f.Pending("logs") != 0 {
+		t.Fatalf("injected failure: %v, %d pending", err, f.Pending("logs"))
+	}
+}
+
+func TestStreamLogsCutsLongLines(t *testing.T) {
+	f := New("node-1")
+	startedContainer(t, f, "w1")
+	f.Log("w1", strings.Repeat("é", 100))
+	r, err := f.StreamLogs(context.Background(), "w1", docker.LogStreamOptions{Tail: -1, MaxLineBytes: 51})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	l, err := r.Next()
+	if err != nil || !l.Truncated || len(l.Text) != 50 || !utf8.ValidString(l.Text) {
+		t.Fatalf("line = %d bytes, truncated %v, %v", len(l.Text), l.Truncated, err)
 	}
 }

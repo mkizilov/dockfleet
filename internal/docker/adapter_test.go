@@ -28,6 +28,10 @@ type fakeBackend struct {
 	listFilters []map[string]string
 	created     []createRequest
 	logStream   []byte
+	// logBody, when set, is what logs returns instead of logStream, and logReqs
+	// records the requests, so a test can drive a stream by hand.
+	logBody     io.ReadCloser
+	logReqs     []logRequest
 	statsJSON   string
 	stopTimeout time.Duration
 	forceRemove bool
@@ -116,8 +120,12 @@ func (f *fakeBackend) inspect(_ context.Context, id string) (rawInspect, error) 
 	return c.rawInspect, err
 }
 
-func (f *fakeBackend) logs(_ context.Context, id string, _ logRequest) (io.ReadCloser, error) {
+func (f *fakeBackend) logs(_ context.Context, id string, req logRequest) (io.ReadCloser, error) {
 	f.record("logs", id)
+	f.logReqs = append(f.logReqs, req)
+	if f.logBody != nil {
+		return f.logBody, nil
+	}
 	return io.NopCloser(bytes.NewReader(f.logStream)), nil
 }
 

@@ -15,6 +15,7 @@ import (
 
 	"github.com/dockfleet/dockfleet/internal/api"
 	"github.com/dockfleet/dockfleet/internal/config"
+	"github.com/dockfleet/dockfleet/internal/logstream"
 	"github.com/dockfleet/dockfleet/internal/netutil"
 	"github.com/dockfleet/dockfleet/internal/pki"
 	"github.com/dockfleet/dockfleet/internal/placement"
@@ -41,6 +42,7 @@ type Manager struct {
 	registry   *registry.Registry
 	scheduler  *placement.Scheduler
 	reconciler *reconcile.Reconciler
+	logs       *logstream.Hub
 	timing     scheduler.Timing
 	logger     *slog.Logger
 	apiTLS     *tls.Config
@@ -73,6 +75,9 @@ func New(cfg config.Manager, st store.Store, logger *slog.Logger) (*Manager, err
 			Store: st, Logger: logger, Interval: cfg.ReconcileInterval, InstanceID: cfg.InstanceID, Timing: timing,
 		}),
 	}
+	m.logs = logstream.NewHub(logstream.HubConfig{
+		MaxStreams: cfg.LogMaxStreams, Window: cfg.LogWindowBytes, ReconnectWait: cfg.LogReconnectWait, Logger: logger,
+	})
 	if cfg.TLSCertFile != "" {
 		var err error
 		m.apiTLS, err = pki.ServerTLS(pki.ServerConfig{CertFile: cfg.TLSCertFile, KeyFile: cfg.TLSKeyFile, Logger: logger})
@@ -110,7 +115,7 @@ func (m *Manager) Serve(ctx context.Context, apiLn, grpcLn net.Listener) error {
 			return err
 		}
 	}
-	nodes := protocol.NewNodeServer(m.registry, m.cfg.HeartbeatInterval, m.logger).WithLease(m.cfg.NodeLease)
+	nodes := protocol.NewNodeServer(m.registry, m.cfg.HeartbeatInterval, m.logger).WithLease(m.cfg.NodeLease).WithLogs(m.logs, 0)
 	grpcSrv, err := protocol.NewGRPCServer(nodes, protocol.ServerOptions{
 		TLS:              m.grpcTLS,
 		Token:            m.cfg.AgentToken,
@@ -131,6 +136,9 @@ func (m *Manager) Serve(ctx context.Context, apiLn, grpcLn net.Listener) error {
 			Logger:     m.logger,
 			InstanceID: m.cfg.InstanceID,
 			Overcommit: overcommit(m.cfg),
+			Logs:       m.logs,
+
+			LogWriteTimeout: m.cfg.LogWriteTimeout,
 		}),
 		TLSConfig:         m.apiTLS,
 		ReadHeaderTimeout: 10 * time.Second,
@@ -194,6 +202,10 @@ func (m *Manager) Serve(ctx context.Context, apiLn, grpcLn net.Listener) error {
 		errs = append(errs, err)
 		m.logger.Error("server failed, shutting down", "error", err)
 	}
+
+	// Open log streams would hold both servers up until the shutdown timeout:
+	// end them first, so that clients and agents see the manager go away.
+	m.logs.Shutdown()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), m.cfg.ShutdownTimeout)
 	defer cancel()

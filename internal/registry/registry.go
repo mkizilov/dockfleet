@@ -244,6 +244,23 @@ func (r *Registry) Heartbeat(ctx context.Context, nodeID, sessionID string, repo
 	return workloads, nil
 }
 
+// CheckSession reports whether the session is the node's current one and the
+// node is still enrolled. It changes nothing but this: a revoked enrollment ends
+// the session, as it does on a heartbeat, so a long-lived stream bound to the
+// session finds out without waiting for the next heartbeat.
+func (r *Registry) CheckSession(ctx context.Context, nodeID, sessionID string) error {
+	if err := r.check(nodeID, sessionID); err != nil {
+		return err
+	}
+	if err := r.checkEnrolled(ctx, nodeID); err != nil {
+		if errors.Is(err, ErrNotEnrolled) {
+			r.endSession(ctx, nodeID, sessionID, "enrollment revoked")
+		}
+		return err
+	}
+	return nil
+}
+
 // failureEvents are the audit events a new report of a workload calls for: it
 // failed, turned unhealthy, was restarted, or recovered. The first report of a
 // workload that is fine says nothing, and neither does a repeat of a state

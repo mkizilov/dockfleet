@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -189,5 +190,111 @@ func TestDockerEngine(t *testing.T) {
 	}
 	if list, err := a.List(ctx); err != nil || len(list) != 0 {
 		t.Fatalf("List after rejection = %+v, %v", list, err)
+	}
+}
+
+// StreamLogs against a real daemon: timestamps, both output streams, a follow
+// that sees lines written later, and a Close that ends a read that is waiting.
+func TestDockerEngineStreamsLogs(t *testing.T) {
+	host := os.Getenv("DOCKFLEET_TEST_DOCKER_HOST")
+	if host == "" {
+		t.Skip("DOCKFLEET_TEST_DOCKER_HOST not set")
+	}
+	image := os.Getenv("DOCKFLEET_TEST_DOCKER_IMAGE")
+	if image == "" {
+		image = "alpine:3.20"
+	}
+	suffix := randomSuffix(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	a, err := NewAdapter(AdapterConfig{Host: host, NodeID: "itest-logs-" + suffix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if err := a.PullImage(ctx, image); err != nil {
+		t.Fatalf("PullImage: %v", err)
+	}
+	workload := "itest-logs-" + suffix
+	t.Cleanup(func() { _ = a.Remove(context.Background(), workload, true) })
+	if _, err := a.Create(ctx, ContainerSpec{
+		WorkloadID: workload, WorkloadName: "logs", Image: image, CPUMillis: 100, MemoryBytes: 32 << 20,
+		Command: []string{"sh", "-c", "i=0; while true; do i=$((i+1)); echo \"out $i\"; echo \"err $i\" >&2; sleep 0.2; done"},
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := a.Start(ctx, workload); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Wait until the container has written a few lines.
+	eventually(t, "a few lines of output", 15*time.Second, func() bool {
+		logs, err := a.Logs(ctx, workload, LogOptions{})
+		return err == nil && len(logs.Chunks) >= 6
+	})
+
+	// The history: the last lines, with the time the daemon recorded, and no wait.
+	r, err := a.StreamLogs(ctx, workload, LogStreamOptions{Tail: 4})
+	if err != nil {
+		t.Fatalf("StreamLogs: %v", err)
+	}
+	var history []LogLine
+	for {
+		l, err := r.Next()
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				t.Fatalf("Next: %v", err)
+			}
+			break
+		}
+		history = append(history, l)
+	}
+	_ = r.Close()
+	if len(history) != 4 {
+		t.Fatalf("%d lines of history, want 4: %+v", len(history), history)
+	}
+	var sawErr, sawOut bool
+	for i, l := range history {
+		if l.Time.IsZero() || time.Since(l.Time) > time.Minute || (i > 0 && l.Time.Before(history[i-1].Time)) {
+			t.Fatalf("line %d has time %v; times must be real and not go backwards", i, l.Time)
+		}
+		sawErr = sawErr || (l.Stream == "stderr" && strings.HasPrefix(l.Text, "err "))
+		sawOut = sawOut || (l.Stream == "stdout" && strings.HasPrefix(l.Text, "out "))
+	}
+	if !sawErr || !sawOut {
+		t.Fatalf("history = %+v; both output streams must come through", history)
+	}
+
+	// Following: lines written after the read began arrive, and Close ends the wait.
+	last := history[len(history)-1].Time
+	f, err := a.StreamLogs(ctx, workload, LogStreamOptions{Tail: -1, Since: last, Follow: true})
+	if err != nil {
+		t.Fatalf("StreamLogs (follow): %v", err)
+	}
+	var fresh int
+	for fresh < 3 {
+		l, err := f.Next()
+		if err != nil {
+			t.Fatalf("Next while following: %v", err)
+		}
+		if l.Time.After(last) {
+			fresh++
+		}
+	}
+	done := make(chan error, 1)
+	go func() {
+		for {
+			if _, err := f.Next(); err != nil {
+				done <- err
+				return
+			}
+		}
+	}()
+	time.Sleep(300 * time.Millisecond)
+	_ = f.Close()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not end a read that was waiting for output")
 	}
 }

@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/dockfleet/dockfleet/internal/config"
+	"github.com/dockfleet/dockfleet/internal/logstream"
 	"github.com/dockfleet/dockfleet/internal/pki"
 	"github.com/dockfleet/dockfleet/internal/protocol"
 	"github.com/dockfleet/dockfleet/internal/store"
@@ -33,6 +35,9 @@ const (
 	// Used by the mutual TLS test.
 	testTLSAPIAddr  = "127.0.0.1:21294"
 	testTLSGRPCAddr = "127.0.0.1:21295"
+	// Used by the container log test.
+	testLogsAPIAddr  = "127.0.0.1:21298"
+	testLogsGRPCAddr = "127.0.0.1:21299"
 )
 
 func testConfig() config.Manager {
@@ -124,6 +129,142 @@ func TestServeRegistersNodeAndShutsDownGracefully(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Serve did not return after context cancellation")
+	}
+}
+
+// An agent's log stream reaches the administrator's HTTP response, both need
+// credentials, and a stream that is still open does not make the shutdown wait
+// for its timeout.
+func TestServeStreamsContainerLogsAndShutsDownWithAnOpenStream(t *testing.T) {
+	cfg := testConfig()
+	cfg.ShutdownTimeout = time.Minute
+	st := store.NewMemory()
+	bg := context.Background()
+	if _, err := st.CreateEnrollment(bg, store.Enrollment{NodeID: "node-1", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateWorkload(bg, store.Workload{ID: "w1", Name: "web", Image: "nginx", CPUMillis: 1, MemoryBytes: 1, NodeID: "node-1", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	m, err := New(cfg, st, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiLn, err := net.Listen("tcp", testLogsAPIAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grpcLn, err := net.Listen("tcp", testLogsGRPCAddr)
+	if err != nil {
+		_ = apiLn.Close()
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(bg)
+	defer cancel()
+	served := make(chan error, 1)
+	go func() { served <- m.Serve(ctx, apiLn, grpcLn) }()
+
+	client, err := protocol.Dial(protocol.ClientConfig{Addr: testLogsGRPCAddr, Token: cfg.AgentToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	callCtx, callCancel := context.WithTimeout(ctx, 20*time.Second)
+	defer callCancel()
+	session, err := client.Register(callCtx, protocol.NodeInfo{ID: "node-1", Name: "Node 1", CPUMillis: 1000, MemoryBytes: 1 << 30})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	conn, err := client.Logs(callCtx, "node-1", session.ID)
+	if err != nil {
+		t.Fatalf("Logs: %v", err)
+	}
+	// The agent: every request is answered with one line.
+	go func() {
+		for {
+			d, err := conn.Recv()
+			if err != nil {
+				return
+			}
+			if d.Open != nil {
+				_ = conn.Send(logstream.Up{Batch: &logstream.Batch{RequestID: d.Open.RequestID, HistoryComplete: true, Lines: []logstream.Line{
+					{Time: time.Now().UTC(), Stream: logstream.StreamStdout, Text: "hello from w1"},
+				}}})
+			}
+		}
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for !m.logs.Connected("node-1") {
+		if time.Now().After(deadline) {
+			t.Fatal("the agent's log stream never attached")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	get := func(token string) *http.Response {
+		req, err := http.NewRequestWithContext(callCtx, http.MethodGet, "http://"+testLogsAPIAddr+"/v1/workloads/w1/logs?follow=true&tail=5", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	for name, token := range map[string]string{"no credentials": "", "the agents' token": cfg.AgentToken} {
+		resp := get(token)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s: status = %d, want 401", name, resp.StatusCode)
+		}
+	}
+
+	resp := get(cfg.APIToken)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/x-ndjson") {
+		t.Fatalf("status %d, content type %q", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	body := bufio.NewReader(resp.Body)
+	line, err := body.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec struct {
+		Type, Text, Workload, Node, Time string
+	}
+	if err := json.Unmarshal([]byte(line), &rec); err != nil {
+		t.Fatalf("%q: %v", line, err)
+	}
+	if !strings.EqualFold(rec.Type, "line") || rec.Text != "hello from w1" || rec.Workload != "w1" || rec.Node != "node-1" || rec.Time == "" {
+		t.Fatalf("first record = %q", line)
+	}
+
+	// Shutting down ends the open response with an end record, promptly.
+	cancel()
+	last := line
+	for {
+		next, err := body.ReadString('\n')
+		if next != "" {
+			last = next
+		}
+		if err != nil {
+			break
+		}
+	}
+	if !strings.Contains(last, `"type":"end"`) {
+		t.Fatalf("last record = %q, want an end record", last)
+	}
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("Serve returned %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("Serve waited for its shutdown timeout because a log stream was open")
 	}
 }
 

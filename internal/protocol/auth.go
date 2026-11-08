@@ -25,6 +25,20 @@ func UnaryTokenInterceptor(token string) grpc.UnaryServerInterceptor {
 	}
 }
 
+// StreamTokenInterceptor is UnaryTokenInterceptor for streaming calls: a
+// stream without "Bearer <token>" is refused before its handler runs.
+func StreamTokenInterceptor(token string) grpc.StreamServerInterceptor {
+	want := []byte("Bearer " + token)
+	return func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		md, _ := metadata.FromIncomingContext(ss.Context())
+		got := md.Get(authorizationKey)
+		if len(got) != 1 || subtle.ConstantTimeCompare([]byte(got[0]), want) != 1 {
+			return status.Error(codes.Unauthenticated, "invalid or missing credentials")
+		}
+		return handler(srv, ss)
+	}
+}
+
 // tokenCredentials attaches the bearer token to every call. It is only used
 // on plaintext loopback connections; mutual TLS replaces it.
 type tokenCredentials struct {

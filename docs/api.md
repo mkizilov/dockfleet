@@ -26,6 +26,8 @@ A service definition is **desired state**: it says what an administrator wants, 
 | `POST /v1/services/{name}/pause` | Hold rollouts where they are | `200`, `ETag` |
 | `POST /v1/services/{name}/resume` | Let them go on | `200`, `ETag` |
 | `POST /v1/services/{name}/rollback` | Return to an earlier spec, as a new revision | `200`, `ETag` |
+| `GET /v1/services/{name}/logs` | Stream the logs of the service's replicas (see [Container logs](#container-logs)) | `200`, streaming |
+| `GET /v1/workloads/{id}/logs` | Stream the logs of one workload | `200`, streaming |
 
 Services are addressed by **name**, which is unique among live services. A deleted service's name can be used again by a new service (with a new `id`), so a deleted service is no longer addressable by name; `GET /v1/services?include_deleted=true` still lists it.
 
@@ -244,10 +246,26 @@ The same scheduler serves the other state endpoints:
 
 Each successful change is recorded in `GET /v1/events` in the same transaction as the change: `service.created`, `service.deployed` (from and to revision, image), `service.scaled` (from and to replicas) and `service.deleted`, with the actor `admin`. Events never contain environment values. Requests that fail validation or change nothing record nothing.
 
+## Container logs
+
+`GET /v1/services/{name}/logs` and `GET /v1/workloads/{id}/logs` stream what the containers wrote, from whichever node they run on: the recent history, and with `follow=true` the lines written from now on, as newline-delimited JSON (`format=ndjson`, the default), plain text (`text`) or server-sent events (`sse`). They take `tail`, `follow`, `since`, `after`, `timestamps` and `format`, and the service endpoint also `replica`, `revision`, `node` and `workload` to pick replicas.
+
+```sh
+curl -N -H "Authorization: Bearer $DOCKFLEET_API_TOKEN" \
+  'http://127.0.0.1:21280/v1/services/web/logs?tail=50&follow=true&replica=1,2'
+```
+
+The parameters, the output, resuming an interrupted response with a cursor, what happens when a node's connection drops, the bounds that keep a slow client from exhausting memory, and the permissions are in [logs.md](logs.md). In short:
+
+- the endpoints need the admin token and only read; the agents' token is refused;
+- a response never buffers more than a small window, whatever the client does: a client that takes no data for `DOCKFLEET_LOG_WRITE_TIMEOUT` (30 s) is dropped, and `DOCKFLEET_LOG_MAX_STREAMS` (32) streams can be open at once (`429` beyond);
+- a container whose node is not connected to this manager, or that has no container yet, is reported in the stream as a `notice`, not as a failure of the request;
+- `400` lists every invalid parameter, `404` means no such service or workload or no replica that matches, `503` that the manager does not serve logs.
+
 ## Not yet
 
 No pagination of the service list, no partial (`PATCH`) updates, no secret values, no image allow-list, no per-user authentication (one shared admin token), no rescheduling of a replica whose container failed beyond its restart limit (see [failure-handling.md](failure-handling.md#limitations)), and no automatic rollback of a failed rollout ([rollouts.md](rollouts.md#limitations)).
 
 ## Tests
 
-`internal/api/services_*_test.go` is one suite run against the in-memory store always and against PostgreSQL under the `integration` build tag (`make test-integration`; every test gets a throwaway database). It covers authentication (missing, malformed and wrong credentials on every route), CRUD, equivalent definitions, optimistic locking, deletion and name reuse, revisions, events, a validation table of over a hundred bad inputs, every unsafe option at every nesting level, request limits, that the handlers never create a workload, and the status after a scheduling pass (assigned, unschedulable with a reason for every node, across revisions, scaling and deletion), the node view and the standalone workload refusals. The scale endpoint has its own tests in the same suite: reading and setting the count with the progress at each step, repeated and stale requests, fifteen kinds of bad request, a scale-up and scale-down through the scheduler, the reconciler and simulated agents (the replicas that stay are the very same workloads), more replicas than fit, and a scaling while a node is unavailable. The rollout part has its own: the policy in the definition and its validation, pausing and resuming, rolling back (the previous revision, a named one, repeated and refused requests), and the progress of a rollout from its first step to a reported failure and a rollback that keeps the replicas it returns to. PostgreSQL-only tests restart the store on the same database and run two managers against one.
+`internal/api/services_*_test.go` is one suite run against the in-memory store always and against PostgreSQL under the `integration` build tag (`make test-integration`; every test gets a throwaway database). It covers authentication (missing, malformed and wrong credentials on every route), CRUD, equivalent definitions, optimistic locking, deletion and name reuse, revisions, events, a validation table of over a hundred bad inputs, every unsafe option at every nesting level, request limits, that the handlers never create a workload, and the status after a scheduling pass (assigned, unschedulable with a reason for every node, across revisions, scaling and deletion), the node view and the standalone workload refusals. The scale endpoint has its own tests in the same suite: reading and setting the count with the progress at each step, repeated and stale requests, fifteen kinds of bad request, a scale-up and scale-down through the scheduler, the reconciler and simulated agents (the replicas that stay are the very same workloads), more replicas than fit, and a scaling while a node is unavailable. The rollout part has its own: the policy in the definition and its validation, pausing and resuming, rolling back (the previous revision, a named one, repeated and refused requests), and the progress of a rollout from its first step to a reported failure and a rollback that keeps the replicas it returns to. The log endpoints are in the same suite, with a real log hub behind the handlers and simulated agents on the other side of it ([logs.md](logs.md#tests)). PostgreSQL-only tests restart the store on the same database and run two managers against one.

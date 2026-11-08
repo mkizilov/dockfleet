@@ -84,6 +84,11 @@ func IsCertificateInvalid(err error) bool {
 	return ErrorCode(err) == dockfleetv1.ProtocolErrorCode_PROTOCOL_ERROR_CODE_CERTIFICATE_INVALID
 }
 
+// IsUnimplemented reports that the manager does not offer the call at all: it
+// is older than the feature, or the feature is switched off there. Retrying
+// cannot change that.
+func IsUnimplemented(err error) bool { return status.Code(err) == codes.Unimplemented }
+
 // NeedsRegistration reports that the manager has no usable session for the
 // node and the agent must register again. For NOT_ENROLLED the registration
 // will keep failing until an administrator enrolls the node again.

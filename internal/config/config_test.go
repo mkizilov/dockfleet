@@ -420,3 +420,57 @@ func TestLoadAgentRemoteManagerNeverFallsBackToPlaintext(t *testing.T) {
 		t.Fatalf("error = %v, want a refusal of plaintext to a remote manager", err)
 	}
 }
+
+func TestLoadManagerLogSettings(t *testing.T) {
+	c, err := LoadManager(getenv(managerEnv()))
+	if err != nil || c.LogMaxStreams != 32 || c.LogWindowBytes != 256<<10 || c.LogReconnectWait != 30*time.Second || c.LogWriteTimeout != 30*time.Second {
+		t.Fatalf("defaults: %+v, %v", c, err)
+	}
+	vars := managerEnv()
+	vars["DOCKFLEET_LOG_MAX_STREAMS"] = "5"
+	vars["DOCKFLEET_LOG_WINDOW_KIB"] = "64"
+	vars["DOCKFLEET_LOG_RECONNECT_WAIT"] = "2s"
+	vars["DOCKFLEET_LOG_WRITE_TIMEOUT"] = "500ms"
+	c, err = LoadManager(getenv(vars))
+	if err != nil || c.LogMaxStreams != 5 || c.LogWindowBytes != 64<<10 || c.LogReconnectWait != 2*time.Second || c.LogWriteTimeout != 500*time.Millisecond {
+		t.Fatalf("configured: %+v, %v", c, err)
+	}
+	for _, bad := range []struct{ key, value string }{
+		{"DOCKFLEET_LOG_MAX_STREAMS", "0"},
+		{"DOCKFLEET_LOG_MAX_STREAMS", "1001"},
+		{"DOCKFLEET_LOG_MAX_STREAMS", "many"},
+		{"DOCKFLEET_LOG_WINDOW_KIB", "63"},
+		{"DOCKFLEET_LOG_WINDOW_KIB", "16385"},
+		{"DOCKFLEET_LOG_WINDOW_KIB", "-1"},
+		{"DOCKFLEET_LOG_RECONNECT_WAIT", "0s"},
+		{"DOCKFLEET_LOG_RECONNECT_WAIT", "soon"},
+		{"DOCKFLEET_LOG_WRITE_TIMEOUT", "-5s"},
+	} {
+		vars := managerEnv()
+		vars[bad.key] = bad.value
+		if _, err := LoadManager(getenv(vars)); err == nil || !strings.Contains(err.Error(), bad.key) {
+			t.Errorf("%s=%s: error = %v, want one naming the setting", bad.key, bad.value, err)
+		}
+	}
+}
+
+func TestLoadAgentLogSettings(t *testing.T) {
+	c, err := LoadAgent(getenv(agentEnv()))
+	if err != nil || c.LogRequests != 16 {
+		t.Fatalf("default: %+v, %v", c, err)
+	}
+	for value, want := range map[string]int{"0": 0, "1": 1, "256": 256} {
+		vars := agentEnv()
+		vars["DOCKFLEET_LOG_MAX_REQUESTS"] = value
+		if c, err := LoadAgent(getenv(vars)); err != nil || c.LogRequests != want {
+			t.Errorf("%q: %d, %v", value, c.LogRequests, err)
+		}
+	}
+	for _, value := range []string{"-1", "257", "lots", "1.5"} {
+		vars := agentEnv()
+		vars["DOCKFLEET_LOG_MAX_REQUESTS"] = value
+		if _, err := LoadAgent(getenv(vars)); err == nil || !strings.Contains(err.Error(), "DOCKFLEET_LOG_MAX_REQUESTS") {
+			t.Errorf("%q: error = %v, want one naming the setting", value, err)
+		}
+	}
+}

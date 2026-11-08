@@ -65,6 +65,16 @@ type Manager struct {
 	// be promised to workloads. 1 means never more than the node has.
 	CPUOvercommit    float64
 	MemoryOvercommit float64
+
+	// Container logs. LogMaxStreams is how many log queries may be open at once,
+	// LogWindowBytes the most that is buffered for one query (agents are held
+	// back by flow control beyond it), LogReconnectWait how long a following
+	// query waits for an agent whose connection dropped, and LogWriteTimeout how
+	// long a response waits for a client that takes no data before it is closed.
+	LogMaxStreams    int
+	LogWindowBytes   int
+	LogReconnectWait time.Duration
+	LogWriteTimeout  time.Duration
 }
 
 // TLSEnabled reports whether the manager serves TLS. TLS always means mutual
@@ -97,6 +107,10 @@ type Agent struct {
 	// Turn it off to keep containers running through a long manager outage, at
 	// the price of duplicate replicas after a failover.
 	FenceOnLeaseLoss bool
+
+	// LogRequests is how many log requests the agent serves at once for the
+	// manager; 0 turns serving container logs off.
+	LogRequests int
 
 	// Container policy relaxations; empty means the strictest policy. The
 	// docker package validates them (they never allow the always-denied set).
@@ -145,6 +159,10 @@ func LoadManager(get Getenv) (Manager, error) {
 	c.ReconcileInterval = duration(get, "DOCKFLEET_RECONCILE_INTERVAL", 5*time.Second, &errs)
 	c.CPUOvercommit = overcommit(get, "DOCKFLEET_SCHEDULER_CPU_OVERCOMMIT", &errs)
 	c.MemoryOvercommit = overcommit(get, "DOCKFLEET_SCHEDULER_MEMORY_OVERCOMMIT", &errs)
+	c.LogMaxStreams = intInRange(get, "DOCKFLEET_LOG_MAX_STREAMS", 32, 1, 1000, &errs)
+	c.LogWindowBytes = intInRange(get, "DOCKFLEET_LOG_WINDOW_KIB", 256, 64, 16384, &errs) << 10
+	c.LogReconnectWait = duration(get, "DOCKFLEET_LOG_RECONNECT_WAIT", 30*time.Second, &errs)
+	c.LogWriteTimeout = duration(get, "DOCKFLEET_LOG_WRITE_TIMEOUT", 30*time.Second, &errs)
 
 	switch c.Store {
 	case "postgres":
@@ -222,6 +240,7 @@ func LoadAgent(get Getenv) (Agent, error) {
 	c.DockerHost = env(get, "DOCKFLEET_DOCKER_HOST", "unix:///var/run/docker.sock")
 	c.RPCTimeout = duration(get, "DOCKFLEET_RPC_TIMEOUT", 5*time.Second, &errs)
 	c.FenceOnLeaseLoss = boolean(get, "DOCKFLEET_FENCE_ON_LEASE_LOSS", true, &errs)
+	c.LogRequests = intInRange(get, "DOCKFLEET_LOG_MAX_REQUESTS", 16, 0, 256, &errs)
 	c.CPUMillis = positiveInt(get, "DOCKFLEET_NODE_CPU_MILLIS", int64(runtime.NumCPU())*1000, &errs)
 	// Declared capacity, not measured: host memory detection is future work.
 	c.MemoryBytes = positiveInt(get, "DOCKFLEET_NODE_MEMORY_MB", 1024, &errs) << 20
@@ -321,6 +340,20 @@ func overcommit(get Getenv, key string, errs *[]error) float64 {
 	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 1 || v > MaxOvercommit {
 		*errs = append(*errs, fmt.Errorf("%s must be a number from 1 (no overcommit) to %g, got %q", key, MaxOvercommit, raw))
 		return 1
+	}
+	return v
+}
+
+// intInRange reads a whole number from lo to hi.
+func intInRange(get Getenv, key string, def, lo, hi int, errs *[]error) int {
+	raw := strings.TrimSpace(get(key))
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v < lo || v > hi {
+		*errs = append(*errs, fmt.Errorf("%s must be a whole number from %d to %d, got %q", key, lo, hi, raw))
+		return def
 	}
 	return v
 }

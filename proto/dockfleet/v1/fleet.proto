@@ -31,6 +31,10 @@ option go_package = "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/
 // Failures that the agent can act on carry a ProtocolError in the gRPC status
 // details. See docs/protocol.md.
 //
+// Container logs: the manager never connects to agents either, so an agent
+// that is registered opens one long-lived Logs stream and serves the log
+// requests the manager sends down it. See docs/logs.md.
+//
 // Transport: outside loopback development the connection is mutual TLS. The
 // manager derives the caller's identity from the client certificate and
 // requires every node_id in a request to match it. Only enrolled nodes may
@@ -47,6 +51,15 @@ service NodeService {
 
   // DeregisterNode ends a session. It is best effort and never required.
   rpc DeregisterNode(DeregisterNodeRequest) returns (DeregisterNodeResponse);
+
+  // Logs is a bidirectional stream the agent opens after it registered and
+  // keeps open for the session. The agent's messages (LogsRequest) are a
+  // LogsHello first, then the log lines it reads from its containers and the
+  // end of each log request; the manager's messages (LogsResponse) are the log
+  // requests, their cancellations and the flow-control credit that lets the
+  // agent send more. A stream that ends is opened again by the agent; log
+  // requests that were running on it are resumed by the manager.
+  rpc Logs(stream LogsRequest) returns (stream LogsResponse);
 }
 
 // ProtocolVersion identifies the wire protocol. A different major version is
@@ -244,3 +257,113 @@ message DeregisterNodeRequest {
 }
 
 message DeregisterNodeResponse {}
+
+enum LogStream {
+  LOG_STREAM_UNSPECIFIED = 0;
+  LOG_STREAM_STDOUT = 1;
+  LOG_STREAM_STDERR = 2;
+}
+
+// LogEndReason says why the agent stopped serving a log request.
+enum LogEndReason {
+  LOG_END_REASON_UNSPECIFIED = 0;
+  // Everything there was has been sent: the history of a request that does not
+  // follow, or the output of a container that stopped or was removed.
+  LOG_END_REASON_COMPLETE = 1;
+  // The node has no container for the workload.
+  LOG_END_REASON_NOT_FOUND = 2;
+  // The manager canceled the request.
+  LOG_END_REASON_CANCELED = 3;
+  // The agent serves as many log requests as it allows and refused this one.
+  LOG_END_REASON_BUSY = 4;
+  // Reading the container's logs failed; message says why.
+  LOG_END_REASON_ERROR = 5;
+}
+
+// LogLine is one line of container output.
+message LogLine {
+  // When the container wrote the line, as the Docker daemon recorded it.
+  int64 time_unix_nano = 1;
+  LogStream stream = 2;
+  // Valid UTF-8, without the line break, at most the request's max_line_bytes.
+  string text = 3;
+  // The line was longer than max_line_bytes; the rest was dropped.
+  bool truncated = 4;
+}
+
+// LogsRequest is what the agent sends on the Logs stream. Exactly one field is
+// set. The first message is the hello and no other message is.
+message LogsRequest {
+  oneof message {
+    LogsHello hello = 1;
+    LogBatch batch = 2;
+    LogEnd end = 3;
+  }
+}
+
+// LogsHello identifies the session the stream belongs to. node_id must equal
+// the identity in the client certificate, the node must be enrolled and the
+// session must be the node's current one.
+message LogsHello {
+  string node_id = 1;
+  string session_id = 2;
+}
+
+// LogBatch carries lines of one log request, oldest first. The bytes the agent
+// may send are limited by the credit the manager grants (see LogOpen).
+message LogBatch {
+  string request_id = 1;
+  repeated LogLine lines = 2;
+  // Set on the last batch of the request's history: what follows, if anything,
+  // was written after the request was opened. The batch may be empty.
+  bool history_complete = 3;
+}
+
+// LogEnd closes a log request; nothing more is sent for it.
+message LogEnd {
+  string request_id = 1;
+  LogEndReason reason = 2;
+  string message = 3;
+}
+
+// LogsResponse is what the manager sends on the Logs stream. Exactly one field
+// is set.
+message LogsResponse {
+  oneof message {
+    LogOpen open = 1;
+    LogCancel cancel = 2;
+    LogCredit credit = 3;
+  }
+}
+
+// LogOpen asks for the logs of one workload's container.
+message LogOpen {
+  // Chosen by the manager, unique on the stream.
+  string request_id = 1;
+  string workload_id = 2;
+  // The last N lines after after_unix_nano; negative means all of them (up to
+  // what the agent allows), 0 none.
+  int32 tail = 3;
+  // Only lines written after this time; 0 means no bound.
+  int64 after_unix_nano = 4;
+  // Keep sending lines as the container writes them, until it stops.
+  bool follow = 5;
+  // Longer lines are cut; 0 means the agent's default.
+  uint32 max_line_bytes = 6;
+  // The bytes the agent may send before it has to wait for more credit. A line
+  // costs its text plus 64 bytes.
+  uint32 credit_bytes = 7;
+}
+
+// LogCancel ends a log request. The agent may still send what it had in flight.
+message LogCancel {
+  string request_id = 1;
+}
+
+// LogCredit lets the agent send bytes more of a log request. The manager grants
+// credit as it delivers lines, so a slow reader slows the agent down instead of
+// filling the manager's memory.
+message LogCredit {
+  string request_id = 1;
+  uint32 bytes = 2;
+}

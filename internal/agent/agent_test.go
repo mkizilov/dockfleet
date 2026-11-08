@@ -14,6 +14,7 @@ import (
 
 	"github.com/dockfleet/dockfleet/internal/docker"
 	"github.com/dockfleet/dockfleet/internal/dockerfake"
+	"github.com/dockfleet/dockfleet/internal/logstream"
 	"github.com/dockfleet/dockfleet/internal/protocol"
 	dockfleetv1 "github.com/dockfleet/dockfleet/internal/protocol/dockfleet/v1"
 )
@@ -35,6 +36,15 @@ type fakeManager struct {
 	deregisterErr error
 	interval      time.Duration
 	lease         time.Duration
+	logAttempts   int
+}
+
+// Logs: this manager serves no container logs, which the agent takes as final.
+func (f *fakeManager) Logs(context.Context, string, string) (logstream.AgentConn, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.logAttempts++
+	return nil, status.Error(codes.Unimplemented, "no container logs here")
 }
 
 func (f *fakeManager) Register(context.Context, protocol.NodeInfo) (protocol.Session, error) {

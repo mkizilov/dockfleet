@@ -65,9 +65,12 @@ type createRequest struct {
 }
 
 type logRequest struct {
+	// Tail is the number of last lines; negative means all of them.
 	Tail       int
 	Since      time.Time
 	Timestamps bool
+	// Follow keeps the stream open for output the container writes later.
+	Follow bool
 }
 
 // AdapterConfig configures NewAdapter.
@@ -337,6 +340,24 @@ func (a *Adapter) Logs(ctx context.Context, workloadID string, opts LogOptions) 
 		return Logs{}, fmt.Errorf("read logs of workload %s: %w", workloadID, err)
 	}
 	return logs, nil
+}
+
+// StreamLogs starts reading the container's output. The container is found by
+// the same labels as for every other operation, so the logs of a container that
+// DockFleet does not manage cannot be read. The returned reader holds the
+// daemon's connection open until it is closed or the context ends.
+func (a *Adapter) StreamLogs(ctx context.Context, workloadID string, opts LogStreamOptions) (LogReader, error) {
+	c, err := a.find(ctx, workloadID)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	rc, err := a.b.logs(ctx, c.ID, logRequest{Tail: opts.Tail, Since: opts.Since, Timestamps: true, Follow: opts.Follow})
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("read logs of workload %s: %w", workloadID, err)
+	}
+	return newLogReader(rc, cancel, opts.maxLine()), nil
 }
 
 func (a *Adapter) Stats(ctx context.Context, workloadID string) (Usage, error) {

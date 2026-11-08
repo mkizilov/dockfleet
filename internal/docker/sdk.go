@@ -266,11 +266,16 @@ func (s *sdkBackend) inspect(ctx context.Context, id string) (rawInspect, error)
 }
 
 func (s *sdkBackend) logs(ctx context.Context, id string, req logRequest) (io.ReadCloser, error) {
+	tail := "all"
+	if req.Tail >= 0 {
+		tail = strconv.Itoa(req.Tail)
+	}
 	opts := container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Timestamps: req.Timestamps,
-		Tail:       strconv.Itoa(req.Tail),
+		Follow:     req.Follow,
+		Tail:       tail,
 	}
 	if !req.Since.IsZero() {
 		opts.Since = req.Since.UTC().Format(time.RFC3339Nano)

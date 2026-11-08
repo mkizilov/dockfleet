@@ -169,6 +169,18 @@ var serviceTests = []serviceTest{
 	{"pausing and resuming a rollout", testRolloutPauseResume},
 	{"rolling back", testRolloutRollback},
 	{"rollout progress, failure and recovery", testRolloutProgressAndFailure},
+	{"service logs are merged by time and filtered", testServiceLogsAreMergedByTimeAndFiltered},
+	{"log records say where a line came from", testServiceLogRecordsSayWhereALineCameFrom},
+	{"log text and event formats", testLogTextAndEventFormats},
+	{"following shows new lines and stops with the client", testFollowingShowsNewLinesAndStopsWhenTheClientLeaves},
+	{"a log stream resumes when an agent reconnects", testLogStreamResumesWhenAnAgentReconnects},
+	{"a log stream reports nodes it cannot reach", testLogStreamReportsNodesItCannotReach},
+	{"a log stream resumes from a cursor", testLogResumeUsesTheCursor},
+	{"bad log requests are refused", testBadLogRequestsAreRefused},
+	{"log requests for things that are not there", testLogRequestsForThingsThatAreNotThere},
+	{"logs need the admin token and a log source", testLogsNeedTheAdminTokenAndALogSource},
+	{"too many log streams are refused", testTooManyLogStreamsAreRefused},
+	{"a slow log client is dropped", testASlowLogClientIsDropped},
 	{"the node view explains availability", testNodeViewExplainsAvailability},
 	{"events", testServiceEvents},
 }
@@ -202,6 +214,8 @@ func testServiceAuthentication(t *testing.T, e *serviceEnv) {
 		{http.MethodPost, "/v1/services/web/pause", ""},
 		{http.MethodPost, "/v1/services/web/resume", ""},
 		{http.MethodPost, "/v1/services/web/rollback", ""},
+		{http.MethodGet, "/v1/services/web/logs", ""},
+		{http.MethodGet, "/v1/workloads/w1/logs", ""},
 	}
 	credentials := []string{
 		"",
