@@ -11,7 +11,7 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 | `cmd/manager`        | Control-plane entry point                                               |
 | `cmd/agent`          | Worker-node entry point                                                 |
 | `cmd/pki`            | `dockfleet-pki`: development CA and certificate issuing                 |
-| `internal/api`       | Administrative HTTP API (nodes, workloads, health)                      |
+| `internal/api`       | Administrative HTTP API (services, nodes, workloads, enrollments, events, health) |
 | `internal/scheduler` | Workload placement (pure functions, no I/O)                             |
 | `internal/agent`     | Node logic: register, heartbeat, retry, re-register                     |
 | `internal/store`     | Persistence: repository interfaces, transactions, versioned migrations; PostgreSQL and in-memory implementations ([docs/state.md](docs/state.md)) |
@@ -27,7 +27,7 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 | `proto/`             | Protobuf definitions (`buf` module)                                     |
 | `deploy/`            | Docker Compose file for development dependencies                        |
 | `config/dev.env`     | Development-only configuration                                          |
-| `docs/`              | [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), [Mutual TLS and enrollment](docs/mtls.md), [Docker adapter](docs/docker.md), [Control-plane state](docs/state.md) |
+| `docs/`              | [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), [Mutual TLS and enrollment](docs/mtls.md), [Docker adapter](docs/docker.md), [Control-plane state](docs/state.md), [Services API](docs/api.md) |
 
 ## Prerequisites
 
@@ -63,6 +63,12 @@ curl -s -H 'Authorization: Bearer dev-api-token-0123456789' http://127.0.0.1:212
 curl -s -X POST -H 'Authorization: Bearer dev-api-token-0123456789' \
   -d '{"name":"web","image":"nginx:1.27","cpu_millis":500,"memory_bytes":134217728}' \
   http://127.0.0.1:21280/v1/workloads
+
+# Describe a service (desired state only: nothing is placed or started yet)
+curl -s -X POST -H 'Authorization: Bearer dev-api-token-0123456789' \
+  -d '{"name":"site","replicas":3,"spec":{"image":"nginx:1.27","cpu_millis":500,"memory_bytes":134217728,"ports":[{"container_port":80}]}}' \
+  http://127.0.0.1:21280/v1/services
+curl -s -H 'Authorization: Bearer dev-api-token-0123456789' http://127.0.0.1:21280/v1/services
 ```
 
 Stop either process with Ctrl-C or `SIGTERM`; both drain and exit with status 0. `make compose-down` stops the database.
@@ -89,6 +95,12 @@ Administrators distributing real credentials should read [docs/mtls.md](docs/mtl
 | `POST /v1/workloads`      | yes  | Choose a node for a workload (desired state `running`); nothing is observed until its agent reports |
 | `GET /v1/workloads`       | yes  | All workloads, each with its desired state and its `observed` report |
 | `GET /v1/workloads/{id}`  | yes  | One workload                                                        |
+| `POST /v1/services`       | yes  | Create a service definition: image, replicas, CPU and memory limits, environment, ports, health check, restart policy ([details](docs/api.md)) |
+| `GET /v1/services`        | yes  | List service definitions (`include_deleted=true` adds deleted ones)  |
+| `GET /v1/services/{name}` | yes  | One service definition, with its `ETag`                              |
+| `PUT /v1/services/{name}` | yes  | Replace a definition: a changed spec is a new revision, a changed replica count a scaling; `If-Match` guards against lost updates |
+| `DELETE /v1/services/{name}` | yes | Delete a service (history is kept)                                |
+| `GET /v1/services/{name}/revisions` | yes | Deployment history                                         |
 | `GET /v1/events`          | yes  | Audit trail, newest first (`resource_type`, `resource_id`, `before`, `limit`) |
 | `POST /v1/enrollments`    | yes  | Enroll a node ID (`{"node_id":"...","description":"..."}`); `409` if already enrolled |
 | `GET /v1/enrollments`     | yes  | All enrollments                                                     |
@@ -159,7 +171,7 @@ Generated protobuf code is not committed, so run `make generate` after a fresh c
 
 - The Docker adapter (create, start, stop, remove, inspect, logs, stats) is implemented and tested, but the agent does not use it to run assigned workloads yet, so agents still report them `pending` and nothing reconciles failures. Workload assignments carry no ports, mounts or environment yet.
 - Sessions are held in manager memory: an agent talks to one manager at a time and registers again if that manager forgets it. Two agents configured with the same node ID will keep superseding each other.
-- The database is ready for several managers (placement lock, optimistic versions, leases, migration lock), but no leader election runs yet and nothing reconciles service definitions into workloads; services, replica counts and deployment revisions are stored and tested, with no HTTP endpoints yet.
+- The database is ready for several managers (placement lock, optimistic versions, leases, migration lock), but no leader election runs yet. Service definitions have a REST API ([docs/api.md](docs/api.md)) and are stored as desired state, but nothing turns them into workloads: no placement, scheduling or reconciliation of services yet.
 - Scheduling is a spread strategy that places one workload per request.
 - Node capacity is declared by the agent, not measured.
 - Registered nodes are never deleted; dead nodes stay listed as `not_ready`.

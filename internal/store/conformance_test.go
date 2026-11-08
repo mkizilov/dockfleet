@@ -21,6 +21,7 @@ func runStoreConformance(t *testing.T, newStore func(t *testing.T) Store) {
 		"observations":          testObservations,
 		"services":              testServices,
 		"service revisions":     testRevisions,
+		"service definitions":   testDefinitions,
 		"service workloads":     testServiceWorkloads,
 		"service deletion":      testServiceDeletion,
 		"events":                testEvents,

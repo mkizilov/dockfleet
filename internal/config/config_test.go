@@ -44,6 +44,11 @@ func TestLoadManagerRejectsInsecureOrInvalid(t *testing.T) {
 		wantErr string
 	}{
 		{"missing api token", func(m map[string]string) { delete(m, "DOCKFLEET_API_TOKEN") }, "DOCKFLEET_API_TOKEN"},
+		{"short api token", func(m map[string]string) { m["DOCKFLEET_API_TOKEN"] = "short" }, "DOCKFLEET_API_TOKEN"},
+		{"blank api token", func(m map[string]string) { m["DOCKFLEET_API_TOKEN"] = "   " }, "DOCKFLEET_API_TOKEN"},
+		{"empty host api bind without tls", func(m map[string]string) { m["DOCKFLEET_API_ADDR"] = ":21280" }, "loopback"},
+		{"ipv6 wildcard api bind without tls", func(m map[string]string) { m["DOCKFLEET_API_ADDR"] = "[::]:21280" }, "loopback"},
+		{"hostname api bind without tls", func(m map[string]string) { m["DOCKFLEET_API_ADDR"] = "manager.example.com:21280" }, "loopback"},
 		{"short agent token", func(m map[string]string) { m["DOCKFLEET_AGENT_TOKEN"] = "short" }, "DOCKFLEET_AGENT_TOKEN"},
 		{"same tokens", func(m map[string]string) { m["DOCKFLEET_AGENT_TOKEN"] = m["DOCKFLEET_API_TOKEN"] }, "must differ"},
 		{"missing database url", func(m map[string]string) { delete(m, "DOCKFLEET_DATABASE_URL") }, "DOCKFLEET_DATABASE_URL"},

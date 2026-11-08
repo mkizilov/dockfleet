@@ -189,6 +189,74 @@ func testRevisions(t *testing.T, s Store) {
 	wantErr(t, err, ErrInvalid)
 }
 
+// fullSpec uses every field of a spec, to prove each one is stored.
+func fullSpec() ServiceSpec {
+	spec := webSpec()
+	spec.Ports = []ServicePort{{ContainerPort: 80, Protocol: "tcp", HostPort: 8080}, {ContainerPort: 53, Protocol: "udp"}}
+	spec.HealthCheck = &HealthCheck{Command: []string{"curl", "-f", "http://localhost/"}, IntervalSeconds: 30, TimeoutSeconds: 5, StartPeriodSeconds: 10, Retries: 3}
+	spec.RestartPolicy = &RestartPolicy{Condition: RestartOnFailure, MaxRetries: 5}
+	return spec
+}
+
+func testDefinitions(t *testing.T, s Store) {
+	ctx := context.Background()
+	none, err := s.ListDefinitions(ctx, true)
+	if err != nil || none == nil || len(none) != 0 {
+		t.Fatalf("ListDefinitions on an empty store = %+v, %v; want empty and non-nil", none, err)
+	}
+
+	// A spec with every field survives storage unchanged.
+	full, err := s.CreateService(ctx, NewService{ID: "svc-full", Name: "full", Replicas: 2, Spec: fullSpec(), CreatedBy: "admin", At: testTime})
+	noErr(t, err)
+	rev, err := s.GetRevision(ctx, full.ID, 1)
+	noErr(t, err)
+	if !reflect.DeepEqual(rev.Spec, fullSpec()) || rev.SpecHash != fullSpec().Hash() {
+		t.Fatalf("stored spec = %+v\nwant %+v", rev.Spec, fullSpec())
+	}
+
+	// Deploying a change to only the new fields is a new revision.
+	changed := fullSpec()
+	changed.RestartPolicy = &RestartPolicy{Condition: RestartAlways}
+	changed.Ports = changed.Ports[:1]
+	changed.HealthCheck.Retries = 5
+	_, rev2, err := s.DeployService(ctx, full.ID, Deployment{Spec: changed, At: testTime.Add(time.Minute)})
+	noErr(t, err)
+	if rev2.Revision != 2 || rev2.SpecHash == rev.SpecHash {
+		t.Fatalf("revision 2 = %+v; a change to ports, health check or restart policy must make a new revision", rev2)
+	}
+
+	newService(t, s, "api", 1)
+	gone := newService(t, s, "old", 1)
+	_, err = s.DeleteService(ctx, gone.ID, 0, testTime.Add(time.Hour))
+	noErr(t, err)
+
+	live, err := s.ListDefinitions(ctx, false)
+	noErr(t, err)
+	if len(live) != 2 || live[0].Service.Name != "api" || live[1].Service.Name != "full" {
+		t.Fatalf("live definitions = %+v", live)
+	}
+	// Each definition carries the revision the service currently runs, not the first.
+	f := live[1]
+	if f.Service.CurrentRevision != 2 || f.Revision.Revision != 2 || f.Revision.ServiceID != full.ID ||
+		!reflect.DeepEqual(f.Revision.Spec, changed) || f.Revision.SpecHash != changed.Hash() {
+		t.Fatalf("definition of full = %+v", f)
+	}
+	all, err := s.ListDefinitions(ctx, true)
+	noErr(t, err)
+	if len(all) != 3 || all[1].Service.Name != "full" || all[2].Service.Name != "old" || all[2].Service.DeletedAt == nil {
+		t.Fatalf("all definitions = %+v", all)
+	}
+
+	// What was returned is a copy.
+	live[1].Revision.Spec.Ports[0].ContainerPort = 1
+	live[1].Revision.Spec.HealthCheck.Command[0] = "mutated"
+	live[1].Revision.Spec.RestartPolicy.Condition = "mutated"
+	again, _ := s.GetRevision(ctx, full.ID, 2)
+	if !reflect.DeepEqual(again.Spec, changed) {
+		t.Fatalf("the store aliases returned specs: %+v", again.Spec)
+	}
+}
+
 func testServiceWorkloads(t *testing.T, s Store) {
 	ctx := context.Background()
 	addNode(t, s, "node-a")

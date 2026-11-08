@@ -5,60 +5,23 @@ package store
 import (
 	"context"
 	"errors"
-	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/dockfleet/dockfleet/internal/pgtest"
 )
 
 // These tests need a PostgreSQL server (version 13 or newer) and are skipped
 // unless DOCKFLEET_TEST_DATABASE_URL names one. Every test creates its own
-// database on that server (dockfleet_test_<random>), migrates it, and drops it
-// when done, so tests never share state with each other, with a developer's
-// data, or with the database named in the URL, which is only used to connect.
-// The role in the URL needs CREATEDB.
-
-func adminURL(t *testing.T) string {
-	t.Helper()
-	u := os.Getenv("DOCKFLEET_TEST_DATABASE_URL")
-	if u == "" {
-		t.Skip("DOCKFLEET_TEST_DATABASE_URL not set")
-	}
-	return u
-}
+// database on that server, migrates it, and drops it when done (see pgtest), so
+// tests never share state with each other or with a developer's data.
 
 // newIsolatedDatabase creates an empty database and returns its URL.
 func newIsolatedDatabase(t *testing.T) string {
 	t.Helper()
-	admin := adminURL(t)
-	parsed, err := url.Parse(admin)
-	if err != nil || parsed.Scheme == "" {
-		t.Fatalf("DOCKFLEET_TEST_DATABASE_URL must be a postgres:// URL: %v", err)
-	}
-	name := "dockfleet_test_" + NewID()[:16]
-	ctx := context.Background()
-
-	conn, err := pgx.Connect(ctx, admin)
-	if err != nil {
-		t.Fatalf("connect to the PostgreSQL server: %v", err)
-	}
-	if _, err := conn.Exec(ctx, `CREATE DATABASE `+pgx.Identifier{name}.Sanitize()); err != nil {
-		_ = conn.Close(ctx)
-		t.Fatalf("create the isolated database: %v", err)
-	}
-	t.Cleanup(func() {
-		defer conn.Close(ctx)
-		if _, err := conn.Exec(ctx, `DROP DATABASE IF EXISTS `+pgx.Identifier{name}.Sanitize()+` WITH (FORCE)`); err != nil {
-			t.Errorf("drop %s: %v", name, err)
-		}
-	})
-
-	parsed.Path = "/" + name
-	return parsed.String()
+	return pgtest.NewDatabase(t)
 }
 
 func openStore(t *testing.T, dbURL string) *Postgres {

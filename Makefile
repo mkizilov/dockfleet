@@ -73,9 +73,9 @@ cover: ## Run unit tests and print per-package coverage
 	$(GO) test -count=1 -cover $(PKGS)
 
 .PHONY: test-integration
-test-integration: ## Run PostgreSQL integration tests (needs `make compose-up`)
+test-integration: ## Run PostgreSQL integration tests: store and API (needs `make compose-up`)
 	set -a; . config/dev.env; set +a; \
-	DOCKFLEET_TEST_DATABASE_URL="$$DOCKFLEET_DATABASE_URL" $(GO) test -race -count=1 -tags integration ./internal/store/...
+	DOCKFLEET_TEST_DATABASE_URL="$$DOCKFLEET_DATABASE_URL" $(GO) test -race -count=1 -tags integration ./internal/store/... ./internal/api/...
 
 .PHONY: test-docker
 test-docker: ## Run the Docker Engine integration tests (set DOCKFLEET_TEST_DOCKER_HOST, e.g. unix:///var/run/docker.sock)

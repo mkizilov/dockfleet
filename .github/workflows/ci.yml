@@ -55,7 +55,7 @@ jobs:
       - run: make proto
       - run: make tidy
       - name: PostgreSQL integration tests
-        run: go test -race -count=1 -tags integration ./internal/store/...
+        run: go test -race -count=1 -tags integration ./internal/store/... ./internal/api/...
 
   docker:
     runs-on: ubuntu-latest

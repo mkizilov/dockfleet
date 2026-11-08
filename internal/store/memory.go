@@ -97,6 +97,15 @@ func cloneSpec(s ServiceSpec) ServiceSpec {
 	if s.NodeSelector != nil {
 		s.NodeSelector = cloneLabels(s.NodeSelector)
 	}
+	if s.Ports != nil {
+		s.Ports = append([]ServicePort(nil), s.Ports...)
+	}
+	if s.HealthCheck != nil {
+		hc := *s.HealthCheck
+		hc.Command = append([]string(nil), hc.Command...)
+		s.HealthCheck = &hc
+	}
+	s.RestartPolicy = clonePtr(s.RestartPolicy)
 	return s
 }
 
@@ -452,6 +461,20 @@ func (m *Memory) ListServices(_ context.Context, includeDeleted bool) ([]Service
 		}
 		return out[i].CreatedAt.Before(out[j].CreatedAt)
 	})
+	return out, nil
+}
+
+func (m *Memory) ListDefinitions(ctx context.Context, includeDeleted bool) ([]Definition, error) {
+	services, err := m.ListServices(ctx, includeDeleted)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]Definition, 0, len(services))
+	for _, svc := range services {
+		out = append(out, Definition{Service: svc, Revision: cloneRevision(m.s.revisions[svc.ID][svc.CurrentRevision-1])})
+	}
 	return out, nil
 }
 

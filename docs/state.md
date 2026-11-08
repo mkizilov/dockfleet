@@ -87,7 +87,7 @@ The in-memory store gives the same guarantees (a transaction works on a copy and
 
 A service holds the desired replica count and a pointer to its current revision. Revisions are immutable snapshots of the spec; numbers start at 1 and only grow. `DeployService` with a spec identical to the current revision's is a no-op (`ErrUnchanged`). A rollback is a new revision carrying an old spec, so the history stays linear and every revision is a faithful record of what was once desired. Replica workloads record which revision they belong to, which is what a future reconciler needs to roll out a change one replica at a time. Deleting a service marks it deleted and sets the desired replicas to zero; revisions, workloads and events are kept.
 
-Nothing reconciles services into workloads yet: this change provides the durable desired state, not the controller. There are no HTTP endpoints for services yet either; the repository interfaces are the contract.
+Nothing reconciles services into workloads yet: this is the durable desired state, not the controller. Services are managed through the REST API described in [api.md](api.md), which stores a spec with image, command, environment, CPU and memory limits, ports, a health check, a restart policy and a node selector. Those newer spec fields are omitted from the stored JSON when empty, so revisions stored before they existed keep their encoding and hash. `ListDefinitions` reads each service with its current revision in one query.
 
 ## Several managers on one database
 
@@ -105,7 +105,7 @@ What is *not* done yet: no leader election is running (the lease primitive exist
 
 ## Administrative events
 
-`events` is an append-only audit trail written in the same transaction as the change it describes. Each event has the time, the manager instance, an actor (`admin` for the shared admin token, `node:<id>` for agents), an action, a resource and free-form details. Recorded today: `enrollment.created`, `enrollment.revoked`, `workload.created`, `node.registered`, `node.deregistered`, `node.session_ended`. Requests that fail or change nothing record nothing. `GET /v1/events` lists them newest first (`resource_type`, `resource_id`, `before` for paging, `limit`).
+`events` is an append-only audit trail written in the same transaction as the change it describes. Each event has the time, the manager instance, an actor (`admin` for the shared admin token, `node:<id>` for agents), an action, a resource and free-form details. Recorded today: `enrollment.created`, `enrollment.revoked`, `workload.created`, `node.registered`, `node.deregistered`, `node.session_ended`. Requests that fail or change nothing record nothing. `GET /v1/events` lists them newest first (`resource_type`, `resource_id`, `before` for paging, `limit`). Service changes add `service.created`, `service.deployed`, `service.scaled` and `service.deleted`.
 
 ## Tests
 

@@ -259,6 +259,38 @@ func (q *queries) ListServices(ctx context.Context, includeDeleted bool) ([]Serv
 	return out, rows.Err()
 }
 
+func (q *queries) ListDefinitions(ctx context.Context, includeDeleted bool) ([]Definition, error) {
+	// The join follows services.current_revision to the revision's primary key.
+	query := `SELECT s.id, s.name, s.replicas, s.current_revision, s.version, s.created_at, s.updated_at, s.deleted_at,
+		r.service_id, r.revision, r.spec, r.spec_hash, r.message, r.created_by, r.created_at
+		FROM services s JOIN service_revisions r ON r.service_id = s.id AND r.revision = s.current_revision`
+	if !includeDeleted {
+		query += ` WHERE s.deleted_at IS NULL`
+	}
+	rows, err := q.db.Query(ctx, query+` ORDER BY s.name, s.created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Definition{}
+	for rows.Next() {
+		var d Definition
+		var spec []byte
+		s, r := &d.Service, &d.Revision
+		if err := rows.Scan(&s.ID, &s.Name, &s.Replicas, &s.CurrentRevision, &s.Version, &s.CreatedAt, &s.UpdatedAt, &s.DeletedAt,
+			&r.ServiceID, &r.Revision, &spec, &r.SpecHash, &r.Message, &r.CreatedBy, &r.CreatedAt); err != nil {
+			return nil, mapError(err)
+		}
+		if err := json.Unmarshal(spec, &r.Spec); err != nil {
+			return nil, fmt.Errorf("decode revision %d of service %s: %w", r.Revision, r.ServiceID, err)
+		}
+		s.CreatedAt, s.UpdatedAt, s.DeletedAt = s.CreatedAt.UTC(), s.UpdatedAt.UTC(), utcPtr(s.DeletedAt)
+		r.CreatedAt = r.CreatedAt.UTC()
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 // explainNoUpdate says why a conditional UPDATE changed no row.
 func (q *queries) explainNoUpdate(ctx context.Context, id string, expectedVersion int64) (Service, error) {
 	svc, err := q.GetService(ctx, id)

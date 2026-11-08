@@ -2,6 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -89,6 +92,58 @@ func TestServiceSpecHash(t *testing.T) {
 		mutate(&c)
 		if c.Hash() == a.Hash() {
 			t.Errorf("changing the %s must change the hash", name)
+		}
+	}
+}
+
+// Revisions stored before ports, health checks and restart policies existed
+// carry a spec_hash computed from this encoding. A spec that does not use the
+// new fields must still encode to exactly it, or redeploying an unchanged
+// service would look like a change.
+func TestSpecWithoutNewFieldsKeepsItsEncodingAndHash(t *testing.T) {
+	spec := ServiceSpec{Image: "nginx:1", Command: []string{"nginx"}, Env: map[string]string{"A": "1"}, CPUMillis: 500, MemoryBytes: 1024, NodeSelector: map[string]string{"zone": "a"}}
+	const encoded = `{"image":"nginx:1","command":["nginx"],"env":{"A":"1"},"cpu_millis":500,"memory_bytes":1024,"node_selector":{"zone":"a"}}`
+	got, err := json.Marshal(spec)
+	if err != nil || string(got) != encoded {
+		t.Fatalf("encoding = %s (%v), want %s", got, err, encoded)
+	}
+	sum := sha256.Sum256([]byte(encoded))
+	if spec.Hash() != hex.EncodeToString(sum[:]) {
+		t.Fatalf("hash = %s, want the SHA-256 of the old encoding", spec.Hash())
+	}
+
+	// And an old stored document decodes with the new fields empty.
+	var old ServiceSpec
+	if err := json.Unmarshal([]byte(encoded), &old); err != nil || old.Ports != nil || old.HealthCheck != nil || old.RestartPolicy != nil {
+		t.Fatalf("old document decoded as %+v, %v", old, err)
+	}
+}
+
+func TestNewSpecFieldsChangeTheHash(t *testing.T) {
+	base := fullSpec()
+	mutations := []struct {
+		name   string
+		mutate func(*ServiceSpec)
+	}{
+		{"port", func(s *ServiceSpec) { s.Ports[0].ContainerPort++ }},
+		{"host port", func(s *ServiceSpec) { s.Ports[0].HostPort++ }},
+		{"protocol", func(s *ServiceSpec) { s.Ports[0].Protocol = "udp" }},
+		{"no ports", func(s *ServiceSpec) { s.Ports = nil }},
+		{"health command", func(s *ServiceSpec) { s.HealthCheck.Command = []string{"true"} }},
+		{"health interval", func(s *ServiceSpec) { s.HealthCheck.IntervalSeconds++ }},
+		{"health timeout", func(s *ServiceSpec) { s.HealthCheck.TimeoutSeconds++ }},
+		{"health start period", func(s *ServiceSpec) { s.HealthCheck.StartPeriodSeconds++ }},
+		{"health retries", func(s *ServiceSpec) { s.HealthCheck.Retries++ }},
+		{"no health check", func(s *ServiceSpec) { s.HealthCheck = nil }},
+		{"restart condition", func(s *ServiceSpec) { s.RestartPolicy.Condition = RestartAlways }},
+		{"restart retries", func(s *ServiceSpec) { s.RestartPolicy.MaxRetries++ }},
+		{"no restart policy", func(s *ServiceSpec) { s.RestartPolicy = nil }},
+	}
+	for _, tt := range mutations {
+		c := cloneSpec(base)
+		tt.mutate(&c)
+		if c.Hash() == base.Hash() {
+			t.Errorf("changing the %s must change the hash", tt.name)
 		}
 	}
 }

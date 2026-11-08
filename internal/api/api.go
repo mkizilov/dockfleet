@@ -71,6 +71,12 @@ func New(cfg Config) http.Handler {
 	mux.Handle("GET /v1/enrollments/{id}", s.auth(s.getEnrollment))
 	mux.Handle("DELETE /v1/enrollments/{id}", s.auth(s.revokeEnrollment))
 	mux.Handle("GET /v1/events", s.auth(s.listEvents))
+	mux.Handle("POST /v1/services", s.auth(s.createService))
+	mux.Handle("GET /v1/services", s.auth(s.listServices))
+	mux.Handle("GET /v1/services/{name}", s.auth(s.getService))
+	mux.Handle("PUT /v1/services/{name}", s.auth(s.updateService))
+	mux.Handle("DELETE /v1/services/{name}", s.auth(s.deleteService))
+	mux.Handle("GET /v1/services/{name}/revisions", s.auth(s.listServiceRevisions))
 	return s.logRequests(mux)
 }
 
@@ -111,6 +117,7 @@ func (s *server) auth(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got := []byte(r.Header.Get("Authorization"))
 		if subtle.ConstantTimeCompare(got, s.token) != 1 {
+			s.logger.WarnContext(r.Context(), "rejected an unauthenticated request", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			writeError(w, http.StatusUnauthorized, "invalid or missing credentials")
 			return
@@ -121,6 +128,9 @@ func (s *server) auth(next http.HandlerFunc) http.Handler {
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	// Responses can carry service environments, so nothing may cache them.
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }

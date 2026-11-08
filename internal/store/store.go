@@ -222,14 +222,55 @@ func equalTimePtr(a, b *time.Time) bool {
 	return a.Equal(*b)
 }
 
-// ServiceSpec is what one revision of a service runs.
+// ServiceSpec is what one revision of a service runs. It is desired state:
+// nothing here has been applied to any container yet.
+//
+// The newer fields (Ports, HealthCheck, RestartPolicy) are omitted from the
+// JSON when empty, so specs stored before they existed encode, and therefore
+// hash, exactly as they did.
 type ServiceSpec struct {
-	Image        string            `json:"image"`
-	Command      []string          `json:"command,omitempty"`
-	Env          map[string]string `json:"env,omitempty"`
-	CPUMillis    int64             `json:"cpu_millis"`
-	MemoryBytes  int64             `json:"memory_bytes"`
-	NodeSelector map[string]string `json:"node_selector,omitempty"`
+	Image         string            `json:"image"`
+	Command       []string          `json:"command,omitempty"`
+	Env           map[string]string `json:"env,omitempty"`
+	CPUMillis     int64             `json:"cpu_millis"`
+	MemoryBytes   int64             `json:"memory_bytes"`
+	NodeSelector  map[string]string `json:"node_selector,omitempty"`
+	Ports         []ServicePort     `json:"ports,omitempty"`
+	HealthCheck   *HealthCheck      `json:"health_check,omitempty"`
+	RestartPolicy *RestartPolicy    `json:"restart_policy,omitempty"`
+}
+
+// Restart conditions a RestartPolicy may name.
+const (
+	RestartNo        = "no"
+	RestartOnFailure = "on-failure"
+	RestartAlways    = "always"
+)
+
+// ServicePort exposes one container port. HostPort is the port to publish on
+// the node, or 0 to let the node choose one; the address it is published on
+// is the agent's decision (loopback unless the agent is configured otherwise).
+type ServicePort struct {
+	ContainerPort int    `json:"container_port"`
+	Protocol      string `json:"protocol"` // "tcp" or "udp"
+	HostPort      int    `json:"host_port,omitempty"`
+}
+
+// HealthCheck is a command run inside the container; exit status 0 means healthy.
+type HealthCheck struct {
+	// Command is in exec form (program and arguments, no shell).
+	Command            []string `json:"command"`
+	IntervalSeconds    int      `json:"interval_seconds"`
+	TimeoutSeconds     int      `json:"timeout_seconds"`
+	StartPeriodSeconds int      `json:"start_period_seconds"`
+	Retries            int      `json:"retries"`
+}
+
+// RestartPolicy says when a replica that stopped is started again.
+type RestartPolicy struct {
+	Condition string `json:"condition"` // RestartNo, RestartOnFailure or RestartAlways
+	// MaxRetries bounds restarts for RestartOnFailure; it is 0 for the others.
+	MaxRetries int `json:"max_retries,omitempty"`
 }
 
 // Hash identifies the spec's content: equal specs hash equally, whatever the
@@ -263,6 +304,12 @@ type Service struct {
 	CreatedAt time.Time  `json:"created_at"`
 	UpdatedAt time.Time  `json:"updated_at"`
 	DeletedAt *time.Time `json:"deleted_at,omitempty"`
+}
+
+// Definition is a service together with the revision it currently runs.
+type Definition struct {
+	Service  Service  `json:"service"`
+	Revision Revision `json:"revision"`
 }
 
 // Revision is an immutable snapshot of a service's spec. Revision numbers
@@ -418,6 +465,9 @@ type ServiceRepository interface {
 	GetServiceByName(ctx context.Context, name string) (Service, error)
 	// ListServices returns services ordered by name; deleted ones only on request.
 	ListServices(ctx context.Context, includeDeleted bool) ([]Service, error)
+	// ListDefinitions is ListServices with each service's current revision,
+	// read in one query.
+	ListDefinitions(ctx context.Context, includeDeleted bool) ([]Definition, error)
 	// ScaleService sets the desired replica count (ErrUnchanged if equal).
 	ScaleService(ctx context.Context, id string, replicas int, expectedVersion int64, at time.Time) (Service, error)
 	// DeployService records a new revision and makes it current (ErrUnchanged
