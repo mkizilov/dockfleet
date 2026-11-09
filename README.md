@@ -49,8 +49,8 @@ DockFleet is a distributed container orchestration system written in Go. A centr
 | `internal/logging`   | Structured logging (`log/slog`, JSON or text)                           |
 | `proto/`             | Protobuf definitions (`buf` module)                                     |
 | `Dockerfile`         | Two images, `manager` and `agent` targets: one static binary each, non-root, with a built-in health check ([docs/deployment.md](docs/deployment.md)) |
-| `LICENSE`, `THIRD_PARTY_NOTICES.md` | The MIT license, and the licenses of the third-party code in the binaries (generated from the build by `make notices`) |
-| `scripts/`           | `vuln-check.sh` (the vulnerability gate) and `notices/` (generates the third-party notices) |
+| `LICENSE`            | The MIT project license |
+| `scripts/`           | Verification and release-support scripts |
 | `deploy/`            | Docker Compose files: development PostgreSQL, a disposable Docker daemon and a disposable etcd for tests; `deploy/examples/` holds example manager and worker configuration, Compose files and systemd units |
 | `config/dev.env`     | Development-only configuration                                          |
 | `docs/`              | [Architecture](docs/architecture.md), [Protocol](docs/protocol.md), [Mutual TLS and enrollment](docs/mtls.md), [Docker adapter](docs/docker.md), [Control-plane state](docs/state.md), [Services API](docs/api.md), [Scheduler](docs/scheduler.md), [Reconciliation](docs/reconciliation.md), [Failure handling](docs/failure-handling.md), [Rolling deployments](docs/rollouts.md), [Container logs](docs/logs.md), [Metrics, dashboard and audit trail](docs/observability.md), [High availability](docs/high-availability.md), [Deployment guide](docs/deployment.md), [Credentials](docs/credentials.md), [Security audit](docs/security-audit.md), [Limitations and differences from Kubernetes](docs/limitations.md), [Verification status](docs/verification.md); the plan for what comes next is [ROADMAP.md](ROADMAP.md) |
@@ -235,7 +235,6 @@ make vuln               # govulncheck; needs network
 make tools-lint         # installs the pinned file linters and the secret scanner (actionlint, gitleaks, shellcheck, hadolint, check-jsonschema); needs network
 make lint-files         # lints the CI workflow, the shell scripts, the Dockerfile and the Compose files
 make scan-secrets       # scans every committed revision for secrets
-make notices            # regenerates THIRD_PARTY_NOTICES.md (a test fails when it is out of date)
 make test-etcd          # the election client and the managers' election against a real etcd; needs DOCKFLEET_TEST_ETCD_ENDPOINTS (`make etcd-test-up` starts a disposable etcd on 127.0.0.1:21234)
 make test-docker        # Docker Engine tests: the adapter and a service deployment; needs DOCKFLEET_TEST_DOCKER_HOST (`make docker-test-up` starts a disposable daemon on 127.0.0.1:21297)
 ```
@@ -272,5 +271,3 @@ Generated protobuf code is not committed, so run `make generate` after a fresh c
 ## License
 
 DockFleet is released under the [MIT License](LICENSE), copyright 2026 Mykyta Kizilov.
-
-The binaries and container images also contain third-party software under its own licenses (BSD, MIT and Apache 2.0). Their notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), which is generated from the build (`make notices`) and checked by a test, and both images carry it, with the license, under `/licenses`.
