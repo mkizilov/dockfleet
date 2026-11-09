@@ -254,9 +254,19 @@ func TestDockerEngineStreamsLogs(t *testing.T) {
 		t.Fatalf("%d lines of history, want 4: %+v", len(history), history)
 	}
 	var sawErr, sawOut bool
+	previous := make(map[string]time.Time)
+	var last time.Time
 	for i, l := range history {
-		if l.Time.IsZero() || time.Since(l.Time) > time.Minute || (i > 0 && l.Time.Before(history[i-1].Time)) {
-			t.Fatalf("line %d has time %v; times must be real and not go backwards", i, l.Time)
+		if l.Time.IsZero() || time.Since(l.Time) > time.Minute {
+			t.Fatalf("line %d has time %v; timestamps must be real and recent", i, l.Time)
+		}
+		// Docker collects stdout and stderr independently, so their timestamps can interleave.
+		if l.Time.Before(previous[l.Stream]) {
+			t.Fatalf("line %d has time %v before the previous %s line", i, l.Time, l.Stream)
+		}
+		previous[l.Stream] = l.Time
+		if l.Time.After(last) {
+			last = l.Time
 		}
 		sawErr = sawErr || (l.Stream == "stderr" && strings.HasPrefix(l.Text, "err "))
 		sawOut = sawOut || (l.Stream == "stdout" && strings.HasPrefix(l.Text, "out "))
@@ -266,7 +276,6 @@ func TestDockerEngineStreamsLogs(t *testing.T) {
 	}
 
 	// Following: lines written after the read began arrive, and Close ends the wait.
-	last := history[len(history)-1].Time
 	f, err := a.StreamLogs(ctx, workload, LogStreamOptions{Tail: -1, Since: last, Follow: true})
 	if err != nil {
 		t.Fatalf("StreamLogs (follow): %v", err)

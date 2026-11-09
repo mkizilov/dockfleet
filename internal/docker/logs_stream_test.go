@@ -43,8 +43,9 @@ func drain(t *testing.T, r LogReader) ([]LogLine, error) {
 
 func TestLogReaderSplitsLinesAndParsesTimestamps(t *testing.T) {
 	r := readerOver(
-		frame(streamStdout, stamped(0, "one\n")),
-		frame(streamStderr, stamped(time.Millisecond, "two\n")),
+		// Cross-stream arrival order does not imply timestamp order.
+		frame(streamStdout, stamped(time.Millisecond, "one\n")),
+		frame(streamStderr, stamped(0, "two\n")),
 		frame(streamStdout, stamped(2*time.Millisecond, "three\n")+stamped(3*time.Millisecond, "four\n")),
 		frame(streamStdout, stamped(4*time.Millisecond, "\n")),       // an empty line
 		frame(streamStdout, stamped(5*time.Millisecond, "crlf\r\n")), // a Windows line break
@@ -54,8 +55,8 @@ func TestLogReaderSplitsLinesAndParsesTimestamps(t *testing.T) {
 		t.Fatalf("error = %v, want io.EOF", err)
 	}
 	want := []LogLine{
-		{Time: streamBase, Stream: "stdout", Text: "one"},
-		{Time: streamBase.Add(time.Millisecond), Stream: "stderr", Text: "two"},
+		{Time: streamBase.Add(time.Millisecond), Stream: "stdout", Text: "one"},
+		{Time: streamBase, Stream: "stderr", Text: "two"},
 		{Time: streamBase.Add(2 * time.Millisecond), Stream: "stdout", Text: "three"},
 		{Time: streamBase.Add(3 * time.Millisecond), Stream: "stdout", Text: "four"},
 		{Time: streamBase.Add(4 * time.Millisecond), Stream: "stdout", Text: ""},

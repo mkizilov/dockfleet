@@ -18,7 +18,7 @@ import (
 // Lines come out in two phases. First the history: the lines each container
 // had when the query began, merged by time, so a service's replicas read as one
 // log. Then, if the query follows, the new lines in the order they arrive. A
-// container's lines are always in the order it wrote them.
+// container's lines retain their input order; stdout/stderr timestamps can interleave.
 //
 // A Stream never holds more than one credit window per container. The window
 // is granted to the agent up front and returned only as Next takes lines out,
