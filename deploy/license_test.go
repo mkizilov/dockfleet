@@ -49,10 +49,13 @@ func TestEveryStatementAboutTheLicenseAgrees(t *testing.T) {
 	if next := strings.Index(section[len("\n## License\n"):], "\n## "); next >= 0 {
 		section = section[:len("\n## License\n")+next]
 	}
-	for _, want := range []string{"MIT", "(LICENSE)", "(THIRD_PARTY_NOTICES.md)"} {
+	for _, want := range []string{"MIT", "(LICENSE)"} {
 		if !strings.Contains(section, want) {
 			t.Errorf("the README's License section does not contain %q:\n%s", want, section)
 		}
+	}
+	if strings.Contains(section, "THIRD_PARTY_NOTICES.md") {
+		t.Error("the README's License section should describe only the project license")
 	}
 	// Statements from before the license existed, whatever the quoting around the file name.
 	stale := regexp.MustCompile(`(?i)no license (has been chosen|file)|no ` + "`?LICENSE`?" + ` file|not yet licensed|license (file )?is added outside|license is scheduled|has not (chosen|picked) a license`)
